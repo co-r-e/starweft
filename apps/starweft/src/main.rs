@@ -35,8 +35,8 @@ use starweft_p2p::{
 use starweft_protocol::{
     ArtifactRef, Envelope, EvaluationIssued, EvaluationPolicy, JoinAccept, JoinOffer, JoinReject,
     MsgType, ParticipantPolicy, ProjectCharter, PublishIntentProposed, PublishIntentSkipped,
-    PublishResultRecorded, SnapshotRequest, SnapshotResponse, SnapshotScopeType, StopAck,
-    StopAckState, StopComplete, StopFinalState, StopOrder, StopScopeType, TaskDelegated,
+    PublishResultRecorded, RoutedBody, SnapshotRequest, SnapshotResponse, SnapshotScopeType,
+    StopAck, StopAckState, StopComplete, StopFinalState, StopOrder, StopScopeType, TaskDelegated,
     TaskExecutionStatus, TaskProgress, TaskResultSubmitted, UnsignedEnvelope, VisionConstraints,
     VisionIntent, WireEnvelope, PROTOCOL_VERSION,
 };
@@ -3560,6 +3560,7 @@ fn process_local_inbox(
 fn flush_outbox(config: &Config, store: &Store, transport: &RuntimeTransport) -> Result<()> {
     let queued = store.queued_outbox_messages(100)?;
     let peers = store.list_peer_addresses()?;
+    let p2p_log = Path::new(&config.node.data_dir).join("logs").join("p2p.log");
 
     for message in queued {
         let wire: WireEnvelope = serde_json::from_str(&message.raw_json)?;
@@ -3573,10 +3574,7 @@ fn flush_outbox(config: &Config, store: &Store, transport: &RuntimeTransport) ->
             match transport.deliver(&target.multiaddr.parse::<Multiaddr>()?, &payload) {
                 Ok(Some(delivery)) => {
                     write_runtime_log(
-                        Path::new(&config.node.data_dir)
-                            .join("logs")
-                            .join("p2p.log")
-                            .as_path(),
+                        &p2p_log,
                         &format!("delivered {} to {}", wire.msg_id, delivery.target),
                     )?;
                 }
@@ -3584,10 +3582,7 @@ fn flush_outbox(config: &Config, store: &Store, transport: &RuntimeTransport) ->
                 Err(error) => {
                     delivered_all = false;
                     write_runtime_log(
-                        Path::new(&config.node.data_dir)
-                            .join("logs")
-                            .join("p2p.log")
-                            .as_path(),
+                        &p2p_log,
                         &format!(
                             "delivery_failed {} {}: {error}",
                             wire.msg_id, target.multiaddr
@@ -3645,20 +3640,28 @@ fn relay_incoming_wire(
     let peers = store.list_peer_addresses()?;
     let targets = resolve_relay_targets(wire, &peers);
     let payload = serde_json::to_string(wire)?;
+    let relay_log = Path::new(&config.node.data_dir).join("logs").join("relay.log");
     for target in targets {
         if let Some(delivery) =
             transport.deliver(&target.multiaddr.parse::<Multiaddr>()?, &payload)?
         {
             write_runtime_log(
-                Path::new(&config.node.data_dir)
-                    .join("logs")
-                    .join("relay.log")
-                    .as_path(),
+                &relay_log,
                 &format!("relayed {} to {}", wire.msg_id, delivery.target),
             )?;
         }
     }
     Ok(())
+}
+
+fn verify_and_decode<T>(wire: WireEnvelope, public_key: &str) -> Result<Envelope<T>>
+where
+    T: RoutedBody + serde::Serialize + for<'de> serde::Deserialize<'de>,
+{
+    let verifying_key = verifying_key_from_base64(public_key)?;
+    let envelope: Envelope<T> = wire.decode()?;
+    envelope.verify_with_key(&verifying_key)?;
+    Ok(envelope)
 }
 
 fn route_incoming_wire(
@@ -3678,25 +3681,20 @@ fn route_incoming_wire(
     })?;
     let runtime = RuntimePipeline::new(store);
 
+    let pk = &peer_identity.public_key;
     match wire.msg_type {
         MsgType::VisionIntent => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<VisionIntent> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<VisionIntent>(wire, pk)?;
             if config.node.role == NodeRole::Owner {
                 handle_owner_vision(store, local_identity, actor_key, envelope)?;
             }
         }
         MsgType::ProjectCharter => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<ProjectCharter> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<ProjectCharter>(wire, pk)?;
             runtime.ingest_project_charter(&envelope)?;
         }
         MsgType::JoinOffer => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<JoinOffer> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<JoinOffer>(wire, pk)?;
             if config.node.role == NodeRole::Worker {
                 handle_worker_join_offer(config, store, local_identity, actor_key, envelope)?;
             } else {
@@ -3704,9 +3702,7 @@ fn route_incoming_wire(
             }
         }
         MsgType::JoinAccept => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<JoinAccept> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<JoinAccept>(wire, pk)?;
             if config.node.role == NodeRole::Owner {
                 handle_owner_join_accept(store, local_identity, actor_key, envelope)?;
             } else {
@@ -3714,9 +3710,7 @@ fn route_incoming_wire(
             }
         }
         MsgType::JoinReject => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<JoinReject> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<JoinReject>(wire, pk)?;
             if config.node.role == NodeRole::Owner {
                 handle_owner_join_reject(config, store, local_identity, actor_key, envelope)?;
             } else {
@@ -3724,9 +3718,7 @@ fn route_incoming_wire(
             }
         }
         MsgType::TaskDelegated => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<TaskDelegated> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<TaskDelegated>(wire, pk)?;
             if config.node.role == NodeRole::Worker {
                 handle_worker_task(
                     config,
@@ -3741,15 +3733,11 @@ fn route_incoming_wire(
             }
         }
         MsgType::TaskProgress => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<TaskProgress> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<TaskProgress>(wire, pk)?;
             runtime.ingest_task_progress(&envelope)?;
         }
         MsgType::TaskResultSubmitted => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<TaskResultSubmitted> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<TaskResultSubmitted>(wire, pk)?;
             if config.node.role == NodeRole::Owner {
                 handle_owner_task_result(config, store, local_identity, actor_key, envelope)?;
             } else {
@@ -3757,52 +3745,37 @@ fn route_incoming_wire(
             }
         }
         MsgType::EvaluationIssued => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<EvaluationIssued> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<EvaluationIssued>(wire, pk)?;
             runtime.ingest_evaluation_issued(&envelope)?;
         }
         MsgType::PublishIntentProposed => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<PublishIntentProposed> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<PublishIntentProposed>(wire, pk)?;
             runtime.ingest_publish_intent_proposed(&envelope)?;
         }
         MsgType::PublishIntentSkipped => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<PublishIntentSkipped> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<PublishIntentSkipped>(wire, pk)?;
             runtime.ingest_publish_intent_skipped(&envelope)?;
         }
         MsgType::PublishResultRecorded => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<PublishResultRecorded> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<PublishResultRecorded>(wire, pk)?;
             runtime.ingest_publish_result_recorded(&envelope)?;
         }
         MsgType::SnapshotRequest => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<SnapshotRequest> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<SnapshotRequest>(wire, pk)?;
             if config.node.role == NodeRole::Owner {
                 handle_owner_snapshot_request(store, local_identity, actor_key, envelope)?;
             }
         }
         MsgType::SnapshotResponse => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<SnapshotResponse> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<SnapshotResponse>(wire, pk)?;
             runtime.ingest_snapshot_response(&envelope)?;
         }
         MsgType::StopOrder => {
-            let verifying_key = verifying_key_from_base64(
-                peer_identity
-                    .stop_public_key
-                    .as_deref()
-                    .unwrap_or(&peer_identity.public_key),
-            )?;
-            let envelope: Envelope<StopOrder> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let stop_key = peer_identity
+                .stop_public_key
+                .as_deref()
+                .unwrap_or(pk);
+            let envelope = verify_and_decode::<StopOrder>(wire, stop_key)?;
             match config.node.role {
                 NodeRole::Owner => {
                     handle_owner_stop_order(store, local_identity, actor_key, envelope)?
@@ -3814,18 +3787,14 @@ fn route_incoming_wire(
             }
         }
         MsgType::StopAck => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<StopAck> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<StopAck>(wire, pk)?;
             runtime.ingest_stop_ack(&envelope)?;
             if config.node.role == NodeRole::Owner {
                 relay_stop_ack_to_principal(store, local_identity, actor_key, &envelope)?;
             }
         }
         MsgType::StopComplete => {
-            let verifying_key = verifying_key_from_base64(&peer_identity.public_key)?;
-            let envelope: Envelope<StopComplete> = wire.decode()?;
-            envelope.verify_with_key(&verifying_key)?;
+            let envelope = verify_and_decode::<StopComplete>(wire, pk)?;
             runtime.ingest_stop_complete(&envelope)?;
             if config.node.role == NodeRole::Owner {
                 relay_stop_complete_to_principal(store, local_identity, actor_key, &envelope)?;
@@ -4040,12 +4009,14 @@ fn process_completed_tasks(
     let runtime = RuntimePipeline::new(store);
     let data_paths = DataPaths::from_config(config)?;
 
+    let bridge_log = data_paths.logs_dir.join("bridge.log");
+
     while let Ok(completion) = task_completion_rx.try_recv() {
         // Log bridge output
         if config.openclaw.enabled {
             if !completion.bridge_response.raw_stdout.trim().is_empty() {
                 write_runtime_log(
-                    &data_paths.logs_dir.join("bridge.log"),
+                    &bridge_log,
                     &format!(
                         "task_id={} stdout={}",
                         completion.task_id,
@@ -4055,7 +4026,7 @@ fn process_completed_tasks(
             }
             if !completion.bridge_response.raw_stderr.trim().is_empty() {
                 write_runtime_log(
-                    &data_paths.logs_dir.join("bridge.log"),
+                    &bridge_log,
                     &format!(
                         "task_id={} stderr={}",
                         completion.task_id,

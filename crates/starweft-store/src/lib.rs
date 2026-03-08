@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -1219,6 +1220,8 @@ impl Store {
             latest_progress_at,
         };
 
+        let parent_map = self.load_parent_map(project_id)?;
+
         let mut retry_stmt = self.connection.prepare(
             r#"
             SELECT task_id, parent_task_id, updated_at
@@ -1241,7 +1244,7 @@ impl Store {
         for row in retry_rows {
             let (task_id, parent_task_id_raw, _updated_at) = row?;
             retry_task_count += 1;
-            let retry_attempt = self.task_retry_attempt(&task_id)?;
+            let retry_attempt = compute_retry_depth(task_id.as_str(), &parent_map);
             max_retry_attempt = max_retry_attempt.max(retry_attempt);
             if latest_retry_task_id.is_none() {
                 latest_retry_parent_task_id = parent_task_id_raw
@@ -1377,39 +1380,6 @@ impl Store {
         Ok(attempt)
     }
 
-    pub fn latest_failure_action_for_task(&self, task_id: &TaskId) -> Result<Option<String>> {
-        self.latest_failure_comment_for_task(task_id)
-            .map(|comment| {
-                comment.and_then(|comment| parse_failure_comment_field(&comment, "action"))
-            })
-    }
-
-    pub fn latest_failure_reason_for_task(&self, task_id: &TaskId) -> Result<Option<String>> {
-        self.latest_failure_comment_for_task(task_id)
-            .map(|comment| {
-                comment.and_then(|comment| parse_failure_comment_field(&comment, "reason"))
-            })
-    }
-
-    pub fn latest_failure_action_for_project(
-        &self,
-        project_id: &ProjectId,
-    ) -> Result<Option<String>> {
-        self.latest_failure_comment_for_project(project_id)
-            .map(|comment| {
-                comment.and_then(|comment| parse_failure_comment_field(&comment, "action"))
-            })
-    }
-
-    pub fn latest_failure_reason_for_project(
-        &self,
-        project_id: &ProjectId,
-    ) -> Result<Option<String>> {
-        self.latest_failure_comment_for_project(project_id)
-            .map(|comment| {
-                comment.and_then(|comment| parse_failure_comment_field(&comment, "reason"))
-            })
-    }
 
     fn latest_failure_comment_for_task(&self, task_id: &TaskId) -> Result<Option<String>> {
         let mut statement = self.connection.prepare(
@@ -1861,21 +1831,102 @@ impl Store {
     ) -> Result<Vec<TaskSnapshot>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT task_id
+            SELECT
+              tasks.task_id, tasks.project_id, tasks.parent_task_id, tasks.title,
+              tasks.assignee_actor_id, tasks.required_capability, tasks.status,
+              tasks.progress_value, tasks.progress_message, task_results.summary,
+              tasks.updated_at
             FROM tasks
-            WHERE project_id = ?1
-            ORDER BY updated_at DESC
+            LEFT JOIN task_results ON task_results.task_id = tasks.task_id
+            WHERE tasks.project_id = ?1
+            ORDER BY tasks.updated_at DESC
             "#,
         )?;
-        let task_ids = statement.query_map([project_id.as_str()], |row| row.get::<_, String>(0))?;
-        let mut tasks = Vec::new();
-        for task_id in task_ids {
-            let task_id = TaskId::new(task_id?).map_err(anyhow::Error::from)?;
-            if let Some(snapshot) = self.task_snapshot(&task_id)? {
-                tasks.push(snapshot);
+        let rows = statement.query_map([project_id.as_str()], |row| {
+            Ok(TaskSnapshot {
+                task_id: TaskId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)?,
+                project_id: ProjectId::new(row.get::<_, String>(1)?)
+                    .map_err(sql_conversion_error)?,
+                parent_task_id: row
+                    .get::<_, Option<String>>(2)?
+                    .map(TaskId::new)
+                    .transpose()
+                    .map_err(sql_conversion_error)?,
+                retry_attempt: 0,
+                title: row.get(3)?,
+                assignee_actor_id: ActorId::new(row.get::<_, String>(4)?)
+                    .map_err(sql_conversion_error)?,
+                required_capability: row.get(5)?,
+                status: row
+                    .get::<_, String>(6)?
+                    .parse()
+                    .map_err(sql_conversion_error)?,
+                progress_value: row.get(7)?,
+                progress_message: row.get(8)?,
+                result_summary: row.get(9)?,
+                latest_failure_action: None,
+                latest_failure_reason: None,
+                updated_at: row.get(10)?,
+            })
+        })?;
+
+        let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
+        let mut snapshots: Vec<TaskSnapshot> = Vec::new();
+        for row in rows {
+            let snapshot = row?;
+            parent_map.insert(
+                snapshot.task_id.to_string(),
+                snapshot.parent_task_id.as_ref().map(|t| t.to_string()),
+            );
+            snapshots.push(snapshot);
+        }
+
+        for snapshot in &mut snapshots {
+            snapshot.retry_attempt =
+                compute_retry_depth(snapshot.task_id.as_str(), &parent_map);
+        }
+
+        let mut failure_stmt = self.connection.prepare(
+            r#"
+            SELECT task_id, comment
+            FROM evaluation_certificates
+            WHERE project_id = ?1 AND comment LIKE 'result failed; action=%'
+            ORDER BY issued_at DESC
+            "#,
+        )?;
+        let failure_rows = failure_stmt.query_map([project_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut failure_map: HashMap<String, String> = HashMap::new();
+        for row in failure_rows {
+            let (task_id, comment) = row?;
+            failure_map.entry(task_id).or_insert(comment);
+        }
+        for snapshot in &mut snapshots {
+            if let Some(comment) = failure_map.get(snapshot.task_id.as_str()) {
+                snapshot.latest_failure_action =
+                    parse_failure_comment_field(comment, "action");
+                snapshot.latest_failure_reason =
+                    parse_failure_comment_field(comment, "reason");
             }
         }
-        Ok(tasks)
+
+        Ok(snapshots)
+    }
+
+    fn load_parent_map(&self, project_id: &ProjectId) -> Result<HashMap<String, Option<String>>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT task_id, parent_task_id FROM tasks WHERE project_id = ?1")?;
+        let rows = stmt.query_map([project_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (task_id, parent_task_id) = row?;
+            map.insert(task_id, parent_task_id);
+        }
+        Ok(map)
     }
 
     pub fn project_exists(&self, project_id: &ProjectId) -> Result<bool> {
@@ -2418,6 +2469,18 @@ fn format_time(timestamp: OffsetDateTime) -> std::result::Result<String, time::e
 
 fn parse_time(value: &str) -> std::result::Result<OffsetDateTime, time::error::Parse> {
     OffsetDateTime::parse(value, &Rfc3339)
+}
+
+fn compute_retry_depth(task_id: &str, parent_map: &HashMap<String, Option<String>>) -> u64 {
+    let mut depth = 0;
+    let mut current = Some(task_id.to_owned());
+    while let Some(ref tid) = current {
+        current = parent_map.get(tid.as_str()).and_then(|p| p.clone());
+        if current.is_some() {
+            depth += 1;
+        }
+    }
+    depth
 }
 
 fn parse_failure_comment_field(comment: &str, field: &str) -> Option<String> {

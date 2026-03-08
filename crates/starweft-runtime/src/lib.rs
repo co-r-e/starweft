@@ -7,6 +7,26 @@ use starweft_protocol::{
 };
 use starweft_store::Store;
 
+macro_rules! define_ingest {
+    ($method:ident, $type:ty, $($store_fn:ident),+) => {
+        pub fn $method(&self, envelope: &Envelope<$type>) -> Result<()> {
+            self.ingest_verified(envelope)?;
+            $(self.store.$store_fn(envelope)?;)+
+            Ok(())
+        }
+    };
+}
+
+macro_rules! define_record_local {
+    ($method:ident, $type:ty, $($store_fn:ident),+) => {
+        pub fn $method(&self, envelope: &Envelope<$type>) -> Result<()> {
+            self.store.append_task_event(envelope)?;
+            $(self.store.$store_fn(envelope)?;)+
+            Ok(())
+        }
+    };
+}
+
 pub struct RuntimePipeline<'a> {
     store: &'a Store,
 }
@@ -35,126 +55,24 @@ impl<'a> RuntimePipeline<'a> {
         Ok(())
     }
 
-    pub fn ingest_project_charter(&self, envelope: &Envelope<ProjectCharter>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.apply_project_charter(envelope)?;
-        Ok(())
-    }
+    define_ingest!(ingest_project_charter, ProjectCharter, apply_project_charter);
+    define_ingest!(ingest_task_delegated, TaskDelegated, apply_task_delegated);
+    define_ingest!(ingest_task_result_submitted, TaskResultSubmitted, apply_task_result_submitted);
+    define_ingest!(ingest_task_progress, TaskProgress, apply_task_progress);
+    define_ingest!(ingest_stop_order, StopOrder, save_stop_order, apply_stop_order_projection);
+    define_ingest!(ingest_stop_ack, StopAck, save_stop_ack);
+    define_ingest!(ingest_stop_complete, StopComplete, save_stop_complete, apply_stop_complete_projection);
+    define_ingest!(ingest_snapshot_response, SnapshotResponse, save_snapshot_response);
+    define_ingest!(ingest_evaluation_issued, EvaluationIssued, save_evaluation_certificate);
+    define_ingest!(ingest_publish_intent_proposed, PublishIntentProposed, save_publish_intent_proposed);
+    define_ingest!(ingest_publish_intent_skipped, PublishIntentSkipped, save_publish_intent_skipped);
+    define_ingest!(ingest_publish_result_recorded, PublishResultRecorded, save_publish_result_recorded);
 
-    pub fn record_local_project_charter(&self, envelope: &Envelope<ProjectCharter>) -> Result<()> {
-        self.store.append_task_event(envelope)?;
-        self.store.apply_project_charter(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_task_delegated(&self, envelope: &Envelope<TaskDelegated>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.apply_task_delegated(envelope)?;
-        Ok(())
-    }
-
-    pub fn record_local_task_delegated(&self, envelope: &Envelope<TaskDelegated>) -> Result<()> {
-        self.store.append_task_event(envelope)?;
-        self.store.apply_task_delegated(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_task_result_submitted(
-        &self,
-        envelope: &Envelope<TaskResultSubmitted>,
-    ) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.apply_task_result_submitted(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_task_progress(&self, envelope: &Envelope<TaskProgress>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.apply_task_progress(envelope)?;
-        Ok(())
-    }
-
-    pub fn record_local_task_result_submitted(
-        &self,
-        envelope: &Envelope<TaskResultSubmitted>,
-    ) -> Result<()> {
-        self.store.append_task_event(envelope)?;
-        self.store.apply_task_result_submitted(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_stop_order(&self, envelope: &Envelope<StopOrder>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_stop_order(envelope)?;
-        self.store.apply_stop_order_projection(envelope)?;
-        Ok(())
-    }
-
-    pub fn record_local_stop_order(&self, envelope: &Envelope<StopOrder>) -> Result<()> {
-        self.store.append_task_event(envelope)?;
-        self.store.save_stop_order(envelope)?;
-        self.store.apply_stop_order_projection(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_stop_ack(&self, envelope: &Envelope<StopAck>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_stop_ack(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_stop_complete(&self, envelope: &Envelope<StopComplete>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_stop_complete(envelope)?;
-        self.store.apply_stop_complete_projection(envelope)?;
-        Ok(())
-    }
-
-    pub fn record_local_stop_complete(&self, envelope: &Envelope<StopComplete>) -> Result<()> {
-        self.store.append_task_event(envelope)?;
-        self.store.save_stop_complete(envelope)?;
-        self.store.apply_stop_complete_projection(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_snapshot_response(&self, envelope: &Envelope<SnapshotResponse>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_snapshot_response(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_evaluation_issued(&self, envelope: &Envelope<EvaluationIssued>) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_evaluation_certificate(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_publish_intent_proposed(
-        &self,
-        envelope: &Envelope<PublishIntentProposed>,
-    ) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_publish_intent_proposed(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_publish_intent_skipped(
-        &self,
-        envelope: &Envelope<PublishIntentSkipped>,
-    ) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_publish_intent_skipped(envelope)?;
-        Ok(())
-    }
-
-    pub fn ingest_publish_result_recorded(
-        &self,
-        envelope: &Envelope<PublishResultRecorded>,
-    ) -> Result<()> {
-        self.ingest_verified(envelope)?;
-        self.store.save_publish_result_recorded(envelope)?;
-        Ok(())
-    }
+    define_record_local!(record_local_project_charter, ProjectCharter, apply_project_charter);
+    define_record_local!(record_local_task_delegated, TaskDelegated, apply_task_delegated);
+    define_record_local!(record_local_task_result_submitted, TaskResultSubmitted, apply_task_result_submitted);
+    define_record_local!(record_local_stop_order, StopOrder, save_stop_order, apply_stop_order_projection);
+    define_record_local!(record_local_stop_complete, StopComplete, save_stop_complete, apply_stop_complete_projection);
 }
 
 #[cfg(test)]
