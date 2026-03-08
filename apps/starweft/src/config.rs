@@ -1,0 +1,411 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    Principal,
+    Owner,
+    #[default]
+    Worker,
+    Relay,
+}
+
+impl std::fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Principal => "principal",
+            Self::Owner => "owner",
+            Self::Worker => "worker",
+            Self::Relay => "relay",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Config {
+    pub node: NodeSection,
+    #[serde(default)]
+    pub identity: IdentitySection,
+    #[serde(default)]
+    pub discovery: DiscoverySection,
+    #[serde(default)]
+    pub p2p: P2pSection,
+    #[serde(default)]
+    pub ledger: LedgerSection,
+    #[serde(default)]
+    pub openclaw: OpenClawSection,
+    #[serde(default)]
+    pub compatibility: CompatibilitySection,
+    #[serde(default)]
+    pub owner: OwnerSection,
+    #[serde(default)]
+    pub worker: WorkerSection,
+    #[serde(default)]
+    pub observation: ObservationSection,
+    #[serde(default)]
+    pub artifacts: ArtifactsSection,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeSection {
+    pub role: NodeRole,
+    pub display_name: String,
+    pub data_dir: String,
+    pub listen: Vec<String>,
+    pub log_level: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IdentitySection {
+    pub actor_key_path: Option<String>,
+    pub stop_authority_key_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiscoverySection {
+    pub seeds: Vec<String>,
+    pub auto_discovery: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct P2pSection {
+    pub transport: P2pTransportKind,
+    pub relay_enabled: bool,
+    pub direct_preferred: bool,
+    pub max_peers: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum P2pTransportKind {
+    #[default]
+    LocalMailbox,
+    Libp2p,
+}
+
+impl Default for P2pSection {
+    fn default() -> Self {
+        Self {
+            transport: P2pTransportKind::LocalMailbox,
+            relay_enabled: true,
+            direct_preferred: true,
+            max_peers: 128,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LedgerSection {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenClawSection {
+    pub enabled: bool,
+    pub bin: String,
+    pub working_dir: Option<String>,
+    pub timeout_sec: u64,
+    pub capability_version: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompatibilitySection {
+    pub protocol_version: String,
+    pub schema_version: String,
+    pub bridge_capability_version: String,
+    pub allow_legacy_protocols: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerSection {
+    pub accept_join_offers: bool,
+    pub max_active_tasks: u64,
+}
+
+impl Default for WorkerSection {
+    fn default() -> Self {
+        Self {
+            accept_join_offers: true,
+            max_active_tasks: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnerSection {
+    pub max_retry_attempts: u64,
+    pub retry_cooldown_ms: u64,
+    #[serde(default = "default_owner_retry_rules")]
+    pub retry_rules: Vec<OwnerRetryRule>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerRetryAction {
+    RetrySameWorker,
+    RetryDifferentWorker,
+    NoRetry,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnerRetryRule {
+    pub pattern: String,
+    pub action: OwnerRetryAction,
+    pub reason: String,
+}
+
+impl Default for OwnerSection {
+    fn default() -> Self {
+        Self {
+            max_retry_attempts: 8,
+            retry_cooldown_ms: 250,
+            retry_rules: default_owner_retry_rules(),
+        }
+    }
+}
+
+fn default_owner_retry_rules() -> Vec<OwnerRetryRule> {
+    vec![
+        OwnerRetryRule {
+            pattern: "timeout".to_owned(),
+            action: OwnerRetryAction::RetrySameWorker,
+            reason: "transient timeout".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "timed out".to_owned(),
+            action: OwnerRetryAction::RetrySameWorker,
+            reason: "transient timeout".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "process failed".to_owned(),
+            action: OwnerRetryAction::RetryDifferentWorker,
+            reason: "transient execution failure".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "worker overloaded".to_owned(),
+            action: OwnerRetryAction::RetryDifferentWorker,
+            reason: "transient execution failure".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "stderr".to_owned(),
+            action: OwnerRetryAction::RetryDifferentWorker,
+            reason: "transient execution failure".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "capability mismatch".to_owned(),
+            action: OwnerRetryAction::NoRetry,
+            reason: "permanent task/input failure".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "invalid input".to_owned(),
+            action: OwnerRetryAction::NoRetry,
+            reason: "permanent task/input failure".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "schema".to_owned(),
+            action: OwnerRetryAction::NoRetry,
+            reason: "permanent task/input failure".to_owned(),
+        },
+        OwnerRetryRule {
+            pattern: "unauthorized".to_owned(),
+            action: OwnerRetryAction::NoRetry,
+            reason: "permanent task/input failure".to_owned(),
+        },
+    ]
+}
+
+impl Default for OpenClawSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bin: "openclaw".to_owned(),
+            working_dir: None,
+            timeout_sec: 3600,
+            capability_version: "openclaw.execution.v1".to_owned(),
+        }
+    }
+}
+
+impl Default for CompatibilitySection {
+    fn default() -> Self {
+        Self {
+            protocol_version: "starweft/0.1".to_owned(),
+            schema_version: "starweft-store/1".to_owned(),
+            bridge_capability_version: "openclaw.execution.v1".to_owned(),
+            allow_legacy_protocols: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservationSection {
+    pub cache_snapshots: bool,
+    pub cache_ttl_sec: u64,
+}
+
+impl Default for ObservationSection {
+    fn default() -> Self {
+        Self {
+            cache_snapshots: true,
+            cache_ttl_sec: 30,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ArtifactsSection {
+    pub dir: String,
+}
+
+impl Config {
+    pub fn for_role(role: NodeRole, data_dir: &Path, display_name: Option<String>) -> Self {
+        let paths = DataPaths::from_root(data_dir);
+
+        Self {
+            node: NodeSection {
+                role,
+                display_name: display_name.unwrap_or_else(|| format!("{role}-node")),
+                data_dir: paths.root.display().to_string(),
+                listen: vec!["/ip4/0.0.0.0/udp/4001/quic-v1".to_owned()],
+                log_level: "info".to_owned(),
+            },
+            identity: IdentitySection {
+                actor_key_path: Some(paths.actor_key.display().to_string()),
+                stop_authority_key_path: (role == NodeRole::Principal)
+                    .then(|| paths.stop_authority_key.display().to_string()),
+            },
+            discovery: DiscoverySection {
+                seeds: Vec::new(),
+                auto_discovery: true,
+            },
+            p2p: P2pSection::default(),
+            ledger: LedgerSection {
+                path: paths.ledger_db.display().to_string(),
+            },
+            openclaw: OpenClawSection::default(),
+            compatibility: CompatibilitySection::default(),
+            owner: OwnerSection::default(),
+            worker: WorkerSection::default(),
+            observation: ObservationSection::default(),
+            artifacts: ArtifactsSection {
+                dir: paths.artifacts_dir.display().to_string(),
+            },
+        }
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        toml::from_str(std::str::from_utf8(&bytes)?)
+            .with_context(|| format!("failed to parse {}", path.display()))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DataPaths {
+    pub root: PathBuf,
+    pub config_toml: PathBuf,
+    pub identity_dir: PathBuf,
+    pub actor_key: PathBuf,
+    pub stop_authority_key: PathBuf,
+    pub ledger_db: PathBuf,
+    pub artifacts_dir: PathBuf,
+    pub logs_dir: PathBuf,
+    pub cache_dir: PathBuf,
+}
+
+impl DataPaths {
+    pub fn default() -> Result<Self> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            anyhow!("[E_CONFIG_NOT_FOUND] ホームディレクトリを特定できませんでした")
+        })?;
+        Ok(Self::from_root(home.join(".starweft")))
+    }
+
+    #[must_use]
+    pub fn from_root(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref().to_path_buf();
+        let identity_dir = root.join("identity");
+        Self {
+            config_toml: root.join("config.toml"),
+            actor_key: identity_dir.join("actor_key"),
+            stop_authority_key: identity_dir.join("stop_authority_key"),
+            ledger_db: root.join("ledger").join("node.db"),
+            artifacts_dir: root.join("artifacts"),
+            logs_dir: root.join("logs"),
+            cache_dir: root.join("cache"),
+            identity_dir,
+            root,
+        }
+    }
+
+    pub fn from_cli_arg(data_dir: Option<&PathBuf>) -> Result<Self> {
+        match data_dir {
+            Some(path) => Ok(Self::from_root(expand_home(path)?)),
+            None => Self::default(),
+        }
+    }
+
+    pub fn from_config(config: &Config) -> Result<Self> {
+        Ok(Self::from_root(expand_home(Path::new(
+            &config.node.data_dir,
+        ))?))
+    }
+
+    pub fn ensure_layout(&self) -> Result<()> {
+        for directory in [
+            &self.root,
+            &self.identity_dir,
+            &self.artifacts_dir,
+            &self.logs_dir,
+            &self.cache_dir,
+            self.ledger_db
+                .parent()
+                .ok_or_else(|| anyhow!("missing ledger parent"))?,
+        ] {
+            std::fs::create_dir_all(directory)
+                .with_context(|| format!("failed to create {}", directory.display()))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn load_existing_config(data_dir: Option<&PathBuf>) -> Result<(Config, DataPaths)> {
+    let paths = DataPaths::from_cli_arg(data_dir)?;
+    if !paths.config_toml.exists() {
+        bail!(
+            "[E_CONFIG_NOT_FOUND] config.toml が見つかりません: {}",
+            paths.config_toml.display()
+        );
+    }
+
+    let config = Config::load(&paths.config_toml)?;
+    let resolved = DataPaths::from_config(&config)?;
+    Ok((config, resolved))
+}
+
+pub fn expand_home(path: &Path) -> Result<PathBuf> {
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        return dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"));
+    }
+    if let Some(stripped) = path_str.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
+        return Ok(home.join(stripped));
+    }
+    Ok(path.to_path_buf())
+}

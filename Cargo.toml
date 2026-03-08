@@ -1,0 +1,44 @@
+[workspace]
+members = [
+  "apps/starweft",
+  "crates/starweft-crypto",
+  "crates/starweft-id",
+  "crates/starweft-observation",
+  "crates/starweft-openclaw-bridge",
+  "crates/starweft-p2p",
+  "crates/starweft-protocol",
+  "crates/starweft-runtime",
+  "crates/starweft-stop",
+  "crates/starweft-store",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+base64 = "0.22.1"
+clap = { version = "4.5.32", features = ["derive", "env"] }
+dirs = "6.0.0"
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+multiaddr = "0.18.2"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+rusqlite = { version = "0.34.0", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+time = { version = "=0.3.39", features = ["formatting", "macros", "parsing", "serde"] }
+toml = "0.8.20"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+ulid = { version = "1.2.0", features = ["serde"] }
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
