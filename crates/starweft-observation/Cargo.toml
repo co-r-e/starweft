@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Observation and monitoring primitives for starweft agents"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 starweft-id = { path = "../starweft-id" }
+starweft-protocol = { path = "../starweft-protocol" }
+time.workspace = true

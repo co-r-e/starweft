@@ -4,10 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Bridge integration between starweft and OpenClaw contract engine"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+libc = "0.2.171"
 serde.workspace = true
 serde_json.workspace = true
 wait-timeout = "0.2.0"
 starweft-protocol = { path = "../starweft-protocol" }
+
+[dev-dependencies]
+tempfile = "3.18.0"

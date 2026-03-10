@@ -70,6 +70,11 @@ pub struct IdentitySection {
 pub struct DiscoverySection {
     pub seeds: Vec<String>,
     pub auto_discovery: bool,
+    pub registry_url: Option<String>,
+    pub registry_ttl_sec: u64,
+    pub registry_heartbeat_sec: u64,
+    pub registry_shared_secret: Option<String>,
+    pub registry_shared_secret_env: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -140,8 +145,17 @@ impl Default for WorkerSection {
 pub struct OwnerSection {
     pub max_retry_attempts: u64,
     pub retry_cooldown_ms: u64,
+    #[serde(default)]
+    pub retry_strategy: RetryStrategyKind,
     #[serde(default = "default_owner_retry_rules")]
     pub retry_rules: Vec<OwnerRetryRule>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStrategyKind {
+    #[default]
+    RuleBased,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,6 +178,7 @@ impl Default for OwnerSection {
         Self {
             max_retry_attempts: 8,
             retry_cooldown_ms: 250,
+            retry_strategy: RetryStrategyKind::default(),
             retry_rules: default_owner_retry_rules(),
         }
     }
@@ -246,6 +261,33 @@ impl Default for CompatibilitySection {
 pub struct ObservationSection {
     pub cache_snapshots: bool,
     pub cache_ttl_sec: u64,
+    pub max_planned_tasks: usize,
+    pub min_task_objective_chars: usize,
+    #[serde(default)]
+    pub planner: PlanningStrategyKind,
+    #[serde(default)]
+    pub evaluator: EvaluationStrategyKind,
+    pub planner_bin: Option<String>,
+    pub planner_working_dir: Option<String>,
+    pub planner_timeout_sec: u64,
+    pub planner_capability_version: String,
+    pub planner_fallback_to_heuristic: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningStrategyKind {
+    #[default]
+    Heuristic,
+    Openclaw,
+    OpenclawWorker,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationStrategyKind {
+    #[default]
+    Heuristic,
 }
 
 impl Default for ObservationSection {
@@ -253,6 +295,15 @@ impl Default for ObservationSection {
         Self {
             cache_snapshots: true,
             cache_ttl_sec: 30,
+            max_planned_tasks: 6,
+            min_task_objective_chars: 48,
+            planner: PlanningStrategyKind::default(),
+            evaluator: EvaluationStrategyKind::default(),
+            planner_bin: None,
+            planner_working_dir: None,
+            planner_timeout_sec: 120,
+            planner_capability_version: "openclaw.plan.v1".to_owned(),
+            planner_fallback_to_heuristic: true,
         }
     }
 }
@@ -271,7 +322,7 @@ impl Config {
                 role,
                 display_name: display_name.unwrap_or_else(|| format!("{role}-node")),
                 data_dir: paths.root.display().to_string(),
-                listen: vec!["/ip4/0.0.0.0/udp/4001/quic-v1".to_owned()],
+                listen: vec![default_listen_multiaddr(&paths.root)],
                 log_level: "info".to_owned(),
             },
             identity: IdentitySection {
@@ -282,6 +333,11 @@ impl Config {
             discovery: DiscoverySection {
                 seeds: Vec::new(),
                 auto_discovery: true,
+                registry_url: None,
+                registry_ttl_sec: 300,
+                registry_heartbeat_sec: 60,
+                registry_shared_secret: None,
+                registry_shared_secret_env: None,
             },
             p2p: P2pSection::default(),
             ledger: LedgerSection {
@@ -313,6 +369,11 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
     }
+}
+
+fn default_listen_multiaddr(root: &Path) -> String {
+    let mailbox = root.join("mailbox.sock");
+    format!("/unix/{}", mailbox.display())
 }
 
 #[derive(Clone, Debug)]

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,29 @@ fn enable_openclaw_bridge(config_path: &Path, bin_path: &Path) {
     std::fs::write(config_path, updated).expect("write config");
 }
 
+fn set_owner_planner_strategy(config_path: &Path, strategy: &str) {
+    let config = std::fs::read_to_string(config_path).expect("read config");
+    let updated = config.replace(
+        "planner = \"heuristic\"",
+        &format!("planner = \"{strategy}\""),
+    );
+    std::fs::write(config_path, updated).expect("write config");
+}
+
+fn set_discovery_seeds(config_path: &Path, seeds: &[String]) {
+    let config = std::fs::read_to_string(config_path).expect("read config");
+    let seed_list = format!(
+        "[{}]",
+        seeds
+            .iter()
+            .map(|seed| format!("\"{seed}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let updated = config.replace("seeds = []", &format!("seeds = {seed_list}"));
+    std::fs::write(config_path, updated).expect("write config");
+}
+
 #[cfg(unix)]
 fn write_mock_openclaw(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -85,7 +109,7 @@ read input
 printf 'PROGRESS:0.3:mock-started\n'
 printf 'PROGRESS:0.7:mock-processing\n'
 printf 'warn-from-stderr\n' >&2
-printf '{"summary":"mock-openclaw","output_payload":{"runner":"mock","input":%s},"artifact_refs":[{"artifact_id":"art_mock_01","scheme":"file","uri":"/tmp/mock-artifact.json","sha256":null,"size":null,"encryption":null}]}' "$input"
+printf '{"summary":"mock-openclaw","output_payload":{"summary":"mock-openclaw","deliverables":[%s],"risks":["none"],"next_steps":["handoff"],"runner":"mock"},"artifact_refs":[{"artifact_id":"art_mock_01","scheme":"file","uri":"/tmp/mock-artifact.json","sha256":null,"size":null,"encryption":null}]}' "$input"
 "#;
     std::fs::write(path, script).expect("write mock openclaw");
     let mut perms = std::fs::metadata(path).expect("metadata").permissions();
@@ -103,6 +127,44 @@ printf 'fatal-from-stderr\n' >&2
 exit 1
 "#;
     std::fs::write(path, script).expect("write failing openclaw");
+    let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("chmod");
+}
+
+#[cfg(unix)]
+fn write_slow_openclaw(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = r#"#!/bin/sh
+printf 'PROGRESS:0.2:slow-started\n'
+sleep 10
+printf '{"summary":"slow-openclaw","output_payload":{"summary":"slow-openclaw","deliverables":["long-running"],"risks":["timeout"],"next_steps":["wait"]}}'
+"#;
+    std::fs::write(path, script).expect("write slow openclaw");
+    let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("chmod");
+}
+
+#[cfg(unix)]
+fn write_planner_aware_openclaw(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = r#"#!/bin/sh
+read input
+case "$input" in
+  *starweft_owner_planner*)
+    printf 'PROGRESS:0.2:planning-started\n'
+    printf '{"tasks":[{"title":"planned execution","description":"planned by worker","objective":"execute planned work","required_capability":"openclaw.execution.v1","input_payload":{"runner":"planner-worker"},"expected_output_schema":{"type":"object"},"rationale":"planner worker output"}]}'
+    ;;
+  *)
+    printf 'PROGRESS:0.3:mock-started\n'
+    printf '{"summary":"planner-worker-execution","output_payload":{"summary":"planner-worker-execution","deliverables":[%s],"risks":["none"],"next_steps":["handoff"],"runner":"planner-worker-execution"}}' "$input"
+    ;;
+esac
+"#;
+    std::fs::write(path, script).expect("write planner aware openclaw");
     let mut perms = std::fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).expect("chmod");
@@ -133,13 +195,23 @@ fn reserve_tcp_port() -> u16 {
         .port()
 }
 
+fn test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[test]
 fn libp2p_three_node_workflow_and_stop() {
+    let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
     let principal_dir = base.join("principal");
     let owner_dir = base.join("owner");
     let worker_dir = base.join("worker");
+    let mock_openclaw = base.join("mock-openclaw.sh");
+    write_mock_openclaw(&mock_openclaw);
     let principal_port = reserve_tcp_port();
     let owner_port = reserve_tcp_port();
     let worker_port = reserve_tcp_port();
@@ -194,6 +266,7 @@ fn libp2p_three_node_workflow_and_stop() {
     replace_transport_with_libp2p(&principal_dir.join("config.toml"));
     replace_transport_with_libp2p(&owner_dir.join("config.toml"));
     replace_transport_with_libp2p(&worker_dir.join("config.toml"));
+    enable_openclaw_bridge(&worker_dir.join("config.toml"), &mock_openclaw);
 
     let principal = parse_keyed_output(&run(&[
         "identity",
@@ -257,28 +330,6 @@ fn libp2p_three_node_workflow_and_stop() {
         ),
         "--data-dir",
         owner_dir.to_str().expect("path"),
-        "--actor-id",
-        &worker["actor_id"],
-        "--node-id",
-        &worker["node_id"],
-        "--public-key",
-        &worker["public_key"],
-    ]);
-    run(&[
-        "peer",
-        "add",
-        &format!(
-            "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
-            owner["libp2p_peer_id"]
-        ),
-        "--data-dir",
-        worker_dir.to_str().expect("path"),
-        "--actor-id",
-        &owner["actor_id"],
-        "--node-id",
-        &owner["node_id"],
-        "--public-key",
-        &owner["public_key"],
     ]);
 
     let mut owner_fg = spawn_foreground(&[
@@ -430,13 +481,753 @@ fn libp2p_three_node_workflow_and_stop() {
 }
 
 #[test]
+fn libp2p_worker_plans_vision_via_openclaw() {
+    let _guard = test_lock();
+    let temp = TempDir::new().expect("tempdir");
+    let base = temp.path();
+    let principal_dir = base.join("principal");
+    let owner_dir = base.join("owner");
+    let worker_dir = base.join("worker");
+    let planner_openclaw = base.join("planner-openclaw.sh");
+    write_planner_aware_openclaw(&planner_openclaw);
+    let principal_port = reserve_tcp_port();
+    let owner_port = reserve_tcp_port();
+    let worker_port = reserve_tcp_port();
+
+    run(&[
+        "init",
+        "--role",
+        "principal",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{principal_port}"),
+    ]);
+    run(&[
+        "init",
+        "--role",
+        "owner",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{owner_port}"),
+    ]);
+    run(&[
+        "init",
+        "--role",
+        "worker",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{worker_port}"),
+    ]);
+
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+    ]);
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]);
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+    ]);
+
+    replace_transport_with_libp2p(&principal_dir.join("config.toml"));
+    replace_transport_with_libp2p(&owner_dir.join("config.toml"));
+    replace_transport_with_libp2p(&worker_dir.join("config.toml"));
+    set_owner_planner_strategy(&owner_dir.join("config.toml"), "openclaw_worker");
+    enable_openclaw_bridge(&worker_dir.join("config.toml"), &planner_openclaw);
+
+    let principal = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+    ]));
+    let owner = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]));
+    let worker = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+    ]));
+
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
+            owner["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--actor-id",
+        &owner["actor_id"],
+        "--node-id",
+        &owner["node_id"],
+        "--public-key",
+        &owner["public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{principal_port}/p2p/{}",
+            principal["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--actor-id",
+        &principal["actor_id"],
+        "--node-id",
+        &principal["node_id"],
+        "--public-key",
+        &principal["public_key"],
+        "--stop-public-key",
+        &principal["stop_public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{worker_port}/p2p/{}",
+            worker["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]);
+
+    let mut owner_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let mut worker_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let mut principal_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+
+    thread::sleep(Duration::from_secs(2));
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.plan.v1",
+        Duration::from_secs(30),
+    );
+    run(&[
+        "vision",
+        "submit",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--title",
+        "Planned Vision",
+        "--text",
+        "let the worker decompose this vision",
+        "--owner",
+        &owner["actor_id"],
+    ]);
+
+    wait_for_contains(
+        &owner_db,
+        "select count(*) from task_results where status = 'completed';",
+        "2",
+        Duration::from_secs(45),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select title from tasks where parent_task_id is not null;",
+        "planned execution",
+        Duration::from_secs(45),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select required_capability from tasks;",
+        "openclaw.plan.v1",
+        Duration::from_secs(45),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select required_capability from tasks;",
+        "openclaw.execution.v1",
+        Duration::from_secs(45),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select summary from task_results;",
+        "planner-worker-execution",
+        Duration::from_secs(45),
+    );
+
+    stop_child(&mut principal_fg);
+    stop_child(&mut owner_fg);
+    stop_child(&mut worker_fg);
+}
+
+#[test]
+fn libp2p_bootstraps_via_discovery_seeds_without_peer_add() {
+    let _guard = test_lock();
+    let temp = TempDir::new().expect("tempdir");
+    let base = temp.path();
+    let principal_dir = base.join("principal");
+    let owner_dir = base.join("owner");
+    let worker_dir = base.join("worker");
+    let mock_openclaw = base.join("mock-openclaw.sh");
+    write_mock_openclaw(&mock_openclaw);
+    let principal_port = reserve_tcp_port();
+    let owner_port = reserve_tcp_port();
+    let worker_port = reserve_tcp_port();
+
+    run(&[
+        "init",
+        "--role",
+        "principal",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{principal_port}"),
+    ]);
+    run(&[
+        "init",
+        "--role",
+        "owner",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{owner_port}"),
+    ]);
+    run(&[
+        "init",
+        "--role",
+        "worker",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{worker_port}"),
+    ]);
+
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+    ]);
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]);
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+    ]);
+
+    replace_transport_with_libp2p(&principal_dir.join("config.toml"));
+    replace_transport_with_libp2p(&owner_dir.join("config.toml"));
+    replace_transport_with_libp2p(&worker_dir.join("config.toml"));
+    enable_openclaw_bridge(&worker_dir.join("config.toml"), &mock_openclaw);
+
+    let owner = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]));
+    let owner_seed = format!(
+        "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
+        owner["libp2p_peer_id"]
+    );
+    set_discovery_seeds(
+        &principal_dir.join("config.toml"),
+        std::slice::from_ref(&owner_seed),
+    );
+    set_discovery_seeds(
+        &worker_dir.join("config.toml"),
+        std::slice::from_ref(&owner_seed),
+    );
+
+    let mut owner_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let mut worker_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let mut principal_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+
+    let principal_db = principal_dir.join("ledger").join("node.db");
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &principal_db,
+        "select public_key from peer_keys;",
+        &owner["public_key"],
+        Duration::from_secs(30),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.execution.v1",
+        Duration::from_secs(30),
+    );
+
+    run(&[
+        "vision",
+        "submit",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--title",
+        "Seed Bootstrap Vision",
+        "--text",
+        "bootstrap through discovery seeds",
+    ]);
+
+    wait_for_contains(
+        &owner_db,
+        "select status from task_results;",
+        "completed",
+        Duration::from_secs(45),
+    );
+
+    stop_child(&mut principal_fg);
+    stop_child(&mut owner_fg);
+    stop_child(&mut worker_fg);
+}
+
+#[test]
+fn libp2p_owner_queries_capabilities_from_running_worker() {
+    let _guard = test_lock();
+    let temp = TempDir::new().expect("tempdir");
+    let base = temp.path();
+    let owner_dir = base.join("owner");
+    let worker_dir = base.join("worker");
+    let planner_openclaw = base.join("planner-openclaw.sh");
+    write_planner_aware_openclaw(&planner_openclaw);
+    let owner_port = reserve_tcp_port();
+    let worker_port = reserve_tcp_port();
+
+    run(&[
+        "init",
+        "--role",
+        "owner",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{owner_port}"),
+    ]);
+    run(&[
+        "init",
+        "--role",
+        "worker",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{worker_port}"),
+    ]);
+
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]);
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+    ]);
+
+    replace_transport_with_libp2p(&owner_dir.join("config.toml"));
+    replace_transport_with_libp2p(&worker_dir.join("config.toml"));
+    enable_openclaw_bridge(&worker_dir.join("config.toml"), &planner_openclaw);
+
+    let worker = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+    ]));
+
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{worker_port}/p2p/{}",
+            worker["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]);
+
+    let mut worker_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    thread::sleep(Duration::from_secs(2));
+    let mut owner_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.plan.v1",
+        Duration::from_secs(30),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.execution.v1",
+        Duration::from_secs(30),
+    );
+
+    stop_child(&mut owner_fg);
+    stop_child(&mut worker_fg);
+}
+
+#[test]
+fn libp2p_stop_cancels_running_worker_without_result_submission() {
+    let _guard = test_lock();
+    let temp = TempDir::new().expect("tempdir");
+    let base = temp.path();
+    let principal_dir = base.join("principal");
+    let owner_dir = base.join("owner");
+    let worker_dir = base.join("worker");
+    let slow_openclaw = base.join("slow-openclaw.sh");
+    write_slow_openclaw(&slow_openclaw);
+    let principal_port = reserve_tcp_port();
+    let owner_port = reserve_tcp_port();
+    let worker_port = reserve_tcp_port();
+
+    run(&[
+        "init",
+        "--role",
+        "principal",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{principal_port}"),
+    ]);
+    run(&[
+        "init",
+        "--role",
+        "owner",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{owner_port}"),
+    ]);
+    run(&[
+        "init",
+        "--role",
+        "worker",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--listen",
+        &format!("/ip4/127.0.0.1/tcp/{worker_port}"),
+    ]);
+
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+    ]);
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]);
+    run(&[
+        "identity",
+        "create",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+    ]);
+
+    replace_transport_with_libp2p(&principal_dir.join("config.toml"));
+    replace_transport_with_libp2p(&owner_dir.join("config.toml"));
+    replace_transport_with_libp2p(&worker_dir.join("config.toml"));
+    enable_openclaw_bridge(&worker_dir.join("config.toml"), &slow_openclaw);
+
+    let principal = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+    ]));
+    let owner = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+    ]));
+    let worker = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+    ]));
+
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
+            owner["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--actor-id",
+        &owner["actor_id"],
+        "--node-id",
+        &owner["node_id"],
+        "--public-key",
+        &owner["public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{principal_port}/p2p/{}",
+            principal["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--actor-id",
+        &principal["actor_id"],
+        "--node-id",
+        &principal["node_id"],
+        "--public-key",
+        &principal["public_key"],
+        "--stop-public-key",
+        &principal["stop_public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{worker_port}/p2p/{}",
+            worker["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--actor-id",
+        &worker["actor_id"],
+        "--node-id",
+        &worker["node_id"],
+        "--public-key",
+        &worker["public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
+            owner["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--actor-id",
+        &owner["actor_id"],
+        "--node-id",
+        &owner["node_id"],
+        "--public-key",
+        &owner["public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{principal_port}/p2p/{}",
+            principal["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--actor-id",
+        &principal["actor_id"],
+        "--node-id",
+        &principal["node_id"],
+        "--public-key",
+        &principal["public_key"],
+        "--stop-public-key",
+        &principal["stop_public_key"],
+    ]);
+
+    let mut worker_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let mut owner_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let mut principal_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+
+    thread::sleep(Duration::from_secs(2));
+    run(&[
+        "vision",
+        "submit",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--title",
+        "Cancellable Vision",
+        "--text",
+        "long running objective",
+        "--owner",
+        &owner["actor_id"],
+    ]);
+
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    let principal_db = principal_dir.join("ledger").join("node.db");
+    let worker_db = worker_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &worker_db,
+        "select status from tasks;",
+        "running",
+        Duration::from_secs(30),
+    );
+
+    let project_id = String::from_utf8(
+        Command::new("sqlite3")
+            .arg(&owner_db)
+            .arg("select project_id from projects limit 1;")
+            .output()
+            .expect("sqlite3 project")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_owned();
+    let task_id = String::from_utf8(
+        Command::new("sqlite3")
+            .arg(&owner_db)
+            .arg("select task_id from tasks limit 1;")
+            .output()
+            .expect("sqlite3 task")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_owned();
+
+    run(&[
+        "stop",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+        "--project",
+        &project_id,
+        "--reason-code",
+        "cancel",
+        "--reason",
+        "cancel running task",
+        "--yes",
+    ]);
+
+    wait_for_contains(
+        &principal_db,
+        "select ack_state from stop_receipts;",
+        "stopped",
+        Duration::from_secs(120),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select status from projects;",
+        "stopped",
+        Duration::from_secs(120),
+    );
+    wait_for_contains(
+        &worker_db,
+        "select status from tasks;",
+        "stopped",
+        Duration::from_secs(120),
+    );
+
+    thread::sleep(Duration::from_secs(1));
+    let task_result_count = String::from_utf8(
+        Command::new("sqlite3")
+            .arg(&owner_db)
+            .arg(format!(
+                "select count(*) from task_results where task_id = '{}';",
+                task_id
+            ))
+            .output()
+            .expect("sqlite3 task result count")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_owned();
+    assert_eq!(task_result_count, "0");
+
+    stop_child(&mut principal_fg);
+    stop_child(&mut owner_fg);
+    stop_child(&mut worker_fg);
+}
+
+#[test]
 fn libp2p_retries_after_join_reject() {
+    let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
     let principal_dir = base.join("principal");
     let owner_dir = base.join("owner");
     let worker_a_dir = base.join("worker-a");
     let worker_b_dir = base.join("worker-b");
+    let mock_openclaw = base.join("mock-openclaw.sh");
+    write_mock_openclaw(&mock_openclaw);
     let principal_port = reserve_tcp_port();
     let owner_port = reserve_tcp_port();
     let worker_a_port = reserve_tcp_port();
@@ -514,6 +1305,8 @@ fn libp2p_retries_after_join_reject() {
     }
     set_worker_accept_join_offers(&worker_a_dir.join("config.toml"), false);
     set_worker_accept_join_offers(&worker_b_dir.join("config.toml"), true);
+    enable_openclaw_bridge(&worker_a_dir.join("config.toml"), &mock_openclaw);
+    enable_openclaw_bridge(&worker_b_dir.join("config.toml"), &mock_openclaw);
 
     let principal = parse_keyed_output(&run(&[
         "identity",
@@ -683,13 +1476,13 @@ fn libp2p_retries_after_join_reject() {
         &owner_db,
         "select status from task_results;",
         "completed",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     );
     wait_for_contains(
         &owner_db,
         "select msg_type from inbox_messages where msg_type = 'JoinReject';",
         "JoinReject",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     );
     let join_reject_raw = String::from_utf8(
         Command::new("sqlite3")
@@ -728,6 +1521,7 @@ fn libp2p_retries_after_join_reject() {
 #[cfg(unix)]
 #[test]
 fn libp2p_worker_executes_via_openclaw_bridge() {
+    let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
     let principal_dir = base.join("principal");
@@ -970,6 +1764,7 @@ fn libp2p_worker_executes_via_openclaw_bridge() {
 #[cfg(unix)]
 #[test]
 fn libp2p_retries_after_failed_task_result() {
+    let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
     let principal_dir = base.join("principal");
@@ -977,7 +1772,9 @@ fn libp2p_retries_after_failed_task_result() {
     let worker_a_dir = base.join("worker-a");
     let worker_b_dir = base.join("worker-b");
     let failing_openclaw = base.join("failing-openclaw.sh");
+    let mock_openclaw = base.join("mock-openclaw.sh");
     write_failing_openclaw(&failing_openclaw);
+    write_mock_openclaw(&mock_openclaw);
 
     let principal_port = reserve_tcp_port();
     let owner_port = reserve_tcp_port();
@@ -1055,6 +1852,7 @@ fn libp2p_retries_after_failed_task_result() {
         };
 
     enable_openclaw_bridge(&failing_dir.join("config.toml"), &failing_openclaw);
+    enable_openclaw_bridge(&healthy_dir.join("config.toml"), &mock_openclaw);
 
     run(&[
         "peer",

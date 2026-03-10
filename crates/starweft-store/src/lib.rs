@@ -1,21 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use starweft_crypto::MessageSignature;
-use starweft_id::{
-    ActorId, MessageId, NodeId, ProjectId, SnapshotId, StopId, TaskId, VisionId,
-};
+use starweft_id::{ActorId, MessageId, NodeId, ProjectId, SnapshotId, StopId, TaskId, VisionId};
 use starweft_protocol::{
-    Envelope, EvaluationIssued, JoinAccept, JoinOffer, JoinReject, MsgType, PROTOCOL_VERSION,
-    ProjectCharter, ProjectStatus, PublishIntentProposed, PublishIntentSkipped,
-    PublishResultRecorded, SnapshotResponse, SnapshotScopeType, StopAck, StopComplete, StopOrder,
-    StopScopeType, TaskDelegated, TaskExecutionStatus, TaskProgress, TaskResultSubmitted,
-    TaskStatus,
+    ApprovalApplied, ApprovalGranted, Envelope, EvaluationIssued, JoinAccept, JoinOffer,
+    JoinReject, MsgType, PROTOCOL_VERSION, ProjectCharter, ProjectStatus, PublishIntentProposed,
+    PublishIntentSkipped, PublishResultRecorded, SnapshotResponse, SnapshotScopeType, StopAck,
+    StopComplete, StopOrder, StopScopeType, TaskDelegated, TaskExecutionStatus, TaskProgress,
+    TaskResultSubmitted, TaskStatus, VisionConstraints,
+};
+use starweft_stop::{
+    StopReceiptState, next_receipt_state_after_ack, next_receipt_state_after_complete,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS peer_keys (
   node_id TEXT NOT NULL,
   public_key TEXT NOT NULL,
   stop_public_key TEXT,
+  capabilities_json TEXT,
   updated_at TEXT NOT NULL
 );
 
@@ -131,6 +133,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE TABLE IF NOT EXISTS evaluation_certificates (
   eval_cert_id TEXT PRIMARY KEY,
+  msg_id TEXT,
   project_id TEXT NOT NULL,
   task_id TEXT,
   subject_actor_id TEXT NOT NULL,
@@ -162,10 +165,26 @@ CREATE TABLE IF NOT EXISTS stop_receipts (
 
 CREATE TABLE IF NOT EXISTS snapshots (
   snapshot_id TEXT PRIMARY KEY,
+  msg_id TEXT,
   scope_type TEXT NOT NULL,
   scope_id TEXT NOT NULL,
   snapshot_json TEXT NOT NULL,
+  requested_by_actor_id TEXT,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS approval_states (
+  scope_type TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  task_id TEXT,
+  approval_granted_msg_id TEXT NOT NULL,
+  approval_applied_msg_id TEXT NOT NULL,
+  approval_updated INTEGER NOT NULL DEFAULT 0,
+  resumed_task_ids_json TEXT,
+  dispatched INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (scope_type, scope_id)
 );
 
 CREATE TABLE IF NOT EXISTS inbox_messages (
@@ -196,268 +215,510 @@ CREATE TABLE IF NOT EXISTS publish_events (
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_certificates_msg_id
+  ON evaluation_certificates(msg_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_msg_id
+  ON snapshots(msg_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_events_msg_id
+  ON publish_events(msg_id);
+
+CREATE INDEX IF NOT EXISTS idx_approval_states_project
+  ON approval_states(project_id, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_approval_states_task
+  ON approval_states(task_id, updated_at);
 "#;
 
+/// The local node's identity record stored in the database.
 #[derive(Clone, Debug)]
 pub struct LocalIdentityRecord {
+    /// The actor ID of this node.
     pub actor_id: ActorId,
+    /// The node ID of this node.
     pub node_id: NodeId,
+    /// Actor type (e.g. `"owner"`, `"worker"`).
     pub actor_type: String,
+    /// Human-readable display name.
     pub display_name: String,
+    /// Base64-encoded public key.
     pub public_key: String,
+    /// Reference to the private key file path.
     pub private_key_ref: String,
+    /// When this identity was created.
     pub created_at: OffsetDateTime,
 }
 
+/// A known network address for a remote peer.
 #[derive(Clone, Debug)]
 pub struct PeerAddressRecord {
+    /// The peer's actor ID.
     pub actor_id: ActorId,
+    /// The peer's node ID.
     pub node_id: NodeId,
+    /// Multiaddr where the peer can be reached.
     pub multiaddr: String,
+    /// Last time this address was confirmed reachable.
     pub last_seen_at: Option<OffsetDateTime>,
 }
 
+/// Identity and capability information for a remote peer.
 #[derive(Clone, Debug)]
 pub struct PeerIdentityRecord {
+    /// The peer's actor ID.
     pub actor_id: ActorId,
+    /// The peer's node ID.
     pub node_id: NodeId,
+    /// Base64-encoded public key for message verification.
     pub public_key: String,
+    /// Optional separate public key for stop order verification.
     pub stop_public_key: Option<String>,
+    /// Capabilities advertised by this peer.
+    pub capabilities: Vec<String>,
+    /// When this identity record was last updated.
     pub updated_at: OffsetDateTime,
 }
 
+/// A stored vision record.
 #[derive(Clone, Debug)]
 pub struct VisionRecord {
+    /// Unique vision identifier.
     pub vision_id: VisionId,
+    /// The principal who submitted this vision.
     pub principal_actor_id: ActorId,
+    /// Short title.
     pub title: String,
+    /// Raw free-form vision text.
     pub raw_vision_text: String,
+    /// Serialized constraints.
     pub constraints: Value,
+    /// Current status of this vision.
     pub status: String,
+    /// When this vision was created.
     pub created_at: OffsetDateTime,
 }
 
+/// Aggregate statistics across all data in the store.
 #[derive(Clone, Debug, Default)]
 pub struct StoreStats {
+    /// Number of known peers.
     pub peer_count: u64,
+    /// Number of visions.
     pub vision_count: u64,
+    /// Number of projects.
     pub project_count: u64,
+    /// Number of currently running tasks.
     pub running_task_count: u64,
+    /// Number of outbox messages awaiting delivery.
     pub queued_outbox_count: u64,
+    /// Number of stop orders.
     pub stop_order_count: u64,
+    /// Number of snapshots.
     pub snapshot_count: u64,
+    /// Number of evaluation certificates.
     pub evaluation_count: u64,
+    /// Number of artifacts.
     pub artifact_count: u64,
+    /// Number of unprocessed inbox messages.
     pub inbox_unprocessed_count: u64,
 }
 
+/// Statistics scoped to a specific actor.
 #[derive(Clone, Debug, Default)]
 pub struct ActorScopedStats {
+    /// Visions initiated by this actor as principal.
     pub principal_vision_count: u64,
+    /// Projects initiated by this actor as principal.
     pub principal_project_count: u64,
+    /// Projects owned (orchestrated) by this actor.
     pub owned_project_count: u64,
+    /// Total tasks assigned to this actor.
     pub assigned_task_count: u64,
+    /// Currently active tasks assigned to this actor.
     pub active_assigned_task_count: u64,
+    /// Tasks issued (delegated) by this actor.
     pub issued_task_count: u64,
+    /// Evaluations where this actor is the subject.
     pub evaluation_subject_count: u64,
+    /// Evaluations issued by this actor.
     pub evaluation_issuer_count: u64,
+    /// Stop receipts acknowledged by this actor.
     pub stop_receipt_count: u64,
+    /// Cached project snapshots.
     pub cached_project_snapshot_count: u64,
+    /// Cached task snapshots.
     pub cached_task_snapshot_count: u64,
 }
 
+/// An outbound message queued for delivery.
 #[derive(Clone, Debug)]
 pub struct OutboxMessageRecord {
+    /// Unique message identifier.
     pub msg_id: String,
+    /// Message type discriminator.
     pub msg_type: String,
+    /// When this message was queued.
     pub queued_at: String,
+    /// Serialized JSON of the full envelope.
     pub raw_json: String,
+    /// Current delivery state (e.g. `"queued"`, `"delivered"`).
     pub delivery_state: String,
 }
 
+/// A recorded task event from the event log.
 #[derive(Clone, Debug)]
 pub struct TaskEventRecord {
+    /// Unique message identifier.
     pub msg_id: String,
+    /// Project this event belongs to.
     pub project_id: String,
+    /// Task this event relates to, if any.
     pub task_id: Option<String>,
+    /// Message type discriminator.
     pub msg_type: String,
+    /// Actor that produced this event.
     pub from_actor_id: String,
+    /// Target actor, if directed.
     pub to_actor_id: Option<String>,
+    /// Lamport logical timestamp.
     pub lamport_ts: u64,
+    /// When this event was created.
     pub created_at: String,
+    /// Serialized JSON of the message body.
     pub body_json: String,
+    /// Serialized JSON of the signature.
     pub signature_json: String,
+    /// Full raw JSON of the original envelope.
     pub raw_json: Option<String>,
 }
 
+/// An evaluation record with parsed scores.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct EvaluationRecord {
+    /// Project this evaluation belongs to.
     pub project_id: ProjectId,
+    /// Task being evaluated, if task-scoped.
     pub task_id: Option<TaskId>,
+    /// Actor whose work was evaluated.
     pub subject_actor_id: ActorId,
+    /// Actor who issued the evaluation.
     pub issuer_actor_id: ActorId,
+    /// Per-dimension score values.
     pub scores: Value,
+    /// Evaluator's comment.
     pub comment: Option<String>,
+    /// When the evaluation was issued.
     pub issued_at: String,
 }
 
+/// A stored artifact record.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ArtifactRecord {
+    /// Unique artifact identifier.
     pub artifact_id: String,
+    /// Task that produced this artifact.
     pub task_id: TaskId,
+    /// Project this artifact belongs to.
     pub project_id: ProjectId,
+    /// Storage scheme (e.g. `"file"`, `"s3"`).
     pub scheme: String,
+    /// URI pointing to the artifact location.
     pub uri: String,
+    /// SHA-256 hash of the artifact content.
     pub sha256: Option<String>,
+    /// Size of the artifact in bytes.
     pub size_bytes: Option<i64>,
+    /// When this artifact was created.
     pub created_at: String,
 }
 
+/// Counts of tasks in each status for a project snapshot.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct TaskCountsSnapshot {
+    /// Tasks waiting in the queue.
     pub queued: u64,
+    /// Tasks offered to workers.
     pub offered: u64,
+    /// Tasks accepted by workers.
     pub accepted: u64,
+    /// Tasks currently being executed.
     pub running: u64,
+    /// Tasks with submitted results pending evaluation.
     pub submitted: u64,
+    /// Tasks that completed successfully.
     pub completed: u64,
+    /// Tasks that failed.
     pub failed: u64,
+    /// Tasks in the process of being stopped.
     pub stopping: u64,
+    /// Tasks that were stopped.
     pub stopped: u64,
 }
 
+/// Aggregated progress information for a project.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ProjectProgressSnapshot {
+    /// Number of tasks in an active (non-terminal) state.
     pub active_task_count: u64,
+    /// Number of tasks that have reported progress.
     pub reported_task_count: u64,
+    /// Average progress value across reported tasks.
     pub average_progress_value: Option<f32>,
+    /// Most recent progress message from any task.
     pub latest_progress_message: Option<String>,
+    /// Timestamp of the most recent progress report.
     pub latest_progress_at: Option<String>,
 }
 
+/// Retry state for a project's tasks.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ProjectRetrySnapshot {
+    /// Number of tasks that have been retried.
     pub retry_task_count: u64,
+    /// Highest retry attempt count among all tasks.
     pub max_retry_attempt: u64,
+    /// Task ID of the most recent retry.
     pub latest_retry_task_id: Option<TaskId>,
+    /// Parent task ID of the most recent retry.
     pub latest_retry_parent_task_id: Option<TaskId>,
+    /// Failure action from the most recent retry.
     pub latest_failure_action: Option<String>,
+    /// Failure reason from the most recent retry.
     pub latest_failure_reason: Option<String>,
 }
 
+/// A complete snapshot of a project's current state.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ProjectSnapshot {
+    /// Unique project identifier.
     pub project_id: ProjectId,
+    /// The originating vision ID.
     pub vision_id: VisionId,
+    /// Project title.
     pub title: String,
+    /// Project objective.
     pub objective: String,
+    /// Current project lifecycle status.
     pub status: ProjectStatus,
+    /// Plan version counter.
     pub plan_version: i64,
+    /// Counts of tasks per status.
     pub task_counts: TaskCountsSnapshot,
+    /// Aggregated progress across active tasks.
     pub progress: ProjectProgressSnapshot,
+    /// Retry state summary.
     pub retry: ProjectRetrySnapshot,
+    /// Approval state summary.
+    pub approval: ApprovalSnapshot,
+    /// When this snapshot was last updated.
     pub updated_at: String,
 }
 
+/// A snapshot of a task's current state.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct TaskSnapshot {
+    /// Unique task identifier.
     pub task_id: TaskId,
+    /// Project this task belongs to.
     pub project_id: ProjectId,
+    /// Parent task, if this is a sub-task.
     pub parent_task_id: Option<TaskId>,
+    /// How many times this task has been retried.
     pub retry_attempt: u64,
+    /// Task title.
     pub title: String,
+    /// Actor assigned to execute this task.
     pub assignee_actor_id: ActorId,
+    /// Required capability for this task.
     pub required_capability: Option<String>,
+    /// Current task lifecycle status.
     pub status: TaskStatus,
+    /// Latest reported progress value (0.0 to 1.0).
     pub progress_value: Option<f32>,
+    /// Latest reported progress message.
     pub progress_message: Option<String>,
+    /// Summary from the task result, if submitted.
     pub result_summary: Option<String>,
+    /// Failure action from the most recent attempt.
     pub latest_failure_action: Option<String>,
+    /// Failure reason from the most recent attempt.
     pub latest_failure_reason: Option<String>,
+    /// Approval state for this task.
+    pub approval: ApprovalSnapshot,
+    /// When this snapshot was last updated.
     pub updated_at: String,
 }
 
+/// Approval state snapshot for a project or task.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct ApprovalSnapshot {
+    /// Current approval state (e.g. `"none"`, `"granted"`).
+    pub state: String,
+    /// When the approval state was last changed.
+    pub updated_at: Option<String>,
+    /// Scope type of the latest approval.
+    pub scope_type: Option<String>,
+    /// Scope ID of the latest approval.
+    pub scope_id: Option<String>,
+    /// Whether the approval was updated (vs initial).
+    pub approval_updated: Option<bool>,
+    /// Number of tasks resumed by this approval.
+    pub resumed_task_count: Option<u64>,
+    /// Whether dispatching was triggered.
+    pub dispatched: Option<bool>,
+}
+
+/// A stored snapshot record.
 #[derive(Clone, Debug)]
 pub struct SnapshotRecord {
+    /// Unique snapshot identifier.
     pub snapshot_id: SnapshotId,
+    /// Scope type (e.g. `"project"`, `"task"`).
     pub scope_type: String,
+    /// ID of the snapshotted entity.
     pub scope_id: String,
+    /// Serialized snapshot JSON.
     pub snapshot_json: String,
+    /// When this snapshot was created.
     pub created_at: String,
 }
 
+/// A recorded publish event (proposed, skipped, or recorded).
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PublishEventRecord {
+    /// Auto-incremented event ID.
     pub event_id: i64,
+    /// Originating message ID, if any.
     pub msg_id: Option<String>,
+    /// Message type that created this event.
     pub msg_type: String,
+    /// Scope type (e.g. `"project"`, `"task"`).
     pub scope_type: String,
+    /// ID of the scoped entity.
     pub scope_id: String,
+    /// Publish target identifier.
     pub target: String,
+    /// Publish status.
     pub status: String,
+    /// Summary of the publish event.
     pub summary: String,
+    /// Serialized event payload.
     pub payload: Value,
+    /// When this event was created.
     pub created_at: String,
 }
 
+/// A stored evaluation certificate record.
 #[derive(Clone, Debug)]
 pub struct EvaluationCertificateRecord {
+    /// Unique evaluation certificate identifier.
     pub eval_cert_id: String,
+    /// Project this evaluation belongs to.
     pub project_id: ProjectId,
+    /// Task being evaluated, if task-scoped.
     pub task_id: Option<TaskId>,
+    /// Actor whose work was evaluated.
     pub subject_actor_id: ActorId,
+    /// Actor who issued the evaluation.
     pub issuer_actor_id: ActorId,
+    /// Serialized scores JSON.
     pub scores_json: String,
+    /// Evaluator's comment.
     pub comment: Option<String>,
+    /// When this evaluation was issued.
     pub issued_at: String,
 }
 
+#[derive(Clone, Debug)]
+struct ApprovalProjectionRecord {
+    scope_type: String,
+    scope_id: String,
+    approval_updated: bool,
+    resumed_task_count: u64,
+    dispatched: bool,
+    updated_at: String,
+}
+
+/// Summary of an audit over the task event log.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct AuditReport {
+    /// Total number of task events.
     pub total_events: u64,
+    /// Events sharing the same Lamport timestamp within a project.
     pub duplicate_lamport_pairs: u64,
+    /// Events referencing tasks that do not exist.
     pub orphan_task_events: u64,
+    /// Tasks whose project does not exist.
     pub tasks_without_project: u64,
+    /// Number of outbox messages still queued.
     pub queued_outbox_messages: u64,
 }
 
+/// Report produced after rebuilding projections from the event log.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct RepairRebuildReport {
+    /// Number of events replayed.
     pub replayed_events: u64,
+    /// Number of project projections rebuilt.
     pub rebuilt_projects: u64,
+    /// Number of task projections rebuilt.
     pub rebuilt_tasks: u64,
+    /// Number of task result projections rebuilt.
     pub rebuilt_task_results: u64,
+    /// Number of evaluation projections rebuilt.
     pub rebuilt_evaluations: u64,
+    /// Number of publish event projections rebuilt.
+    pub rebuilt_publish_events: u64,
+    /// Number of snapshot projections rebuilt.
+    pub rebuilt_snapshots: u64,
+    /// Number of stop order projections rebuilt.
     pub rebuilt_stop_orders: u64,
+    /// Number of stop receipt projections rebuilt.
     pub rebuilt_stop_receipts: u64,
 }
 
+/// Report produced after resuming stalled outbox messages.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct RepairResumeOutboxReport {
+    /// Number of outbox messages resumed.
     pub resumed_messages: u64,
 }
 
+/// Report produced after reconciling running tasks with stop orders.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct RepairReconcileRunningTasksReport {
+    /// Number of tasks moved to `stopped` status.
     pub stopped_tasks: u64,
+    /// Number of tasks moved to `stopping` status.
     pub stopping_tasks: u64,
 }
 
+/// Report produced after verifying the integrity of the task event log.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct AuditVerifyLogReport {
+    /// Total events examined.
     pub total_events: u64,
+    /// Duplicate project charter events detected.
     pub duplicate_project_charters: u64,
+    /// Events with missing task IDs.
     pub missing_task_ids: u64,
+    /// Lamport timestamp regressions detected.
     pub lamport_regressions: u64,
+    /// Events that failed to parse.
     pub parse_failures: u64,
+    /// Detailed error messages for each issue found.
     pub errors: Vec<String>,
 }
 
+/// SQLite-backed store for all Starweft runtime state.
 pub struct Store {
     connection: Connection,
 }
 
 impl Store {
+    /// Opens or creates an SQLite database at the given path and runs migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -468,13 +729,18 @@ impl Store {
         let connection =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         connection.execute_batch(MIGRATIONS)?;
-        ensure_peer_keys_stop_column(&connection)?;
+        ensure_peer_keys_columns(&connection)?;
         ensure_tasks_progress_columns(&connection)?;
         ensure_task_events_raw_json_column(&connection)?;
+        ensure_evaluation_certificates_msg_id_column(&connection)?;
+        ensure_snapshots_msg_id_column(&connection)?;
+        ensure_snapshots_requested_by_actor_column(&connection)?;
+        ensure_publish_events_msg_id_index(&connection)?;
 
         Ok(Self { connection })
     }
 
+    /// Inserts or replaces the local node identity record.
     pub fn upsert_local_identity(&self, record: &LocalIdentityRecord) -> Result<()> {
         self.connection.execute(
             r#"
@@ -496,6 +762,7 @@ impl Store {
         Ok(())
     }
 
+    /// Retrieves the local node identity, if one has been registered.
     pub fn local_identity(&self) -> Result<Option<LocalIdentityRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -523,6 +790,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Adds or updates a known address for a remote peer.
     pub fn add_peer_address(&self, peer: &PeerAddressRecord) -> Result<()> {
         self.connection.execute(
             r#"
@@ -542,6 +810,7 @@ impl Store {
         Ok(())
     }
 
+    /// Lists all known peer addresses.
     pub fn list_peer_addresses(&self) -> Result<Vec<PeerAddressRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -569,15 +838,30 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Removes peer addresses last seen before the given cutoff time.
+    pub fn purge_stale_peer_addresses(&self, cutoff: OffsetDateTime) -> Result<u64> {
+        let removed = self.connection.execute(
+            r#"
+            DELETE FROM peer_addresses
+            WHERE last_seen_at IS NOT NULL
+              AND last_seen_at < ?1
+            "#,
+            [format_time(cutoff)?],
+        )?;
+        Ok(removed as u64)
+    }
+
+    /// Inserts or replaces identity and capability data for a remote peer.
     pub fn upsert_peer_identity(&self, peer: &PeerIdentityRecord) -> Result<()> {
         self.connection.execute(
             r#"
-            INSERT INTO peer_keys (actor_id, node_id, public_key, stop_public_key, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO peer_keys (actor_id, node_id, public_key, stop_public_key, capabilities_json, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(actor_id) DO UPDATE SET
               node_id = excluded.node_id,
               public_key = excluded.public_key,
               stop_public_key = excluded.stop_public_key,
+              capabilities_json = excluded.capabilities_json,
               updated_at = excluded.updated_at
             "#,
             params![
@@ -585,16 +869,18 @@ impl Store {
                 peer.node_id.as_str(),
                 &peer.public_key,
                 peer.stop_public_key.as_deref(),
+                serde_json::to_string(&peer.capabilities)?,
                 format_time(peer.updated_at)?,
             ],
         )?;
         Ok(())
     }
 
+    /// Retrieves identity data for a peer by actor ID.
     pub fn peer_identity(&self, actor_id: &ActorId) -> Result<Option<PeerIdentityRecord>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT actor_id, node_id, public_key, stop_public_key, updated_at
+            SELECT actor_id, node_id, public_key, stop_public_key, capabilities_json, updated_at
             FROM peer_keys
             WHERE actor_id = ?1
             LIMIT 1
@@ -609,7 +895,13 @@ impl Store {
                     node_id: NodeId::new(row.get::<_, String>(1)?).map_err(sql_conversion_error)?,
                     public_key: row.get(2)?,
                     stop_public_key: row.get(3)?,
-                    updated_at: parse_time(&row.get::<_, String>(4)?)
+                    capabilities: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|json| serde_json::from_str::<Vec<String>>(&json))
+                        .transpose()
+                        .map_err(sql_conversion_error)?
+                        .unwrap_or_default(),
+                    updated_at: parse_time(&row.get::<_, String>(5)?)
                         .map_err(sql_conversion_error)?,
                 })
             })
@@ -617,6 +909,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Persists a new vision record.
     pub fn save_vision(&self, record: &VisionRecord) -> Result<()> {
         self.connection.execute(
             r#"
@@ -644,6 +937,7 @@ impl Store {
         Ok(())
     }
 
+    /// Queues a signed envelope in the outbox for delivery.
     pub fn queue_outbox<T>(&self, envelope: &Envelope<T>) -> Result<()>
     where
         T: Serialize,
@@ -664,13 +958,14 @@ impl Store {
         Ok(())
     }
 
+    /// Saves an incoming envelope to the inbox.
     pub fn save_inbox_message<T>(&self, envelope: &Envelope<T>) -> Result<()>
     where
         T: Serialize,
     {
         self.connection.execute(
             r#"
-            INSERT OR REPLACE INTO inbox_messages (msg_id, msg_type, received_at, raw_json, processed)
+            INSERT OR IGNORE INTO inbox_messages (msg_id, msg_type, received_at, raw_json, processed)
             VALUES (?1, ?2, ?3, ?4, 0)
             "#,
             params![
@@ -684,6 +979,28 @@ impl Store {
         Ok(())
     }
 
+    /// Returns whether an inbox message has already been processed.
+    pub fn inbox_message_processed(&self, msg_id: &MessageId) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT processed FROM inbox_messages WHERE msg_id = ?1 LIMIT 1")?;
+        let processed = statement
+            .query_row([msg_id.as_str()], |row| row.get::<_, i64>(0))
+            .optional()?
+            .unwrap_or(0);
+        Ok(processed != 0)
+    }
+
+    /// Marks an inbox message as processed.
+    pub fn mark_inbox_message_processed(&self, msg_id: &MessageId) -> Result<()> {
+        self.connection.execute(
+            "UPDATE inbox_messages SET processed = 1 WHERE msg_id = ?1",
+            [msg_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Appends a signed envelope to the task event log.
     pub fn append_task_event<T>(&self, envelope: &Envelope<T>) -> Result<()>
     where
         T: Serialize,
@@ -721,6 +1038,7 @@ impl Store {
         Ok(())
     }
 
+    /// Persists a stop order from a signed envelope.
     pub fn save_stop_order(&self, envelope: &Envelope<StopOrder>) -> Result<()> {
         self.connection.execute(
             r#"
@@ -730,7 +1048,7 @@ impl Store {
             "#,
             params![
                 envelope.body.stop_id.as_str(),
-                serde_json::to_string(&envelope.body.scope_type)?,
+                stop_scope_type_name(&envelope.body.scope_type),
                 &envelope.body.scope_id,
                 envelope.from_actor_id.as_str(),
                 &envelope.body.reason_code,
@@ -743,38 +1061,59 @@ impl Store {
         Ok(())
     }
 
+    /// Records a stop acknowledgment receipt.
     pub fn save_stop_ack(&self, envelope: &Envelope<StopAck>) -> Result<()> {
+        let stop_id = envelope.body.stop_id.as_str();
+        let actor_id = envelope.body.actor_id.as_str();
+        let next_state = next_receipt_state_after_ack(
+            self.stop_receipt_state(&envelope.body.stop_id, &envelope.body.actor_id)?,
+            &envelope.body.ack_state,
+        );
         self.connection.execute(
             r#"
-            INSERT OR REPLACE INTO stop_receipts (stop_id, actor_id, ack_state, acknowledged_at)
+            INSERT INTO stop_receipts (stop_id, actor_id, ack_state, acknowledged_at)
             VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(stop_id, actor_id) DO UPDATE SET
+              ack_state = excluded.ack_state,
+              acknowledged_at = excluded.acknowledged_at
             "#,
             params![
-                envelope.body.stop_id.as_str(),
-                envelope.body.actor_id.as_str(),
-                "stopping",
+                stop_id,
+                actor_id,
+                next_state.as_str(),
                 format_time(envelope.body.acked_at)?,
             ],
         )?;
         Ok(())
     }
 
+    /// Records a stop completion receipt.
     pub fn save_stop_complete(&self, envelope: &Envelope<StopComplete>) -> Result<()> {
+        let stop_id = envelope.body.stop_id.as_str();
+        let actor_id = envelope.body.actor_id.as_str();
+        let next_state = next_receipt_state_after_complete(
+            self.stop_receipt_state(&envelope.body.stop_id, &envelope.body.actor_id)?,
+            &envelope.body,
+        );
         self.connection.execute(
             r#"
-            INSERT OR REPLACE INTO stop_receipts (stop_id, actor_id, ack_state, acknowledged_at)
+            INSERT INTO stop_receipts (stop_id, actor_id, ack_state, acknowledged_at)
             VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(stop_id, actor_id) DO UPDATE SET
+              ack_state = excluded.ack_state,
+              acknowledged_at = excluded.acknowledged_at
             "#,
             params![
-                envelope.body.stop_id.as_str(),
-                envelope.body.actor_id.as_str(),
-                "stopped",
+                stop_id,
+                actor_id,
+                next_state.as_str(),
                 format_time(envelope.body.completed_at)?,
             ],
         )?;
         Ok(())
     }
 
+    /// Applies a project charter to create or update a project projection.
     pub fn apply_project_charter(&self, envelope: &Envelope<ProjectCharter>) -> Result<()> {
         self.connection.execute(
             r#"
@@ -806,6 +1145,50 @@ impl Store {
         Ok(())
     }
 
+    /// Applies an approval-applied message to update approval projections.
+    pub fn apply_approval_applied(&self, envelope: &Envelope<ApprovalApplied>) -> Result<()> {
+        let project_id = envelope
+            .project_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("project_id is required for ApprovalApplied projection"))?;
+        let task_id = envelope.task_id.as_ref().map(TaskId::as_str);
+        let scope_type = match envelope.body.scope_type {
+            starweft_protocol::ApprovalScopeType::Project => "project",
+            starweft_protocol::ApprovalScopeType::Task => "task",
+        };
+        self.connection.execute(
+            r#"
+            INSERT INTO approval_states (
+              scope_type, scope_id, project_id, task_id, approval_granted_msg_id,
+              approval_applied_msg_id, approval_updated, resumed_task_ids_json, dispatched, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+              project_id = excluded.project_id,
+              task_id = excluded.task_id,
+              approval_granted_msg_id = excluded.approval_granted_msg_id,
+              approval_applied_msg_id = excluded.approval_applied_msg_id,
+              approval_updated = excluded.approval_updated,
+              resumed_task_ids_json = excluded.resumed_task_ids_json,
+              dispatched = excluded.dispatched,
+              updated_at = excluded.updated_at
+            "#,
+            params![
+                scope_type,
+                &envelope.body.scope_id,
+                project_id.as_str(),
+                task_id,
+                envelope.body.approval_granted_msg_id.as_str(),
+                envelope.msg_id.as_str(),
+                i64::from(envelope.body.approval_updated),
+                serde_json::to_string(&envelope.body.resumed_task_ids)?,
+                i64::from(envelope.body.dispatched),
+                format_time(envelope.body.applied_at)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Applies a task-delegated message to create a new task projection.
     pub fn apply_task_delegated(&self, envelope: &Envelope<TaskDelegated>) -> Result<()> {
         let project_id = envelope
             .project_id
@@ -819,6 +1202,11 @@ impl Store {
             .to_actor_id
             .as_ref()
             .ok_or_else(|| anyhow!("to_actor_id is required for TaskDelegated projection"))?;
+        if let Some(parent_task_id) = envelope.body.parent_task_id.as_ref() {
+            if self.would_create_task_cycle(task_id, parent_task_id)? {
+                bail!("task hierarchy cycle detected for task_id={task_id}");
+            }
+        }
 
         self.connection.execute(
             r#"
@@ -833,10 +1221,17 @@ impl Store {
               assignee_actor_id = excluded.assignee_actor_id,
               title = excluded.title,
               required_capability = excluded.required_capability,
-              status = excluded.status,
-              progress_value = excluded.progress_value,
-              progress_message = excluded.progress_message,
-              updated_at = excluded.updated_at
+              status = CASE
+                WHEN tasks.status IN ('accepted', 'running', 'stopping', 'completed', 'failed', 'stopped')
+                  THEN tasks.status
+                ELSE excluded.status
+              END,
+              progress_value = COALESCE(tasks.progress_value, excluded.progress_value),
+              progress_message = COALESCE(tasks.progress_message, excluded.progress_message),
+              updated_at = CASE
+                WHEN tasks.updated_at > excluded.updated_at THEN tasks.updated_at
+                ELSE excluded.updated_at
+              END
             "#,
             params![
                 task_id.as_str(),
@@ -864,6 +1259,7 @@ impl Store {
         Ok(())
     }
 
+    /// Applies a task progress update to the task and project projections.
     pub fn apply_task_progress(
         &self,
         envelope: &Envelope<starweft_protocol::TaskProgress>,
@@ -872,28 +1268,89 @@ impl Store {
             .task_id
             .as_ref()
             .ok_or_else(|| anyhow!("task_id is required for TaskProgress projection"))?;
+        let updated_at = format_time(envelope.created_at)?;
 
-        self.connection.execute(
+        let updated = self.connection.execute(
             r#"
             UPDATE tasks
-            SET status = ?5,
-                progress_value = ?2,
-                progress_message = ?3,
-                updated_at = ?4
+            SET status = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN status
+                  ELSE ?5
+                END,
+                progress_value = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN progress_value
+                  ELSE ?2
+                END,
+                progress_message = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN progress_message
+                  ELSE ?3
+                END,
+                updated_at = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN updated_at
+                  ELSE ?4
+                END
             WHERE task_id = ?1
             "#,
             params![
                 task_id.as_str(),
                 envelope.body.progress,
                 &envelope.body.message,
-                format_time(envelope.created_at)?,
+                &updated_at,
                 TaskStatus::Running.as_str(),
             ],
         )?;
+        if updated == 0 {
+            let project_id = envelope
+                .project_id
+                .as_ref()
+                .ok_or_else(|| anyhow!("project_id is required for TaskProgress projection"))?;
+            self.connection.execute(
+                r#"
+                INSERT INTO tasks (
+                  task_id, project_id, parent_task_id, issuer_actor_id, assignee_actor_id, title,
+                  required_capability, status, progress_value, progress_message, created_at, updated_at
+                ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(task_id) DO UPDATE SET
+                  status = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.status
+                    ELSE excluded.status
+                  END,
+                  progress_value = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.progress_value
+                    ELSE excluded.progress_value
+                  END,
+                  progress_message = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.progress_message
+                    ELSE excluded.progress_message
+                  END,
+                  updated_at = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.updated_at
+                    ELSE excluded.updated_at
+                  END
+                "#,
+                params![
+                    task_id.as_str(),
+                    project_id.as_str(),
+                    envelope
+                        .to_actor_id
+                        .as_ref()
+                        .map(ActorId::as_str)
+                        .unwrap_or_else(|| envelope.from_actor_id.as_str()),
+                    envelope.from_actor_id.as_str(),
+                    "pending task materialization",
+                    TaskStatus::Running.as_str(),
+                    envelope.body.progress,
+                    &envelope.body.message,
+                    &updated_at,
+                    &updated_at,
+                ],
+            )?;
+        }
 
         Ok(())
     }
 
+    /// Applies a task result submission, updating task status and storing artifacts.
     pub fn apply_task_result_submitted(
         &self,
         envelope: &Envelope<TaskResultSubmitted>,
@@ -911,6 +1368,7 @@ impl Store {
             TaskExecutionStatus::Failed => TaskStatus::Failed,
             TaskExecutionStatus::Stopped => TaskStatus::Stopped,
         };
+        let updated_at = format_time(envelope.created_at)?;
 
         self.connection.execute(
             r#"
@@ -932,14 +1390,74 @@ impl Store {
                 serde_json::to_string(&envelope.body.output_payload)?,
                 format_time(envelope.body.started_at)?,
                 format_time(envelope.body.finished_at)?,
-                format_time(envelope.created_at)?,
+                &updated_at,
             ],
         )?;
 
-        self.connection.execute(
-            "UPDATE tasks SET status = ?2, progress_value = NULL, progress_message = NULL, updated_at = ?3 WHERE task_id = ?1",
-            params![task_id.as_str(), status.as_str(), format_time(envelope.created_at)?,],
+        let updated = self.connection.execute(
+            r#"
+            UPDATE tasks
+            SET status = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN status
+                  ELSE ?2
+                END,
+                progress_value = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN progress_value
+                  ELSE NULL
+                END,
+                progress_message = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN progress_message
+                  ELSE NULL
+                END,
+                updated_at = CASE
+                  WHEN status IN ('stopping', 'completed', 'failed', 'stopped') THEN updated_at
+                  ELSE ?3
+                END
+            WHERE task_id = ?1
+            "#,
+            params![task_id.as_str(), status.as_str(), &updated_at,],
         )?;
+        if updated == 0 {
+            self.connection.execute(
+                r#"
+                INSERT INTO tasks (
+                  task_id, project_id, parent_task_id, issuer_actor_id, assignee_actor_id, title,
+                  required_capability, status, progress_value, progress_message, created_at, updated_at
+                ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, ?6, NULL, NULL, ?7, ?8)
+                ON CONFLICT(task_id) DO UPDATE SET
+                  status = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.status
+                    ELSE excluded.status
+                  END,
+                  progress_value = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.progress_value
+                    ELSE NULL
+                  END,
+                  progress_message = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.progress_message
+                    ELSE NULL
+                  END,
+                  updated_at = CASE
+                    WHEN tasks.status IN ('stopping', 'completed', 'failed', 'stopped') THEN tasks.updated_at
+                    ELSE excluded.updated_at
+                  END
+                "#,
+                params![
+                    task_id.as_str(),
+                    project_id.as_str(),
+                    envelope
+                        .to_actor_id
+                        .as_ref()
+                        .map(ActorId::as_str)
+                        .unwrap_or_else(|| envelope.from_actor_id.as_str()),
+                    envelope.from_actor_id.as_str(),
+                    "pending task materialization",
+                    status.as_str(),
+                    format_time(envelope.body.started_at)?,
+                    &updated_at,
+                ],
+            )?;
+        }
 
         for artifact in &envelope.body.artifact_refs {
             self.connection.execute(
@@ -968,48 +1486,110 @@ impl Store {
         Ok(())
     }
 
+    /// Applies a stop order to the project/task projections (sets status to stopping).
     pub fn apply_stop_order_projection(&self, envelope: &Envelope<StopOrder>) -> Result<()> {
-        if let StopScopeType::Project = envelope.body.scope_type {
-            self.connection.execute(
-                "UPDATE projects SET status = ?3, updated_at = ?2 WHERE project_id = ?1",
-                params![
-                    &envelope.body.scope_id,
-                    format_time(envelope.created_at)?,
-                    ProjectStatus::Stopping.as_str()
-                ],
-            )?;
-            self.connection.execute(
-                &format!(
-                    "UPDATE tasks SET status = ?3, updated_at = ?2 WHERE project_id = ?1 AND status NOT IN {TERMINAL_TASK_STATUSES_SQL}"
-                ),
-                params![&envelope.body.scope_id, format_time(envelope.created_at)?, TaskStatus::Stopping.as_str()],
-            )?;
+        let updated_at = format_time(envelope.created_at)?;
+        match envelope.body.scope_type {
+            StopScopeType::Project => {
+                self.connection.execute(
+                    "UPDATE projects SET status = ?3, updated_at = ?2 WHERE project_id = ?1",
+                    params![
+                        &envelope.body.scope_id,
+                        &updated_at,
+                        ProjectStatus::Stopping.as_str()
+                    ],
+                )?;
+                self.connection.execute(
+                    &format!(
+                        "UPDATE tasks SET status = ?3, updated_at = ?2 WHERE project_id = ?1 AND status NOT IN {TERMINAL_TASK_STATUSES_SQL}"
+                    ),
+                    params![&envelope.body.scope_id, &updated_at, TaskStatus::Stopping.as_str()],
+                )?;
+            }
+            StopScopeType::TaskTree => {
+                let project_id = envelope.project_id.as_ref().ok_or_else(|| {
+                    anyhow!("project_id is required for task-tree stop projection")
+                })?;
+                let root_task_id = TaskId::new(envelope.body.scope_id.clone())?;
+                for task_id in self.task_tree_task_ids(project_id, &root_task_id)? {
+                    self.connection.execute(
+                        &format!(
+                            "UPDATE tasks SET status = ?3, updated_at = ?2 WHERE task_id = ?1 AND status NOT IN {TERMINAL_TASK_STATUSES_SQL}"
+                        ),
+                        params![task_id.as_str(), &updated_at, TaskStatus::Stopping.as_str()],
+                    )?;
+                }
+            }
         }
 
         Ok(())
     }
 
+    /// Applies a stop completion to finalize project/task projections (sets status to stopped).
     pub fn apply_stop_complete_projection(&self, envelope: &Envelope<StopComplete>) -> Result<()> {
-        if let Some(project_id) = envelope.project_id.as_ref() {
-            self.connection.execute(
-                "UPDATE projects SET status = ?3, updated_at = ?2 WHERE project_id = ?1",
-                params![
-                    project_id.as_str(),
-                    format_time(envelope.created_at)?,
-                    ProjectStatus::Stopped.as_str()
-                ],
-            )?;
-            self.connection.execute(
-                &format!(
-                    "UPDATE tasks SET status = ?3, updated_at = ?2 WHERE project_id = ?1 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
-                ),
-                params![project_id.as_str(), format_time(envelope.created_at)?, TaskStatus::Stopped.as_str()],
-            )?;
+        let updated_at = format_time(envelope.created_at)?;
+        let Some((scope_type, scope_id)) = self.stop_order_scope(&envelope.body.stop_id)? else {
+            return Ok(());
+        };
+        match scope_type {
+            StopScopeType::Project => {
+                if let Some(project_id) = envelope.project_id.as_ref() {
+                    self.connection.execute(
+                        &format!(
+                            "UPDATE tasks SET status = ?4, updated_at = ?3 WHERE project_id = ?1 AND assignee_actor_id = ?2 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
+                        ),
+                        params![
+                            project_id.as_str(),
+                            envelope.body.actor_id.as_str(),
+                            &updated_at,
+                            TaskStatus::Stopped.as_str()
+                        ],
+                    )?;
+                    let remaining_active: u64 = count_query(
+                        &self.connection,
+                        &format!(
+                            "SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
+                        ),
+                        [project_id.as_str()],
+                    )?;
+                    if remaining_active == 0 {
+                        self.connection.execute(
+                            "UPDATE projects SET status = ?3, updated_at = ?2 WHERE project_id = ?1",
+                            params![
+                                project_id.as_str(),
+                                &updated_at,
+                                ProjectStatus::Stopped.as_str()
+                            ],
+                        )?;
+                    }
+                }
+            }
+            StopScopeType::TaskTree => {
+                let project_id = envelope.project_id.as_ref().ok_or_else(|| {
+                    anyhow!("project_id is required for task-tree stop completion")
+                })?;
+                let root_task_id = TaskId::new(scope_id)?;
+                let subtree = self.task_tree_task_ids(project_id, &root_task_id)?;
+                for task_id in subtree {
+                    self.connection.execute(
+                        &format!(
+                            "UPDATE tasks SET status = ?4, updated_at = ?3 WHERE task_id = ?1 AND assignee_actor_id = ?2 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
+                        ),
+                        params![
+                            task_id.as_str(),
+                            envelope.body.actor_id.as_str(),
+                            &updated_at,
+                            TaskStatus::Stopped.as_str()
+                        ],
+                    )?;
+                }
+            }
         }
 
         Ok(())
     }
 
+    /// Stops all tasks in a project assigned to a specific actor.
     pub fn stop_project_tasks_for_actor(
         &self,
         project_id: &ProjectId,
@@ -1022,7 +1602,7 @@ impl Store {
             ),
         )?;
         let rows = statement.query_map(params![project_id.as_str(), actor_id.as_str()], |row| {
-            Ok(TaskId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)?)
+            TaskId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
         })?;
         let task_ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -1036,6 +1616,108 @@ impl Store {
         Ok(task_ids)
     }
 
+    /// Returns IDs of active tasks in a project assigned to a specific actor.
+    pub fn active_project_task_ids_for_actor(
+        &self,
+        project_id: &ProjectId,
+        actor_id: &ActorId,
+    ) -> Result<Vec<TaskId>> {
+        let mut statement = self.connection.prepare(
+            &format!(
+                "SELECT task_id FROM tasks WHERE project_id = ?1 AND assignee_actor_id = ?2 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
+            ),
+        )?;
+        let rows = statement.query_map(params![project_id.as_str(), actor_id.as_str()], |row| {
+            TaskId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Stops all tasks in a task tree assigned to a specific actor.
+    pub fn stop_task_tree_tasks_for_actor(
+        &self,
+        project_id: &ProjectId,
+        root_task_id: &TaskId,
+        actor_id: &ActorId,
+        timestamp: OffsetDateTime,
+    ) -> Result<Vec<TaskId>> {
+        let subtree = self.task_tree_task_ids(project_id, root_task_id)?;
+        if subtree.is_empty() {
+            return Ok(Vec::new());
+        }
+        let updated_at = format_time(timestamp)?;
+        let targets = self.filter_active_tasks_for_actor(&subtree, actor_id)?;
+        let mut stopped = Vec::new();
+        for task_id in targets {
+            self.connection.execute(
+                "UPDATE tasks SET status = ?3, updated_at = ?2 WHERE task_id = ?1",
+                params![task_id.as_str(), &updated_at, TaskStatus::Stopped.as_str()],
+            )?;
+            stopped.push(task_id);
+        }
+        Ok(stopped)
+    }
+
+    /// Returns IDs of active tasks in a task tree assigned to a specific actor.
+    pub fn active_task_tree_task_ids_for_actor(
+        &self,
+        project_id: &ProjectId,
+        root_task_id: &TaskId,
+        actor_id: &ActorId,
+    ) -> Result<Vec<TaskId>> {
+        let subtree = self.task_tree_task_ids(project_id, root_task_id)?;
+        self.filter_active_tasks_for_actor(&subtree, actor_id)
+    }
+
+    fn filter_active_tasks_for_actor(
+        &self,
+        task_ids: &[TaskId],
+        actor_id: &ActorId,
+    ) -> Result<Vec<TaskId>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let task_set: HashSet<&str> = task_ids.iter().map(|id| id.as_str()).collect();
+        let mut stmt = self.connection.prepare(
+            &format!(
+                "SELECT task_id FROM tasks WHERE assignee_actor_id = ?1 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
+            ),
+        )?;
+        let rows = stmt.query_map([actor_id.as_str()], |row| row.get::<_, String>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let id = row?;
+            if task_set.contains(id.as_str()) {
+                result.push(TaskId::new(id)?);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Sets the given tasks to the specified status (e.g. `"stopped"` or `"stopping"`).
+    pub fn stop_tasks(
+        &self,
+        task_ids: &[TaskId],
+        timestamp: OffsetDateTime,
+    ) -> Result<Vec<TaskId>> {
+        let updated_at = format_time(timestamp)?;
+        let mut stopped = Vec::new();
+        for task_id in task_ids {
+            let updated = self.connection.execute(
+                &format!(
+                    "UPDATE tasks SET status = ?3, updated_at = ?2 WHERE task_id = ?1 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
+                ),
+                params![task_id.as_str(), &updated_at, TaskStatus::Stopped.as_str()],
+            )?;
+            if updated > 0 {
+                stopped.push(task_id.clone());
+            }
+        }
+        Ok(stopped)
+    }
+
+    /// Returns distinct assignee actor IDs for all tasks in a project.
     pub fn project_assignee_actor_ids(&self, project_id: &ProjectId) -> Result<Vec<ActorId>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1045,12 +1727,41 @@ impl Store {
             "#,
         )?;
         let rows = statement.query_map([project_id.as_str()], |row| {
-            Ok(ActorId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)?)
+            ActorId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
+    /// Returns distinct assignee actor IDs for all tasks in a task tree.
+    pub fn task_tree_assignee_actor_ids(
+        &self,
+        project_id: &ProjectId,
+        root_task_id: &TaskId,
+    ) -> Result<Vec<ActorId>> {
+        let subtree = self.task_tree_task_ids(project_id, root_task_id)?;
+        if subtree.is_empty() {
+            return Ok(Vec::new());
+        }
+        let task_set: HashSet<&str> = subtree.iter().map(|id| id.as_str()).collect();
+        let mut stmt = self
+            .connection
+            .prepare("SELECT task_id, assignee_actor_id FROM tasks WHERE project_id = ?1")?;
+        let rows = stmt.query_map([project_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut seen = HashSet::new();
+        let mut assignees = Vec::new();
+        for row in rows {
+            let (task_id, actor_id) = row?;
+            if task_set.contains(task_id.as_str()) && seen.insert(actor_id.clone()) {
+                assignees.push(ActorId::new(actor_id)?);
+            }
+        }
+        Ok(assignees)
+    }
+
+    /// Returns the number of active tasks assigned to an actor.
     pub fn active_task_count_for_actor(&self, actor_id: &ActorId) -> Result<u64> {
         count_query(
             &self.connection,
@@ -1061,6 +1772,7 @@ impl Store {
         )
     }
 
+    /// Returns the number of failed tasks in a project.
     pub fn failed_task_count_for_project(&self, project_id: &ProjectId) -> Result<u64> {
         count_query(
             &self.connection,
@@ -1069,6 +1781,7 @@ impl Store {
         )
     }
 
+    /// Returns the most recently failed task ID in a project.
     pub fn latest_failed_task_id_for_project(
         &self,
         project_id: &ProjectId,
@@ -1090,6 +1803,176 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Returns the owner actor ID for a project.
+    pub fn project_owner_actor_id(&self, project_id: &ProjectId) -> Result<Option<ActorId>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT owner_actor_id
+            FROM projects
+            WHERE project_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([project_id.as_str()], |row| {
+                ActorId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns the vision constraints associated with a project.
+    pub fn project_vision_constraints(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<VisionConstraints>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT visions.constraints_json
+            FROM projects
+            INNER JOIN visions ON visions.vision_id = projects.vision_id
+            WHERE projects.project_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([project_id.as_str()], |row| {
+                let raw = row.get::<_, String>(0)?;
+                serde_json::from_str::<VisionConstraints>(&raw).map_err(sql_conversion_error)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns the vision record linked to a project via its vision ID.
+    pub fn project_vision_record(&self, project_id: &ProjectId) -> Result<Option<VisionRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+              visions.vision_id,
+              visions.principal_actor_id,
+              visions.title,
+              visions.raw_vision_text,
+              visions.constraints_json,
+              visions.status,
+              visions.created_at
+            FROM projects
+            INNER JOIN visions ON visions.vision_id = projects.vision_id
+            WHERE projects.project_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([project_id.as_str()], |row| {
+                let constraints_json = row.get::<_, String>(4)?;
+                let created_at = row.get::<_, String>(6)?;
+                Ok(VisionRecord {
+                    vision_id: VisionId::new(row.get::<_, String>(0)?)
+                        .map_err(sql_conversion_error)?,
+                    principal_actor_id: ActorId::new(row.get::<_, String>(1)?)
+                        .map_err(sql_conversion_error)?,
+                    title: row.get(2)?,
+                    raw_vision_text: row.get(3)?,
+                    constraints: serde_json::from_str(&constraints_json)
+                        .map_err(sql_conversion_error)?,
+                    status: row.get(5)?,
+                    created_at: parse_time(&created_at).map_err(sql_conversion_error)?,
+                })
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn approval_projection_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<ApprovalProjectionRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT scope_type, scope_id, approval_updated, resumed_task_ids_json, dispatched, updated_at
+            FROM approval_states
+            WHERE project_id = ?1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([project_id.as_str()], |row| {
+                let resumed_task_ids_json = row.get::<_, Option<String>>(3)?;
+                let resumed_task_count = resumed_task_ids_json
+                    .as_deref()
+                    .map(serde_json::from_str::<Vec<String>>)
+                    .transpose()
+                    .map_err(sql_conversion_error)?
+                    .map_or(0, |items| items.len() as u64);
+                Ok(ApprovalProjectionRecord {
+                    scope_type: row.get(0)?,
+                    scope_id: row.get(1)?,
+                    approval_updated: row.get::<_, i64>(2)? != 0,
+                    resumed_task_count,
+                    dispatched: row.get::<_, i64>(4)? != 0,
+                    updated_at: row.get(5)?,
+                })
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn approval_projection_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<ApprovalProjectionRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT scope_type, scope_id, approval_updated, resumed_task_ids_json, dispatched, updated_at
+            FROM approval_states
+            WHERE task_id = ?1 OR (scope_type = 'task' AND scope_id = ?1)
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([task_id.as_str()], |row| {
+                let resumed_task_ids_json = row.get::<_, Option<String>>(3)?;
+                let resumed_task_count = resumed_task_ids_json
+                    .as_deref()
+                    .map(serde_json::from_str::<Vec<String>>)
+                    .transpose()
+                    .map_err(sql_conversion_error)?
+                    .map_or(0, |items| items.len() as u64);
+                Ok(ApprovalProjectionRecord {
+                    scope_type: row.get(0)?,
+                    scope_id: row.get(1)?,
+                    approval_updated: row.get::<_, i64>(2)? != 0,
+                    resumed_task_count,
+                    dispatched: row.get::<_, i64>(4)? != 0,
+                    updated_at: row.get(5)?,
+                })
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns the issuer (owner) actor ID for a task.
+    pub fn task_owner_actor_id(&self, task_id: &TaskId) -> Result<Option<ActorId>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT projects.owner_actor_id
+            FROM tasks
+            INNER JOIN projects ON projects.project_id = tasks.project_id
+            WHERE tasks.task_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([task_id.as_str()], |row| {
+                ActorId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns the principal actor ID for a project.
     pub fn project_principal_actor_id(&self, project_id: &ProjectId) -> Result<Option<ActorId>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1107,6 +1990,85 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Returns the next queued task assigned to a specific actor.
+    pub fn next_queued_task_for_actor(
+        &self,
+        project_id: &ProjectId,
+        actor_id: &ActorId,
+    ) -> Result<Option<TaskId>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT task_id
+            FROM tasks
+            WHERE project_id = ?1 AND assignee_actor_id = ?2 AND status = 'queued'
+            ORDER BY CASE WHEN parent_task_id IS NOT NULL THEN 0 ELSE 1 END, created_at ASC, task_id ASC
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row(params![project_id.as_str(), actor_id.as_str()], |row| {
+                TaskId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Retrieves the original task delegation body for a task.
+    pub fn task_blueprint(&self, task_id: &TaskId) -> Result<Option<TaskDelegated>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT body_json
+            FROM task_events
+            WHERE task_id = ?1 AND msg_type = 'TaskDelegated'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([task_id.as_str()], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(|body_json| serde_json::from_str::<TaskDelegated>(&body_json))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Returns the number of direct child tasks for a given task.
+    pub fn task_child_count(&self, task_id: &TaskId) -> Result<u64> {
+        count_query(
+            &self.connection,
+            "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ?1",
+            [task_id.as_str()],
+        )
+    }
+
+    /// Replaces all peer addresses for an actor/node with a new set.
+    pub fn rebind_peer_addresses(
+        &self,
+        actor_id: &ActorId,
+        node_id: &NodeId,
+        multiaddrs: &[String],
+        seen_at: OffsetDateTime,
+    ) -> Result<()> {
+        let seen_at = format_time(seen_at)?;
+        for multiaddr in multiaddrs {
+            self.connection.execute(
+                "DELETE FROM peer_addresses WHERE multiaddr = ?1 AND actor_id != ?2",
+                params![multiaddr, actor_id.as_str()],
+            )?;
+            self.connection.execute(
+                r#"
+                INSERT INTO peer_addresses (actor_id, node_id, multiaddr, last_seen_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(actor_id, node_id, multiaddr) DO UPDATE SET
+                  last_seen_at = excluded.last_seen_at
+                "#,
+                params![actor_id.as_str(), node_id.as_str(), multiaddr, &seen_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Builds a complete project snapshot from the current projection state.
     pub fn project_snapshot(&self, project_id: &ProjectId) -> Result<Option<ProjectSnapshot>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1134,6 +2096,7 @@ impl Store {
                     task_counts: TaskCountsSnapshot::default(),
                     progress: ProjectProgressSnapshot::default(),
                     retry: ProjectRetrySnapshot::default(),
+                    approval: ApprovalSnapshot::default(),
                     updated_at: row.get(6)?,
                 })
             })
@@ -1168,6 +2131,13 @@ impl Store {
             }
         }
         project.task_counts = counts;
+        let constraints = self
+            .project_vision_constraints(project_id)?
+            .unwrap_or_default();
+        project.approval = approval_snapshot_from(
+            &constraints,
+            self.approval_projection_for_project(project_id)?,
+        );
 
         let mut progress_stmt = self.connection.prepare(
             r#"
@@ -1273,6 +2243,7 @@ impl Store {
         Ok(Some(project))
     }
 
+    /// Returns the snapshot of the most recently updated project.
     pub fn latest_project_snapshot(&self) -> Result<Option<ProjectSnapshot>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1293,6 +2264,7 @@ impl Store {
         }
     }
 
+    /// Builds a task snapshot from the current projection state.
     pub fn task_snapshot(&self, task_id: &TaskId) -> Result<Option<TaskSnapshot>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1340,6 +2312,7 @@ impl Store {
                     result_summary: row.get(9)?,
                     latest_failure_action: None,
                     latest_failure_reason: None,
+                    approval: ApprovalSnapshot::default(),
                     updated_at: row.get(10)?,
                 })
             })
@@ -1356,16 +2329,28 @@ impl Store {
         snapshot.latest_failure_reason = task_failure_comment
             .as_deref()
             .and_then(|c| parse_failure_comment_field(c, "reason"));
+        let constraints = self
+            .project_vision_constraints(&snapshot.project_id)?
+            .unwrap_or_default();
+        snapshot.approval = approval_snapshot_from(
+            &constraints,
+            self.approval_projection_for_task(&snapshot.task_id)?,
+        );
         Ok(Some(snapshot))
     }
 
+    /// Returns the retry attempt count for a task based on sibling tasks sharing the same parent.
     pub fn task_retry_attempt(&self, task_id: &TaskId) -> Result<u64> {
         let mut statement = self
             .connection
             .prepare("SELECT parent_task_id FROM tasks WHERE task_id = ?1 LIMIT 1")?;
         let mut attempt = 0_u64;
         let mut current = Some(task_id.clone());
+        let mut visited = HashSet::new();
         while let Some(task_id) = current {
+            if !visited.insert(task_id.clone()) {
+                break;
+            }
             current = statement
                 .query_row([task_id.as_str()], |row| row.get::<_, Option<String>>(0))
                 .optional()?
@@ -1379,7 +2364,6 @@ impl Store {
         }
         Ok(attempt)
     }
-
 
     fn latest_failure_comment_for_task(&self, task_id: &TaskId) -> Result<Option<String>> {
         let mut statement = self.connection.prepare(
@@ -1413,28 +2397,35 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Saves a snapshot response to the snapshots table.
     pub fn save_snapshot_response(&self, envelope: &Envelope<SnapshotResponse>) -> Result<()> {
         let snapshot_id = SnapshotId::generate();
         let scope_type = snapshot_scope_type_name(&envelope.body.scope_type);
         let scope_id = envelope.body.scope_id.clone();
         let snapshot_json = serde_json::to_string(&envelope.body.snapshot)?;
+        let requested_by_actor_id = envelope.to_actor_id.as_ref().map(ActorId::as_str);
         let created_at = format_time(envelope.created_at)?;
         self.connection.execute(
             r#"
-            INSERT INTO snapshots (snapshot_id, scope_type, scope_id, snapshot_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO snapshots (
+              snapshot_id, msg_id, scope_type, scope_id, snapshot_json, requested_by_actor_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(msg_id) DO NOTHING
             "#,
             params![
                 snapshot_id.as_str(),
+                envelope.msg_id.as_str(),
                 scope_type,
                 scope_id,
                 snapshot_json,
+                requested_by_actor_id,
                 created_at,
             ],
         )?;
         Ok(())
     }
 
+    /// Saves an evaluation certificate from a signed envelope.
     pub fn save_evaluation_certificate(&self, envelope: &Envelope<EvaluationIssued>) -> Result<()> {
         let project_id = envelope
             .project_id
@@ -1443,12 +2434,14 @@ impl Store {
         self.connection.execute(
             r#"
             INSERT INTO evaluation_certificates (
-              eval_cert_id, project_id, task_id, subject_actor_id, issuer_actor_id,
+              eval_cert_id, msg_id, project_id, task_id, subject_actor_id, issuer_actor_id,
               scores_json, comment, issued_at, signature_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(msg_id) DO NOTHING
             "#,
             params![
                 starweft_id::EvalCertId::generate().as_str(),
+                envelope.msg_id.as_str(),
                 project_id.as_str(),
                 envelope.task_id.as_ref().map(|task_id| task_id.as_str()),
                 envelope.body.subject_actor_id.as_str(),
@@ -1462,6 +2455,7 @@ impl Store {
         Ok(())
     }
 
+    /// Records a publish-intent-proposed event.
     pub fn save_publish_intent_proposed(
         &self,
         envelope: &Envelope<PublishIntentProposed>,
@@ -1471,6 +2465,7 @@ impl Store {
             INSERT INTO publish_events (
               msg_id, msg_type, scope_type, scope_id, target, status, summary, payload_json, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(msg_id) DO NOTHING
             "#,
             params![
                 envelope.msg_id.as_str(),
@@ -1487,6 +2482,7 @@ impl Store {
         Ok(())
     }
 
+    /// Records a publish-intent-skipped event.
     pub fn save_publish_intent_skipped(
         &self,
         envelope: &Envelope<PublishIntentSkipped>,
@@ -1496,6 +2492,7 @@ impl Store {
             INSERT INTO publish_events (
               msg_id, msg_type, scope_type, scope_id, target, status, summary, payload_json, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(msg_id) DO NOTHING
             "#,
             params![
                 envelope.msg_id.as_str(),
@@ -1512,6 +2509,7 @@ impl Store {
         Ok(())
     }
 
+    /// Records a publish-result-recorded event.
     pub fn save_publish_result_recorded(
         &self,
         envelope: &Envelope<PublishResultRecorded>,
@@ -1521,6 +2519,7 @@ impl Store {
             INSERT INTO publish_events (
               msg_id, msg_type, scope_type, scope_id, target, status, summary, payload_json, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(msg_id) DO NOTHING
             "#,
             params![
                 envelope.msg_id.as_str(),
@@ -1537,6 +2536,7 @@ impl Store {
         Ok(())
     }
 
+    /// Returns the latest snapshot for a given scope type and ID.
     pub fn latest_snapshot(
         &self,
         scope_type: &str,
@@ -1567,6 +2567,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all project IDs in the store.
     pub fn list_project_ids(&self) -> Result<Vec<ProjectId>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1582,6 +2583,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all task IDs belonging to a project.
     pub fn list_task_ids_by_project(&self, project_id: &ProjectId) -> Result<Vec<TaskId>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1598,6 +2600,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all evaluation records for a project.
     pub fn list_evaluations_by_project(
         &self,
         project_id: &ProjectId,
@@ -1633,6 +2636,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all artifact records for a project.
     pub fn list_artifacts_by_project(&self, project_id: &ProjectId) -> Result<Vec<ArtifactRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1668,6 +2672,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all artifact records across all projects.
     pub fn list_all_artifacts(&self) -> Result<Vec<ArtifactRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1702,6 +2707,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all task events for a project, ordered by Lamport timestamp.
     pub fn list_task_events_by_project(
         &self,
         project_id: &ProjectId,
@@ -1735,6 +2741,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all task events across all projects.
     pub fn list_task_events(&self) -> Result<Vec<TaskEventRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1764,6 +2771,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Deletes all projection state for a project (tasks, results, artifacts, etc.).
     pub fn reset_projection_state_for_project(&self, project_id: &ProjectId) -> Result<()> {
         self.connection.execute(
             "DELETE FROM evaluation_certificates WHERE project_id = ?1",
@@ -1794,6 +2802,7 @@ impl Store {
         Ok(())
     }
 
+    /// Resets all non-queued outbox messages back to `"queued"` for redelivery.
     pub fn reset_outbox_for_resume(&self) -> Result<u64> {
         let changed = self.connection.execute(
             r#"
@@ -1806,6 +2815,7 @@ impl Store {
         Ok(changed as u64)
     }
 
+    /// Returns snapshots for all projects.
     pub fn list_project_snapshots(&self) -> Result<Vec<ProjectSnapshot>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1825,6 +2835,7 @@ impl Store {
         Ok(projects)
     }
 
+    /// Returns snapshots for all tasks in a project.
     pub fn list_task_snapshots_for_project(
         &self,
         project_id: &ProjectId,
@@ -1866,6 +2877,7 @@ impl Store {
                 result_summary: row.get(9)?,
                 latest_failure_action: None,
                 latest_failure_reason: None,
+                approval: ApprovalSnapshot::default(),
                 updated_at: row.get(10)?,
             })
         })?;
@@ -1882,8 +2894,7 @@ impl Store {
         }
 
         for snapshot in &mut snapshots {
-            snapshot.retry_attempt =
-                compute_retry_depth(snapshot.task_id.as_str(), &parent_map);
+            snapshot.retry_attempt = compute_retry_depth(snapshot.task_id.as_str(), &parent_map);
         }
 
         let mut failure_stmt = self.connection.prepare(
@@ -1904,11 +2915,16 @@ impl Store {
         }
         for snapshot in &mut snapshots {
             if let Some(comment) = failure_map.get(snapshot.task_id.as_str()) {
-                snapshot.latest_failure_action =
-                    parse_failure_comment_field(comment, "action");
-                snapshot.latest_failure_reason =
-                    parse_failure_comment_field(comment, "reason");
+                snapshot.latest_failure_action = parse_failure_comment_field(comment, "action");
+                snapshot.latest_failure_reason = parse_failure_comment_field(comment, "reason");
             }
+            let constraints = self
+                .project_vision_constraints(&snapshot.project_id)?
+                .unwrap_or_default();
+            snapshot.approval = approval_snapshot_from(
+                &constraints,
+                self.approval_projection_for_task(&snapshot.task_id)?,
+            );
         }
 
         Ok(snapshots)
@@ -1929,6 +2945,44 @@ impl Store {
         Ok(map)
     }
 
+    /// Returns all task IDs in a task tree (the root and all descendants).
+    pub fn task_tree_task_ids(
+        &self,
+        project_id: &ProjectId,
+        root_task_id: &TaskId,
+    ) -> Result<Vec<TaskId>> {
+        let parent_map = self.load_parent_map(project_id)?;
+        if !parent_map.contains_key(root_task_id.as_str()) {
+            return Ok(Vec::new());
+        }
+
+        let root = root_task_id.to_string();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for (task_id, maybe_parent) in &parent_map {
+            if let Some(parent_id) = maybe_parent {
+                children
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push(task_id.clone());
+            }
+        }
+        let mut descendants = vec![root.clone()];
+        let mut cursor = 0;
+        while let Some(parent) = descendants.get(cursor).cloned() {
+            cursor += 1;
+            if let Some(child_ids) = children.get(&parent) {
+                descendants.extend(child_ids.iter().cloned());
+            }
+        }
+
+        descendants
+            .into_iter()
+            .map(TaskId::new)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Returns whether a project exists in the store.
     pub fn project_exists(&self, project_id: &ProjectId) -> Result<bool> {
         let mut statement = self
             .connection
@@ -1939,6 +2993,7 @@ impl Store {
             .is_some())
     }
 
+    /// Returns whether a stop order exists in the store.
     pub fn stop_order_exists(&self, stop_id: &StopId) -> Result<bool> {
         let mut statement = self
             .connection
@@ -1949,6 +3004,53 @@ impl Store {
             .is_some())
     }
 
+    fn stop_receipt_state(
+        &self,
+        stop_id: &StopId,
+        actor_id: &ActorId,
+    ) -> Result<Option<StopReceiptState>> {
+        let mut statement = self.connection.prepare(
+            "SELECT ack_state FROM stop_receipts WHERE stop_id = ?1 AND actor_id = ?2 LIMIT 1",
+        )?;
+        let state = statement
+            .query_row([stop_id.as_str(), actor_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(state.as_deref().and_then(StopReceiptState::from_db))
+    }
+
+    fn stop_order_scope(&self, stop_id: &StopId) -> Result<Option<(StopScopeType, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT scope_type, scope_id FROM stop_orders WHERE stop_id = ?1 LIMIT 1")?;
+        statement
+            .query_row([stop_id.as_str()], |row| {
+                let scope_type = row.get::<_, String>(0)?;
+                let scope_type = serde_json::from_str::<StopScopeType>(&scope_type)
+                    .ok()
+                    .or(match scope_type.as_str() {
+                        "project" => Some(StopScopeType::Project),
+                        "task_tree" => Some(StopScopeType::TaskTree),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid stop scope type: {scope_type}"),
+                            )),
+                        )
+                    })?;
+                Ok((scope_type, row.get::<_, String>(1)?))
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Rebuilds all projection tables by replaying task events from the event log.
     pub fn rebuild_projections_from_task_events(&self) -> Result<RepairRebuildReport> {
         self.connection.execute("DELETE FROM projects", [])?;
         self.connection.execute("DELETE FROM tasks", [])?;
@@ -1959,6 +3061,7 @@ impl Store {
         self.connection.execute("DELETE FROM stop_orders", [])?;
         self.connection.execute("DELETE FROM stop_receipts", [])?;
         self.connection.execute("DELETE FROM snapshots", [])?;
+        self.connection.execute("DELETE FROM publish_events", [])?;
 
         let events = self.list_task_events()?;
         let mut report = RepairRebuildReport::default();
@@ -1970,6 +3073,10 @@ impl Store {
                     let envelope = decode_task_event::<ProjectCharter>(&event)?;
                     self.apply_project_charter(&envelope)?;
                     report.rebuilt_projects += 1;
+                }
+                "ApprovalApplied" => {
+                    let envelope = decode_task_event::<ApprovalApplied>(&event)?;
+                    self.apply_approval_applied(&envelope)?;
                 }
                 "TaskDelegated" => {
                     let envelope = decode_task_event::<TaskDelegated>(&event)?;
@@ -1989,6 +3096,26 @@ impl Store {
                     let envelope = decode_task_event::<EvaluationIssued>(&event)?;
                     self.save_evaluation_certificate(&envelope)?;
                     report.rebuilt_evaluations += 1;
+                }
+                "SnapshotResponse" => {
+                    let envelope = decode_task_event::<SnapshotResponse>(&event)?;
+                    self.save_snapshot_response(&envelope)?;
+                    report.rebuilt_snapshots += 1;
+                }
+                "PublishIntentProposed" => {
+                    let envelope = decode_task_event::<PublishIntentProposed>(&event)?;
+                    self.save_publish_intent_proposed(&envelope)?;
+                    report.rebuilt_publish_events += 1;
+                }
+                "PublishIntentSkipped" => {
+                    let envelope = decode_task_event::<PublishIntentSkipped>(&event)?;
+                    self.save_publish_intent_skipped(&envelope)?;
+                    report.rebuilt_publish_events += 1;
+                }
+                "PublishResultRecorded" => {
+                    let envelope = decode_task_event::<PublishResultRecorded>(&event)?;
+                    self.save_publish_result_recorded(&envelope)?;
+                    report.rebuilt_publish_events += 1;
                 }
                 "StopOrder" => {
                     let envelope = decode_task_event::<StopOrder>(&event)?;
@@ -2014,6 +3141,7 @@ impl Store {
         Ok(report)
     }
 
+    /// Resumes pending outbox messages by resetting their delivery state.
     pub fn resume_pending_outbox(&self) -> Result<RepairResumeOutboxReport> {
         let resumed_messages = self.connection.execute(
             "UPDATE outbox_messages SET delivery_state = 'queued' WHERE delivery_state NOT LIKE 'delivered%'",
@@ -2022,6 +3150,7 @@ impl Store {
         Ok(RepairResumeOutboxReport { resumed_messages })
     }
 
+    /// Reconciles running tasks with stop orders, stopping tasks as needed.
     pub fn repair_reconcile_running_tasks(&self) -> Result<RepairReconcileRunningTasksReport> {
         let stopping_tasks = self.connection.execute(
             &format!(
@@ -2041,6 +3170,7 @@ impl Store {
         })
     }
 
+    /// Verifies integrity of the task event log and reports anomalies.
     pub fn verify_task_event_log(&self) -> Result<AuditVerifyLogReport> {
         let events = self.list_task_events()?;
         let mut report = AuditVerifyLogReport::default();
@@ -2088,33 +3218,43 @@ impl Store {
         Ok(report)
     }
 
+    /// Returns aggregate statistics across all stored data.
     pub fn stats(&self) -> Result<StoreStats> {
-        Ok(StoreStats {
-            peer_count: count_rows(&self.connection, "peer_addresses")?,
-            vision_count: count_rows(&self.connection, "visions")?,
-            project_count: count_rows(&self.connection, "projects")?,
-            running_task_count: count_where(
-                &self.connection,
-                "tasks",
-                &format!("status IN {ACTIVE_TASK_STATUSES_SQL}"),
-            )?,
-            queued_outbox_count: count_where(
-                &self.connection,
-                "outbox_messages",
-                "delivery_state = 'queued'",
-            )?,
-            stop_order_count: count_rows(&self.connection, "stop_orders")?,
-            snapshot_count: count_rows(&self.connection, "snapshots")?,
-            evaluation_count: count_rows(&self.connection, "evaluation_certificates")?,
-            artifact_count: count_rows(&self.connection, "artifacts")?,
-            inbox_unprocessed_count: count_where(
-                &self.connection,
-                "inbox_messages",
-                "processed = 0",
-            )?,
-        })
+        let row = self.connection.query_row(
+            &format!(
+                r#"SELECT
+                    (SELECT COUNT(*) FROM peer_addresses),
+                    (SELECT COUNT(*) FROM visions),
+                    (SELECT COUNT(*) FROM projects),
+                    (SELECT COUNT(*) FROM tasks WHERE status IN {ACTIVE_TASK_STATUSES_SQL}),
+                    (SELECT COUNT(*) FROM outbox_messages WHERE delivery_state = 'queued'),
+                    (SELECT COUNT(*) FROM stop_orders),
+                    (SELECT COUNT(*) FROM snapshots),
+                    (SELECT COUNT(*) FROM evaluation_certificates),
+                    (SELECT COUNT(*) FROM artifacts),
+                    (SELECT COUNT(*) FROM inbox_messages WHERE processed = 0)
+                "#
+            ),
+            [],
+            |row| {
+                Ok(StoreStats {
+                    peer_count: row.get::<_, i64>(0)? as u64,
+                    vision_count: row.get::<_, i64>(1)? as u64,
+                    project_count: row.get::<_, i64>(2)? as u64,
+                    running_task_count: row.get::<_, i64>(3)? as u64,
+                    queued_outbox_count: row.get::<_, i64>(4)? as u64,
+                    stop_order_count: row.get::<_, i64>(5)? as u64,
+                    snapshot_count: row.get::<_, i64>(6)? as u64,
+                    evaluation_count: row.get::<_, i64>(7)? as u64,
+                    artifact_count: row.get::<_, i64>(8)? as u64,
+                    inbox_unprocessed_count: row.get::<_, i64>(9)? as u64,
+                })
+            },
+        )?;
+        Ok(row)
     }
 
+    /// Returns statistics scoped to a specific actor.
     pub fn actor_scoped_stats(&self, actor_id: &ActorId) -> Result<ActorScopedStats> {
         let actor_id = actor_id.as_str();
         Ok(ActorScopedStats {
@@ -2167,17 +3307,18 @@ impl Store {
             )?,
             cached_project_snapshot_count: count_query(
                 &self.connection,
-                "SELECT COUNT(*) FROM snapshots WHERE scope_type = 'project' AND json_extract(snapshot_json, '$.requested_by_actor_id') = ?1",
+                "SELECT COUNT(*) FROM snapshots WHERE scope_type = 'project' AND COALESCE(requested_by_actor_id, json_extract(snapshot_json, '$.requested_by_actor_id')) = ?1",
                 [actor_id],
             )?,
             cached_task_snapshot_count: count_query(
                 &self.connection,
-                "SELECT COUNT(*) FROM snapshots WHERE scope_type = 'task' AND json_extract(snapshot_json, '$.requested_by_actor_id') = ?1",
+                "SELECT COUNT(*) FROM snapshots WHERE scope_type = 'task' AND COALESCE(requested_by_actor_id, json_extract(snapshot_json, '$.requested_by_actor_id')) = ?1",
                 [actor_id],
             )?,
         })
     }
 
+    /// Returns the creation timestamp of the most recent snapshot.
     pub fn latest_snapshot_created_at(&self) -> Result<Option<String>> {
         let mut statement = self
             .connection
@@ -2188,6 +3329,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Returns the ID of the most recently issued stop order.
     pub fn latest_stop_id(&self) -> Result<Option<String>> {
         let mut statement = self
             .connection
@@ -2198,6 +3340,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists evaluation records for a project from the certificates table.
     pub fn list_evaluations_for_project(
         &self,
         project_id: &ProjectId,
@@ -2233,6 +3376,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists evaluation records for a specific task.
     pub fn list_evaluations_for_task(&self, task_id: &TaskId) -> Result<Vec<EvaluationRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -2265,14 +3409,15 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists all artifact records for a specific task.
     pub fn list_artifacts_for_task(&self, task_id: &TaskId) -> Result<Vec<ArtifactRecord>> {
         let mut statement = self.connection.prepare(
             r#"
             SELECT artifacts.artifact_id, artifacts.task_id, tasks.project_id, artifacts.scheme, artifacts.uri, artifacts.sha256, artifacts.size_bytes, artifacts.created_at
             FROM artifacts
             INNER JOIN tasks ON tasks.task_id = artifacts.task_id
-            WHERE task_id = ?1
-            ORDER BY created_at DESC
+            WHERE artifacts.task_id = ?1
+            ORDER BY artifacts.created_at DESC
             "#,
         )?;
         let rows = statement.query_map([task_id.as_str()], |row| {
@@ -2292,6 +3437,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Lists publish events, optionally filtered by scope.
     pub fn list_publish_events(
         &self,
         scope_type: Option<&str>,
@@ -2342,6 +3488,7 @@ impl Store {
         }
     }
 
+    /// Returns up to `limit` outbox messages with `"queued"` delivery state.
     pub fn queued_outbox_messages(&self, limit: usize) -> Result<Vec<OutboxMessageRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -2367,6 +3514,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Updates the delivery state for a specific outbox message.
     pub fn mark_outbox_delivery_state(&self, msg_id: &str, delivery_state: &str) -> Result<()> {
         self.connection.execute(
             "UPDATE outbox_messages SET delivery_state = ?2 WHERE msg_id = ?1",
@@ -2374,18 +3522,6 @@ impl Store {
         )?;
         Ok(())
     }
-}
-
-fn count_rows(connection: &Connection, table: &str) -> Result<u64> {
-    let query = format!("SELECT COUNT(*) FROM {table}");
-    let count: i64 = connection.query_row(query.as_str(), [], |row| row.get(0))?;
-    Ok(count as u64)
-}
-
-fn count_where(connection: &Connection, table: &str, predicate: &str) -> Result<u64> {
-    let query = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
-    let count: i64 = connection.query_row(query.as_str(), [], |row| row.get(0))?;
-    Ok(count as u64)
 }
 
 fn count_query<P>(connection: &Connection, query: &str, params: P) -> Result<u64>
@@ -2403,19 +3539,34 @@ fn snapshot_scope_type_name(scope_type: &SnapshotScopeType) -> &'static str {
     }
 }
 
-fn ensure_peer_keys_stop_column(connection: &Connection) -> Result<()> {
+fn stop_scope_type_name(scope_type: &StopScopeType) -> &'static str {
+    match scope_type {
+        StopScopeType::Project => "project",
+        StopScopeType::TaskTree => "task_tree",
+    }
+}
+
+fn ensure_peer_keys_columns(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(peer_keys)")?;
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
     let mut has_stop_public_key = false;
+    let mut has_capabilities_json = false;
     for column in columns {
-        if column? == "stop_public_key" {
-            has_stop_public_key = true;
-            break;
+        match column?.as_str() {
+            "stop_public_key" => has_stop_public_key = true,
+            "capabilities_json" => has_capabilities_json = true,
+            _ => {}
         }
     }
 
     if !has_stop_public_key {
         connection.execute("ALTER TABLE peer_keys ADD COLUMN stop_public_key TEXT", [])?;
+    }
+    if !has_capabilities_json {
+        connection.execute(
+            "ALTER TABLE peer_keys ADD COLUMN capabilities_json TEXT",
+            [],
+        )?;
     }
 
     Ok(())
@@ -2463,6 +3614,83 @@ fn ensure_task_events_raw_json_column(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_evaluation_certificates_msg_id_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(evaluation_certificates)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_msg_id = false;
+    for column in columns {
+        if column? == "msg_id" {
+            has_msg_id = true;
+            break;
+        }
+    }
+
+    if !has_msg_id {
+        connection.execute(
+            "ALTER TABLE evaluation_certificates ADD COLUMN msg_id TEXT",
+            [],
+        )?;
+    }
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_certificates_msg_id ON evaluation_certificates(msg_id)",
+        [],
+    )?;
+
+    Ok(())
+}
+
+fn ensure_snapshots_msg_id_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(snapshots)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_msg_id = false;
+    for column in columns {
+        if column? == "msg_id" {
+            has_msg_id = true;
+            break;
+        }
+    }
+
+    if !has_msg_id {
+        connection.execute("ALTER TABLE snapshots ADD COLUMN msg_id TEXT", [])?;
+    }
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_msg_id ON snapshots(msg_id)",
+        [],
+    )?;
+
+    Ok(())
+}
+
+fn ensure_snapshots_requested_by_actor_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(snapshots)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_requested_by_actor_id = false;
+
+    for column in columns {
+        if column? == "requested_by_actor_id" {
+            has_requested_by_actor_id = true;
+            break;
+        }
+    }
+
+    if !has_requested_by_actor_id {
+        connection.execute(
+            "ALTER TABLE snapshots ADD COLUMN requested_by_actor_id TEXT",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ensure_publish_events_msg_id_index(connection: &Connection) -> Result<()> {
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_events_msg_id ON publish_events(msg_id)",
+        [],
+    )?;
+    Ok(())
+}
+
 fn format_time(timestamp: OffsetDateTime) -> std::result::Result<String, time::error::Format> {
     timestamp.format(&Rfc3339)
 }
@@ -2474,7 +3702,11 @@ fn parse_time(value: &str) -> std::result::Result<OffsetDateTime, time::error::P
 fn compute_retry_depth(task_id: &str, parent_map: &HashMap<String, Option<String>>) -> u64 {
     let mut depth = 0;
     let mut current = Some(task_id.to_owned());
+    let mut visited = HashSet::new();
     while let Some(ref tid) = current {
+        if !visited.insert(tid.clone()) {
+            break;
+        }
         current = parent_map.get(tid.as_str()).and_then(|p| p.clone());
         if current.is_some() {
             depth += 1;
@@ -2483,11 +3715,82 @@ fn compute_retry_depth(task_id: &str, parent_map: &HashMap<String, Option<String
     depth
 }
 
+impl Store {
+    fn would_create_task_cycle(&self, task_id: &TaskId, parent_task_id: &TaskId) -> Result<bool> {
+        if task_id == parent_task_id {
+            return Ok(true);
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT parent_task_id FROM tasks WHERE task_id = ?1 LIMIT 1")?;
+        let mut current = Some(parent_task_id.clone());
+        let mut visited = HashSet::new();
+        while let Some(current_task_id) = current {
+            if current_task_id == *task_id {
+                return Ok(true);
+            }
+            if !visited.insert(current_task_id.clone()) {
+                return Ok(true);
+            }
+            current = statement
+                .query_row([current_task_id.as_str()], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()?
+                .flatten()
+                .map(TaskId::new)
+                .transpose()
+                .map_err(anyhow::Error::from)?;
+        }
+        Ok(false)
+    }
+}
+
 fn parse_failure_comment_field(comment: &str, field: &str) -> Option<String> {
     let prefix = format!("{field}=");
     comment
         .split_whitespace()
         .find_map(|part| part.strip_prefix(&prefix).map(ToOwned::to_owned))
+}
+
+fn human_intervention_requires_approval(constraints: &VisionConstraints) -> bool {
+    constraints
+        .human_intervention
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("required"))
+}
+
+fn submission_is_approved(constraints: &VisionConstraints) -> bool {
+    constraints
+        .extra
+        .get("submission_approved")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn approval_snapshot_from(
+    constraints: &VisionConstraints,
+    projection: Option<ApprovalProjectionRecord>,
+) -> ApprovalSnapshot {
+    let state = if human_intervention_requires_approval(constraints) {
+        if submission_is_approved(constraints) {
+            "approved"
+        } else {
+            "pending"
+        }
+    } else {
+        "not_required"
+    };
+    ApprovalSnapshot {
+        state: state.to_owned(),
+        updated_at: projection.as_ref().map(|record| record.updated_at.clone()),
+        scope_type: projection.as_ref().map(|record| record.scope_type.clone()),
+        scope_id: projection.as_ref().map(|record| record.scope_id.clone()),
+        approval_updated: projection.as_ref().map(|record| record.approval_updated),
+        resumed_task_count: projection.as_ref().map(|record| record.resumed_task_count),
+        dispatched: projection.as_ref().map(|record| record.dispatched),
+    }
 }
 
 fn decode_task_event<T>(event: &TaskEventRecord) -> Result<Envelope<T>>
@@ -2515,6 +3818,12 @@ fn validate_task_event_shape(event: &TaskEventRecord) -> Result<()> {
     match event.msg_type.as_str() {
         "ProjectCharter" => {
             let _ = decode_task_event::<ProjectCharter>(event)?;
+        }
+        "ApprovalGranted" => {
+            let _ = decode_task_event::<ApprovalGranted>(event)?;
+        }
+        "ApprovalApplied" => {
+            let _ = decode_task_event::<ApprovalApplied>(event)?;
         }
         "TaskDelegated" => {
             let _ = decode_task_event::<TaskDelegated>(event)?;
@@ -2567,6 +3876,10 @@ fn parse_msg_type_name(value: &str) -> Result<MsgType> {
     Ok(match value {
         "VisionIntent" => MsgType::VisionIntent,
         "ProjectCharter" => MsgType::ProjectCharter,
+        "ApprovalGranted" => MsgType::ApprovalGranted,
+        "ApprovalApplied" => MsgType::ApprovalApplied,
+        "CapabilityQuery" => MsgType::CapabilityQuery,
+        "CapabilityAdvertisement" => MsgType::CapabilityAdvertisement,
         "JoinOffer" => MsgType::JoinOffer,
         "JoinAccept" => MsgType::JoinAccept,
         "JoinReject" => MsgType::JoinReject,
@@ -2592,13 +3905,16 @@ fn sql_conversion_error(error: impl std::error::Error + Send + Sync + 'static) -
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalIdentityRecord, Store, VisionRecord};
+    use super::{LocalIdentityRecord, PeerAddressRecord, Store, VisionRecord, format_time};
+    use rusqlite::params;
     use serde_json::json;
     use starweft_crypto::StoredKeypair;
     use starweft_id::{ActorId, NodeId, ProjectId, StopId, TaskId, VisionId};
     use starweft_protocol::{
-        EvaluationIssued, EvaluationPolicy, ParticipantPolicy, ProjectCharter, SnapshotResponse,
-        SnapshotScopeType, StopAck, StopAckState, TaskDelegated, UnsignedEnvelope,
+        EvaluationIssued, EvaluationPolicy, ParticipantPolicy, ProjectCharter,
+        PublishIntentProposed, SnapshotResponse, SnapshotScopeType, StopAck, StopAckState,
+        StopComplete, StopFinalState, TaskDelegated, TaskExecutionStatus, TaskProgress,
+        TaskResultSubmitted, TaskStatus, UnsignedEnvelope,
     };
     use std::fs;
     use time::OffsetDateTime;
@@ -2719,7 +4035,6 @@ mod tests {
                 scope_id: project_id.to_string(),
                 snapshot: json!({
                     "project_id": project_id,
-                    "requested_by_actor_id": principal_actor_id,
                 }),
             },
         )
@@ -2766,6 +4081,573 @@ mod tests {
         assert_eq!(worker_stats.active_assigned_task_count, 1);
         assert_eq!(worker_stats.evaluation_subject_count, 1);
         assert_eq!(worker_stats.stop_receipt_count, 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn rebuild_projections_restores_snapshot_responses() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-rebuild-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let owner_key = StoredKeypair::generate();
+        let principal_actor_id = ActorId::generate();
+        let owner_actor_id = ActorId::generate();
+        let project_id = ProjectId::generate();
+
+        let snapshot = UnsignedEnvelope::new(
+            owner_actor_id,
+            Some(principal_actor_id.clone()),
+            SnapshotResponse {
+                scope_type: SnapshotScopeType::Project,
+                scope_id: project_id.to_string(),
+                snapshot: json!({
+                    "project_id": project_id,
+                    "status": "active",
+                }),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .sign(&owner_key)
+        .expect("sign snapshot");
+
+        store
+            .append_task_event(&snapshot)
+            .expect("append task event");
+        store
+            .save_snapshot_response(&snapshot)
+            .expect("save snapshot");
+        assert_eq!(
+            store
+                .actor_scoped_stats(&principal_actor_id)
+                .expect("stats before rebuild")
+                .cached_project_snapshot_count,
+            1
+        );
+
+        let report = store
+            .rebuild_projections_from_task_events()
+            .expect("rebuild projections");
+        assert_eq!(report.rebuilt_snapshots, 1);
+        assert_eq!(
+            store
+                .actor_scoped_stats(&principal_actor_id)
+                .expect("stats after rebuild")
+                .cached_project_snapshot_count,
+            1
+        );
+
+        let cached = store
+            .latest_snapshot("project", project_id.as_str())
+            .expect("latest snapshot")
+            .expect("snapshot exists");
+        assert!(cached.snapshot_json.contains("\"status\":\"active\""));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn duplicate_receipts_and_publish_events_are_idempotent() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-idempotent-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let project_id = ProjectId::generate();
+        let task_id = TaskId::generate();
+        let owner_actor_id = ActorId::generate();
+        let worker_actor_id = ActorId::generate();
+        let principal_actor_id = ActorId::generate();
+
+        let evaluation = UnsignedEnvelope::new(
+            owner_actor_id.clone(),
+            Some(worker_actor_id.clone()),
+            EvaluationIssued {
+                subject_actor_id: worker_actor_id,
+                scores: [("quality".to_owned(), 1.0)].into_iter().collect(),
+                comment: "duplicate-safe".to_owned(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign evaluation");
+        store
+            .save_evaluation_certificate(&evaluation)
+            .expect("save evaluation");
+        store
+            .save_evaluation_certificate(&evaluation)
+            .expect("save evaluation duplicate");
+
+        let snapshot = UnsignedEnvelope::new(
+            owner_actor_id.clone(),
+            Some(principal_actor_id),
+            SnapshotResponse {
+                scope_type: SnapshotScopeType::Task,
+                scope_id: task_id.to_string(),
+                snapshot: json!({ "task_id": task_id, "status": "running" }),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign snapshot");
+        store
+            .save_snapshot_response(&snapshot)
+            .expect("save snapshot");
+        store
+            .save_snapshot_response(&snapshot)
+            .expect("save snapshot duplicate");
+
+        let publish = UnsignedEnvelope::new(
+            owner_actor_id,
+            None,
+            PublishIntentProposed {
+                scope_type: "task".to_owned(),
+                scope_id: task_id.to_string(),
+                target: "github_issue:owner/repo#1".to_owned(),
+                reason: "test".to_owned(),
+                summary: "summary".to_owned(),
+                context: json!({ "task_id": task_id }),
+                proposed_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id)
+        .sign(&key)
+        .expect("sign publish");
+        store
+            .save_publish_intent_proposed(&publish)
+            .expect("save publish");
+        store
+            .save_publish_intent_proposed(&publish)
+            .expect("save publish duplicate");
+
+        let evaluation_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM evaluation_certificates", [], |row| {
+                row.get(0)
+            })
+            .expect("evaluation count");
+        let snapshot_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .expect("snapshot count");
+        let publish_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM publish_events", [], |row| row.get(0))
+            .expect("publish count");
+
+        assert_eq!(evaluation_count, 1);
+        assert_eq!(snapshot_count, 1);
+        assert_eq!(publish_count, 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn out_of_order_task_progress_keeps_live_projection() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-order-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let owner_actor_id = ActorId::generate();
+        let worker_actor_id = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let task_id = TaskId::generate();
+
+        let progress = UnsignedEnvelope::new(
+            worker_actor_id.clone(),
+            Some(owner_actor_id.clone()),
+            TaskProgress {
+                progress: 0.6,
+                message: "working early".to_owned(),
+                updated_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign progress");
+        store
+            .apply_task_progress(&progress)
+            .expect("apply progress first");
+
+        let delegated = UnsignedEnvelope::new(
+            owner_actor_id,
+            Some(worker_actor_id),
+            TaskDelegated {
+                parent_task_id: None,
+                title: "Recovered Task".to_owned(),
+                description: "desc".to_owned(),
+                objective: "obj".to_owned(),
+                required_capability: "mock".to_owned(),
+                input_payload: json!({}),
+                expected_output_schema: json!({}),
+            },
+        )
+        .with_project_id(project_id)
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign delegated");
+        store
+            .apply_task_delegated(&delegated)
+            .expect("apply delegated later");
+
+        let snapshot = store
+            .task_snapshot(&task_id)
+            .expect("snapshot")
+            .expect("task exists");
+        assert_eq!(snapshot.title, "Recovered Task");
+        assert_eq!(snapshot.status, starweft_protocol::TaskStatus::Running);
+        assert_eq!(snapshot.progress_value, Some(0.6));
+        assert_eq!(snapshot.progress_message.as_deref(), Some("working early"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn delayed_progress_does_not_revive_stopped_task() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-terminal-progress-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let owner_actor_id = ActorId::generate();
+        let worker_actor_id = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let task_id = TaskId::generate();
+
+        let delegated = UnsignedEnvelope::new(
+            owner_actor_id.clone(),
+            Some(worker_actor_id.clone()),
+            TaskDelegated {
+                parent_task_id: None,
+                title: "Task".to_owned(),
+                description: "desc".to_owned(),
+                objective: "obj".to_owned(),
+                required_capability: "mock".to_owned(),
+                input_payload: json!({}),
+                expected_output_schema: json!({}),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign delegated");
+        store
+            .apply_task_delegated(&delegated)
+            .expect("apply delegated");
+
+        let stopped = UnsignedEnvelope::new(
+            worker_actor_id.clone(),
+            Some(owner_actor_id.clone()),
+            TaskResultSubmitted {
+                status: TaskExecutionStatus::Stopped,
+                summary: "stopped".to_owned(),
+                output_payload: json!({ "stopped": true }),
+                artifact_refs: Vec::new(),
+                started_at: OffsetDateTime::now_utc(),
+                finished_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign stopped");
+        store
+            .apply_task_result_submitted(&stopped)
+            .expect("apply stopped result");
+
+        let late_progress = UnsignedEnvelope::new(
+            worker_actor_id,
+            Some(owner_actor_id),
+            TaskProgress {
+                progress: 0.9,
+                message: "late progress".to_owned(),
+                updated_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id)
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign progress");
+        store
+            .apply_task_progress(&late_progress)
+            .expect("apply late progress");
+
+        let snapshot = store
+            .task_snapshot(&task_id)
+            .expect("snapshot")
+            .expect("task exists");
+        assert_eq!(snapshot.status, TaskStatus::Stopped);
+        assert_eq!(snapshot.result_summary.as_deref(), Some("stopped"));
+        assert_eq!(snapshot.progress_message, None);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn list_artifacts_for_task_returns_joined_records() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-artifacts-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let owner_actor_id = ActorId::generate();
+        let worker_actor_id = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let task_id = TaskId::generate();
+
+        let delegated = UnsignedEnvelope::new(
+            owner_actor_id,
+            Some(worker_actor_id),
+            TaskDelegated {
+                parent_task_id: None,
+                title: "Artifact Task".to_owned(),
+                description: "desc".to_owned(),
+                objective: "obj".to_owned(),
+                required_capability: "mock".to_owned(),
+                input_payload: json!({}),
+                expected_output_schema: json!({}),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&key)
+        .expect("sign delegated");
+        store
+            .apply_task_delegated(&delegated)
+            .expect("apply delegated");
+
+        store
+            .connection
+            .execute(
+                r#"
+                INSERT INTO artifacts (artifact_id, task_id, scheme, uri, sha256, size_bytes, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    "art_test_01",
+                    task_id.as_str(),
+                    "file",
+                    "/tmp/artifact.json",
+                    Option::<String>::None,
+                    42_i64,
+                    format_time(OffsetDateTime::now_utc()).expect("time"),
+                ],
+            )
+            .expect("insert artifact");
+
+        let artifacts = store
+            .list_artifacts_for_task(&task_id)
+            .expect("list artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].project_id, project_id);
+        assert_eq!(artifacts[0].artifact_id, "art_test_01");
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn task_retry_attempt_handles_cycle_without_hanging() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-cycle-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let project_id = ProjectId::generate();
+        let task_id = TaskId::generate();
+        let actor_id = ActorId::generate();
+        let now = format_time(OffsetDateTime::now_utc()).expect("time");
+
+        store
+            .connection
+            .execute(
+                r#"
+                INSERT INTO tasks (
+                  task_id, project_id, parent_task_id, issuer_actor_id, assignee_actor_id, title,
+                  required_capability, status, progress_value, progress_message, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', NULL, NULL, ?8, ?8)
+                "#,
+                params![
+                    task_id.as_str(),
+                    project_id.as_str(),
+                    task_id.as_str(),
+                    actor_id.as_str(),
+                    actor_id.as_str(),
+                    "cyclic",
+                    "mock",
+                    &now,
+                ],
+            )
+            .expect("insert cyclic task");
+
+        let attempt = store.task_retry_attempt(&task_id).expect("retry attempt");
+        assert_eq!(attempt, 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn apply_task_delegated_rejects_self_cycle() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-cycle-reject-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let owner_actor_id = ActorId::generate();
+        let worker_actor_id = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let task_id = TaskId::generate();
+
+        let delegated = UnsignedEnvelope::new(
+            owner_actor_id,
+            Some(worker_actor_id),
+            TaskDelegated {
+                parent_task_id: Some(task_id.clone()),
+                title: "Cycle".to_owned(),
+                description: "desc".to_owned(),
+                objective: "obj".to_owned(),
+                required_capability: "mock".to_owned(),
+                input_payload: json!({}),
+                expected_output_schema: json!({}),
+            },
+        )
+        .with_project_id(project_id)
+        .with_task_id(task_id)
+        .sign(&key)
+        .expect("sign delegated");
+
+        let error = store
+            .apply_task_delegated(&delegated)
+            .expect_err("self cycle should fail");
+        assert!(error.to_string().contains("cycle"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn stop_ack_does_not_downgrade_completed_receipt() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-stop-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let project_id = ProjectId::generate();
+        let actor_id = ActorId::generate();
+        let stop_id = StopId::generate();
+
+        let complete = UnsignedEnvelope::new(
+            actor_id.clone(),
+            None,
+            StopComplete {
+                stop_id: stop_id.clone(),
+                actor_id: actor_id.clone(),
+                final_state: StopFinalState::Stopped,
+                completed_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .sign(&key)
+        .expect("sign complete");
+        store.save_stop_complete(&complete).expect("save complete");
+
+        let ack = UnsignedEnvelope::new(
+            actor_id.clone(),
+            None,
+            StopAck {
+                stop_id: stop_id.clone(),
+                actor_id: actor_id.clone(),
+                ack_state: StopAckState::Stopping,
+                acked_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id)
+        .sign(&key)
+        .expect("sign ack");
+        store.save_stop_ack(&ack).expect("save ack");
+
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT ack_state FROM stop_receipts WHERE stop_id = ?1 AND actor_id = ?2",
+                [stop_id.as_str(), actor_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("receipt state");
+        assert_eq!(state, "stopped");
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn purge_stale_peer_addresses_removes_only_expired_dynamic_entries() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-peers-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let now = OffsetDateTime::now_utc();
+
+        let stale_actor = ActorId::generate();
+        store
+            .add_peer_address(&PeerAddressRecord {
+                actor_id: stale_actor.clone(),
+                node_id: NodeId::generate(),
+                multiaddr: "/unix/stale.sock".to_owned(),
+                last_seen_at: Some(now - time::Duration::seconds(600)),
+            })
+            .expect("add stale peer");
+
+        let fresh_actor = ActorId::generate();
+        store
+            .add_peer_address(&PeerAddressRecord {
+                actor_id: fresh_actor.clone(),
+                node_id: NodeId::generate(),
+                multiaddr: "/unix/fresh.sock".to_owned(),
+                last_seen_at: Some(now - time::Duration::seconds(30)),
+            })
+            .expect("add fresh peer");
+
+        let manual_actor = ActorId::generate();
+        store
+            .add_peer_address(&PeerAddressRecord {
+                actor_id: manual_actor.clone(),
+                node_id: NodeId::generate(),
+                multiaddr: "/unix/manual.sock".to_owned(),
+                last_seen_at: None,
+            })
+            .expect("add manual peer");
+
+        let removed = store
+            .purge_stale_peer_addresses(now - time::Duration::seconds(300))
+            .expect("purge stale peers");
+        assert_eq!(removed, 1);
+
+        let peers = store.list_peer_addresses().expect("list peers");
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().any(|peer| peer.actor_id == fresh_actor));
+        assert!(peers.iter().any(|peer| peer.actor_id == manual_actor));
+        assert!(!peers.iter().any(|peer| peer.actor_id == stale_actor));
 
         let _ = fs::remove_dir_all(temp);
     }

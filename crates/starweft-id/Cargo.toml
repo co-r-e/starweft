@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Identity types and ULID-based identifiers for starweft"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde.workspace = true

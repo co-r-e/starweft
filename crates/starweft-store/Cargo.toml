@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "SQLite-backed persistent storage layer for starweft"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -14,3 +17,4 @@ time.workspace = true
 starweft-crypto = { path = "../starweft-crypto" }
 starweft-id = { path = "../starweft-id" }
 starweft-protocol = { path = "../starweft-protocol" }
+starweft-stop = { path = "../starweft-stop" }

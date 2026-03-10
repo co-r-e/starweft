@@ -1,17 +1,26 @@
+//! Inbox/outbox message pipeline for the Starweft runtime.
+//!
+//! Provides [`RuntimePipeline`] which orchestrates ingestion of incoming
+//! protocol messages (inbox) and queuing of outgoing messages (outbox),
+//! applying projections to the store as side effects.
+
 use anyhow::Result;
 use serde::Serialize;
 use starweft_protocol::{
-    Envelope, EvaluationIssued, ProjectCharter, PublishIntentProposed, PublishIntentSkipped,
-    PublishResultRecorded, SnapshotResponse, StopAck, StopComplete, StopOrder, TaskDelegated,
-    TaskProgress, TaskResultSubmitted,
+    ApprovalApplied, Envelope, EvaluationIssued, ProjectCharter, PublishIntentProposed,
+    PublishIntentSkipped, PublishResultRecorded, SnapshotResponse, StopAck, StopComplete,
+    StopOrder, TaskDelegated, TaskProgress, TaskResultSubmitted,
 };
 use starweft_store::Store;
 
 macro_rules! define_ingest {
     ($method:ident, $type:ty, $($store_fn:ident),+) => {
         pub fn $method(&self, envelope: &Envelope<$type>) -> Result<()> {
-            self.ingest_verified(envelope)?;
+            if !self.ingest_verified(envelope)? {
+                return Ok(());
+            }
             $(self.store.$store_fn(envelope)?;)+
+            self.store.mark_inbox_message_processed(&envelope.msg_id)?;
             Ok(())
         }
     };
@@ -27,16 +36,19 @@ macro_rules! define_record_local {
     };
 }
 
+/// Pipeline that processes incoming and locally-generated protocol messages.
 pub struct RuntimePipeline<'a> {
     store: &'a Store,
 }
 
 impl<'a> RuntimePipeline<'a> {
+    /// Creates a new pipeline backed by the given store.
     #[must_use]
     pub fn new(store: &'a Store) -> Self {
         Self { store }
     }
 
+    /// Queues a signed envelope for outbound delivery.
     pub fn queue_outgoing<T>(&self, envelope: &Envelope<T>) -> Result<()>
     where
         T: Serialize,
@@ -44,35 +56,134 @@ impl<'a> RuntimePipeline<'a> {
         self.store.queue_outbox(envelope)
     }
 
-    pub fn ingest_verified<T>(&self, envelope: &Envelope<T>) -> Result<()>
+    /// Saves an incoming envelope to the inbox and returns `false` if already processed.
+    pub fn ingest_verified<T>(&self, envelope: &Envelope<T>) -> Result<bool>
     where
         T: Serialize,
     {
         self.store.save_inbox_message(envelope)?;
+        if self.store.inbox_message_processed(&envelope.msg_id)? {
+            return Ok(false);
+        }
         if envelope.project_id.is_some() {
             self.store.append_task_event(envelope)?;
         }
-        Ok(())
+        Ok(true)
     }
 
-    define_ingest!(ingest_project_charter, ProjectCharter, apply_project_charter);
-    define_ingest!(ingest_task_delegated, TaskDelegated, apply_task_delegated);
-    define_ingest!(ingest_task_result_submitted, TaskResultSubmitted, apply_task_result_submitted);
-    define_ingest!(ingest_task_progress, TaskProgress, apply_task_progress);
-    define_ingest!(ingest_stop_order, StopOrder, save_stop_order, apply_stop_order_projection);
-    define_ingest!(ingest_stop_ack, StopAck, save_stop_ack);
-    define_ingest!(ingest_stop_complete, StopComplete, save_stop_complete, apply_stop_complete_projection);
-    define_ingest!(ingest_snapshot_response, SnapshotResponse, save_snapshot_response);
-    define_ingest!(ingest_evaluation_issued, EvaluationIssued, save_evaluation_certificate);
-    define_ingest!(ingest_publish_intent_proposed, PublishIntentProposed, save_publish_intent_proposed);
-    define_ingest!(ingest_publish_intent_skipped, PublishIntentSkipped, save_publish_intent_skipped);
-    define_ingest!(ingest_publish_result_recorded, PublishResultRecorded, save_publish_result_recorded);
+    /// Marks an inbox message as processed so it is not ingested again.
+    pub fn mark_inbox_message_processed(&self, msg_id: &starweft_id::MessageId) -> Result<()> {
+        self.store.mark_inbox_message_processed(msg_id)
+    }
 
-    define_record_local!(record_local_project_charter, ProjectCharter, apply_project_charter);
-    define_record_local!(record_local_task_delegated, TaskDelegated, apply_task_delegated);
-    define_record_local!(record_local_task_result_submitted, TaskResultSubmitted, apply_task_result_submitted);
-    define_record_local!(record_local_stop_order, StopOrder, save_stop_order, apply_stop_order_projection);
-    define_record_local!(record_local_stop_complete, StopComplete, save_stop_complete, apply_stop_complete_projection);
+    define_ingest!(
+        ingest_project_charter,
+        ProjectCharter,
+        apply_project_charter
+    );
+    define_ingest!(
+        ingest_approval_applied,
+        ApprovalApplied,
+        apply_approval_applied
+    );
+    define_ingest!(ingest_task_delegated, TaskDelegated, apply_task_delegated);
+    define_ingest!(
+        ingest_task_result_submitted,
+        TaskResultSubmitted,
+        apply_task_result_submitted
+    );
+    define_ingest!(ingest_task_progress, TaskProgress, apply_task_progress);
+    define_ingest!(
+        ingest_stop_order,
+        StopOrder,
+        save_stop_order,
+        apply_stop_order_projection
+    );
+    define_ingest!(ingest_stop_ack, StopAck, save_stop_ack);
+    define_ingest!(
+        ingest_stop_complete,
+        StopComplete,
+        save_stop_complete,
+        apply_stop_complete_projection
+    );
+    define_ingest!(
+        ingest_snapshot_response,
+        SnapshotResponse,
+        save_snapshot_response
+    );
+    define_ingest!(
+        ingest_evaluation_issued,
+        EvaluationIssued,
+        save_evaluation_certificate
+    );
+    define_ingest!(
+        ingest_publish_intent_proposed,
+        PublishIntentProposed,
+        save_publish_intent_proposed
+    );
+    define_ingest!(
+        ingest_publish_intent_skipped,
+        PublishIntentSkipped,
+        save_publish_intent_skipped
+    );
+    define_ingest!(
+        ingest_publish_result_recorded,
+        PublishResultRecorded,
+        save_publish_result_recorded
+    );
+
+    define_record_local!(
+        record_local_project_charter,
+        ProjectCharter,
+        apply_project_charter
+    );
+    define_record_local!(
+        record_local_approval_applied,
+        ApprovalApplied,
+        apply_approval_applied
+    );
+    define_record_local!(
+        record_local_task_delegated,
+        TaskDelegated,
+        apply_task_delegated
+    );
+    define_record_local!(
+        record_local_task_result_submitted,
+        TaskResultSubmitted,
+        apply_task_result_submitted
+    );
+    define_record_local!(
+        record_local_task_progress,
+        TaskProgress,
+        apply_task_progress
+    );
+    define_record_local!(
+        record_local_publish_intent_proposed,
+        PublishIntentProposed,
+        save_publish_intent_proposed
+    );
+    define_record_local!(
+        record_local_publish_intent_skipped,
+        PublishIntentSkipped,
+        save_publish_intent_skipped
+    );
+    define_record_local!(
+        record_local_publish_result_recorded,
+        PublishResultRecorded,
+        save_publish_result_recorded
+    );
+    define_record_local!(
+        record_local_stop_order,
+        StopOrder,
+        save_stop_order,
+        apply_stop_order_projection
+    );
+    define_record_local!(
+        record_local_stop_complete,
+        StopComplete,
+        save_stop_complete,
+        apply_stop_complete_projection
+    );
 }
 
 #[cfg(test)]
@@ -260,6 +371,116 @@ mod tests {
             .expect("project snapshot after stop")
             .expect("project exists after stop");
         assert_eq!(stopped_project.status, ProjectStatus::Stopping);
+        assert_eq!(
+            store.stats().expect("stats").inbox_unprocessed_count,
+            0,
+            "received messages should be marked processed after ingest"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn record_local_task_progress_updates_local_projection() {
+        let db_path = env::temp_dir().join(format!(
+            "starweft-runtime-local-progress-{}.db",
+            VisionId::generate()
+        ));
+        let store = Store::open(&db_path).expect("store");
+        let runtime = RuntimePipeline::new(&store);
+        let keypair = StoredKeypair::generate();
+
+        let principal_actor = ActorId::generate();
+        let owner_actor = ActorId::generate();
+        let worker_actor = ActorId::generate();
+        let vision_id = VisionId::generate();
+        let project_id = ProjectId::generate();
+        let task_id = TaskId::generate();
+
+        let project_charter = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(principal_actor.clone()),
+            ProjectCharter {
+                project_id: project_id.clone(),
+                vision_id: vision_id.clone(),
+                principal_actor_id: principal_actor,
+                owner_actor_id: owner_actor.clone(),
+                title: "demo".to_owned(),
+                objective: "test projection".to_owned(),
+                stop_authority_actor_id: worker_actor.clone(),
+                participant_policy: ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: EvaluationPolicy {
+                    quality_weight: 0.4,
+                    speed_weight: 0.2,
+                    reliability_weight: 0.2,
+                    alignment_weight: 0.2,
+                },
+            },
+        )
+        .with_vision_id(vision_id)
+        .with_project_id(project_id.clone())
+        .sign(&keypair)
+        .expect("sign project charter");
+        runtime
+            .ingest_project_charter(&project_charter)
+            .expect("apply project charter");
+
+        let task_delegated = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(worker_actor.clone()),
+            TaskDelegated {
+                parent_task_id: None,
+                title: "research".to_owned(),
+                description: "collect data".to_owned(),
+                objective: "validate".to_owned(),
+                required_capability: "research.web.v1".to_owned(),
+                input_payload: serde_json::json!({ "target": "market" }),
+                expected_output_schema: serde_json::json!({ "type": "object" }),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&keypair)
+        .expect("sign task delegated");
+        runtime
+            .ingest_task_delegated(&task_delegated)
+            .expect("apply task delegated");
+
+        let task_progress = UnsignedEnvelope::new(
+            worker_actor,
+            Some(owner_actor),
+            TaskProgress {
+                progress: 0.5,
+                message: "working locally".to_owned(),
+                updated_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id.clone())
+        .sign(&keypair)
+        .expect("sign task progress");
+        runtime
+            .record_local_task_progress(&task_progress)
+            .expect("record local progress");
+
+        let task_snapshot = store
+            .task_snapshot(&task_id)
+            .expect("task snapshot after local progress")
+            .expect("task exists after local progress");
+        assert_eq!(task_snapshot.status, TaskStatus::Running);
+        assert_eq!(task_snapshot.progress_value, Some(0.5));
+        assert_eq!(
+            task_snapshot.progress_message.as_deref(),
+            Some("working locally")
+        );
+
+        let project_snapshot = store
+            .project_snapshot(&project_id)
+            .expect("project snapshot after local progress")
+            .expect("project exists after local progress");
+        assert_eq!(project_snapshot.progress.average_progress_value, Some(0.5));
 
         let _ = std::fs::remove_file(db_path);
     }

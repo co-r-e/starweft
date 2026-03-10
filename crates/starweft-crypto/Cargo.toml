@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Cryptographic primitives and key management for starweft"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 base64.workspace = true

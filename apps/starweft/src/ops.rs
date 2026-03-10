@@ -1,13 +1,10 @@
-use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
-use serde_json::{Value, json};
 use starweft_store::{ArtifactRecord, EvaluationRecord, ProjectSnapshot, Store, TaskSnapshot};
-use time::OffsetDateTime;
 
-use crate::config::{DataPaths, load_existing_config};
+use crate::config::load_existing_config;
 
 #[derive(Clone, Debug)]
 pub enum RenderFormat {
@@ -34,6 +31,7 @@ pub struct ExportRequest {
 pub struct PublishContextRequest {
     pub data_dir: Option<PathBuf>,
     pub project_id: String,
+    pub task_id: Option<String>,
     pub format: RenderFormat,
 }
 
@@ -60,7 +58,10 @@ pub struct AuditRequest {
 
 #[derive(Serialize)]
 struct PublishContext {
+    scope_type: String,
+    scope_id: String,
     project: ProjectSnapshot,
+    task: Option<TaskSnapshot>,
     task_ids: Vec<String>,
     evaluations: Vec<EvaluationRecord>,
     artifacts: Vec<ArtifactRecord>,
@@ -105,23 +106,71 @@ pub fn run_publish_context(request: PublishContextRequest) -> Result<String> {
     let project = store
         .project_snapshot(&project_id)?
         .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] project が見つかりません"))?;
-    let task_ids = store
-        .list_task_ids_by_project(&project_id)?
-        .into_iter()
-        .map(|task_id| task_id.to_string())
-        .collect::<Vec<_>>();
-    let evaluations = store.list_evaluations_by_project(&project_id)?;
-    let artifacts = store.list_artifacts_by_project(&project_id)?;
+    let task = match request.task_id {
+        Some(task_id) => {
+            let task_id = starweft_id::TaskId::new(task_id)?;
+            let task = store
+                .task_snapshot(&task_id)?
+                .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task が見つかりません"))?;
+            if task.project_id != project_id {
+                bail!("[E_TASK_NOT_FOUND] task が project に属していません");
+            }
+            Some(task)
+        }
+        None => None,
+    };
+    let task_ids = if let Some(task) = &task {
+        vec![task.task_id.to_string()]
+    } else {
+        store
+            .list_task_ids_by_project(&project_id)?
+            .into_iter()
+            .map(|task_id| task_id.to_string())
+            .collect::<Vec<_>>()
+    };
+    let evaluations = if let Some(task) = &task {
+        store
+            .list_evaluations_by_project(&project_id)?
+            .into_iter()
+            .filter(|record| record.task_id.as_ref() == Some(&task.task_id))
+            .collect::<Vec<_>>()
+    } else {
+        store.list_evaluations_by_project(&project_id)?
+    };
+    let artifacts = if let Some(task) = &task {
+        store
+            .list_artifacts_by_project(&project_id)?
+            .into_iter()
+            .filter(|record| record.task_id == task.task_id)
+            .collect::<Vec<_>>()
+    } else {
+        store.list_artifacts_by_project(&project_id)?
+    };
 
     let mut publish_signals = Vec::new();
-    if project.task_counts.failed > 0 {
-        publish_signals.push("failed_tasks_present".to_owned());
-    }
-    if project.retry.max_retry_attempt > 0 {
-        publish_signals.push("retry_detected".to_owned());
-    }
-    if project.status.as_str() == "stopped" {
-        publish_signals.push("project_stopped".to_owned());
+    if let Some(task) = &task {
+        if task.status.as_str() == "failed" {
+            publish_signals.push("task_failed".to_owned());
+        }
+        if task.retry_attempt > 0 {
+            publish_signals.push("retry_detected".to_owned());
+        }
+        if task.latest_failure_action.is_some() {
+            publish_signals.push("latest_failure_action_present".to_owned());
+        }
+    } else {
+        if project.task_counts.failed > 0 {
+            publish_signals.push("failed_tasks_present".to_owned());
+        }
+        if project.retry.max_retry_attempt > 0 {
+            publish_signals.push("retry_detected".to_owned());
+        }
+        if project.status.as_str() == "stopped" {
+            publish_signals.push("project_stopped".to_owned());
+        }
+        if project.retry.latest_failure_action.is_some() {
+            publish_signals.push("latest_failure_action_present".to_owned());
+        }
     }
     if !evaluations.is_empty() {
         publish_signals.push("evaluation_available".to_owned());
@@ -129,12 +178,19 @@ pub fn run_publish_context(request: PublishContextRequest) -> Result<String> {
     if !artifacts.is_empty() {
         publish_signals.push("artifacts_available".to_owned());
     }
-    if project.retry.latest_failure_action.is_some() {
-        publish_signals.push("latest_failure_action_present".to_owned());
-    }
 
     let context = PublishContext {
+        scope_type: if task.is_some() {
+            "task".to_owned()
+        } else {
+            "project".to_owned()
+        },
+        scope_id: task
+            .as_ref()
+            .map(|snapshot| snapshot.task_id.to_string())
+            .unwrap_or_else(|| project.project_id.to_string()),
         project,
+        task,
         task_ids,
         evaluations,
         artifacts,
@@ -169,12 +225,14 @@ pub fn run_repair(request: RepairRequest) -> Result<String> {
         RepairAction::RebuildProjections => {
             let report = store.rebuild_projections_from_task_events()?;
             Ok(format!(
-                "repair_action: rebuild_projections\nreplayed_events: {}\nrebuilt_projects: {}\nrebuilt_tasks: {}\nrebuilt_task_results: {}\nrebuilt_evaluations: {}\nrebuilt_stop_orders: {}\nrebuilt_stop_receipts: {}",
+                "repair_action: rebuild_projections\nreplayed_events: {}\nrebuilt_projects: {}\nrebuilt_tasks: {}\nrebuilt_task_results: {}\nrebuilt_evaluations: {}\nrebuilt_publish_events: {}\nrebuilt_snapshots: {}\nrebuilt_stop_orders: {}\nrebuilt_stop_receipts: {}",
                 report.replayed_events,
                 report.rebuilt_projects,
                 report.rebuilt_tasks,
                 report.rebuilt_task_results,
                 report.rebuilt_evaluations,
+                report.rebuilt_publish_events,
+                report.rebuilt_snapshots,
                 report.rebuilt_stop_orders,
                 report.rebuilt_stop_receipts,
             ))
@@ -247,14 +305,8 @@ fn render_task_snapshot(snapshot: &TaskSnapshot, format: RenderFormat) -> Result
                 .progress_value
                 .map(|value| format!("{value:.3}"))
                 .unwrap_or_else(|| "none".to_owned()),
-            snapshot
-                .latest_failure_action
-                .as_deref()
-                .unwrap_or("none"),
-            snapshot
-                .latest_failure_reason
-                .as_deref()
-                .unwrap_or("none"),
+            snapshot.latest_failure_action.as_deref().unwrap_or("none"),
+            snapshot.latest_failure_reason.as_deref().unwrap_or("none"),
         )),
     }
 }
@@ -279,8 +331,21 @@ fn render_publish_context_markdown(context: &PublishContext) -> String {
         .and_then(|record| record.comment.as_deref())
         .unwrap_or("none");
 
+    let task_section = context.task.as_ref().map(|task| {
+        format!(
+            "\n## Task\n- task_id: `{}`\n- status: {}\n- assignee_actor_id: `{}`\n- retry_attempt: {}\n- latest_failure_action: {}\n",
+            task.task_id,
+            task.status,
+            task.assignee_actor_id,
+            task.retry_attempt,
+            task.latest_failure_action.as_deref().unwrap_or("none"),
+        )
+    }).unwrap_or_default();
+
     format!(
-        "# Publish Context\n\n## Project\n- project_id: `{}`\n- title: {}\n- status: {}\n- task_count: {}\n- failed_tasks: {}\n- retry_task_count: {}\n- max_retry_attempt: {}\n- latest_failure_action: {}\n\n## Signals\n{}\n\n## Summary\n- evaluations: {}\n- artifacts: {}\n- latest_evaluation_comment: {}\n",
+        "# Publish Context\n\n- scope_type: {}\n- scope_id: `{}`\n\n## Project\n- project_id: `{}`\n- title: {}\n- status: {}\n- task_count: {}\n- failed_tasks: {}\n- retry_task_count: {}\n- max_retry_attempt: {}\n- latest_failure_action: {}\n{}\n## Signals\n{}\n\n## Summary\n- evaluations: {}\n- artifacts: {}\n- latest_evaluation_comment: {}\n",
+        context.scope_type,
+        context.scope_id,
         context.project.project_id,
         context.project.title,
         context.project.status,
@@ -294,6 +359,7 @@ fn render_publish_context_markdown(context: &PublishContext) -> String {
             .latest_failure_action
             .as_deref()
             .unwrap_or("none"),
+        task_section,
         context
             .publish_signals
             .iter()
@@ -307,65 +373,21 @@ fn render_publish_context_markdown(context: &PublishContext) -> String {
 }
 
 #[allow(dead_code)]
-pub fn create_backup_archive(data_dir: Option<&PathBuf>, output: &PathBuf) -> Result<String> {
-    let (_config, paths) = load_existing_config(data_dir)?;
-    let manifest = json!({
-        "created_at": OffsetDateTime::now_utc(),
-        "root": paths.root,
-        "files": collect_backup_files(&paths)?,
-    });
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(output, serde_json::to_vec_pretty(&manifest)?)?;
-    Ok(format!("backup_manifest: {}", output.display()))
-}
-
-#[allow(dead_code)]
-pub fn restore_backup_archive(_data_dir: Option<&PathBuf>, input: &PathBuf) -> Result<String> {
-    let bytes = fs::read(input)?;
-    let manifest: Value = serde_json::from_slice(&bytes)?;
+pub fn create_backup_archive(data_dir: Option<&PathBuf>, output: &Path) -> Result<String> {
+    let output = crate::create_backup_bundle(data_dir, output, false)?;
     Ok(format!(
-        "backup_restore_manifest: {}\nstatus: stub\nfile_count: {}",
-        input.display(),
-        manifest["files"].as_array().map_or(0, |files| files.len())
+        "backup_dir: {}\nmanifest: {}",
+        output.display(),
+        output.join("manifest.json").display()
     ))
 }
 
 #[allow(dead_code)]
-fn collect_backup_files(paths: &DataPaths) -> Result<Vec<String>> {
-    let mut files = Vec::new();
-    for path in [
-        &paths.config_toml,
-        &paths.actor_key,
-        &paths.stop_authority_key,
-        &paths.ledger_db,
-    ] {
-        if path.exists() {
-            files.push(path.display().to_string());
-        }
-    }
-    for directory in [&paths.artifacts_dir, &paths.logs_dir, &paths.cache_dir] {
-        if directory.exists() {
-            for entry in walk_dir(directory)? {
-                files.push(entry.display().to_string());
-            }
-        }
-    }
-    Ok(files)
-}
-
-#[allow(dead_code)]
-fn walk_dir(root: &PathBuf) -> Result<Vec<PathBuf>> {
-    let mut result = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            result.extend(walk_dir(&path)?);
-        } else {
-            result.push(path);
-        }
-    }
-    Ok(result)
+pub fn restore_backup_archive(data_dir: Option<&PathBuf>, input: &Path) -> Result<String> {
+    let (input, paths) = crate::restore_backup_bundle(data_dir, input, false)?;
+    Ok(format!(
+        "restored_from: {}\ndata_dir: {}",
+        input.display(),
+        paths.root.display()
+    ))
 }

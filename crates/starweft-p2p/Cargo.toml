@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Peer-to-peer networking layer for starweft using libp2p"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -11,6 +14,6 @@ libp2p = { version = "0.56.0", features = ["cbor", "macros", "noise", "request-r
 multiaddr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1.44.1", features = ["macros", "rt", "sync"] }
+tokio = { version = "1.44.1", features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 starweft-protocol = { path = "../starweft-protocol" }

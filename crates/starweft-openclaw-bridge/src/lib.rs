@@ -1,8 +1,16 @@
+//! Bridge for executing tasks via external OpenClaw-compatible processes.
+//!
+//! Spawns an external binary, writes a JSON task request to its stdin,
+//! reads the structured response from stdout, and supports timeout,
+//! cancellation, and progress reporting via `PROGRESS:` lines.
+
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -10,51 +18,94 @@ use serde_json::Value;
 use starweft_protocol::ArtifactRef;
 use wait_timeout::ChildExt;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+/// Configuration for an external OpenClaw executor binary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenClawAttachment {
+    /// Path to the executable binary.
     pub bin: String,
+    /// Optional working directory for the spawned process.
     pub working_dir: Option<String>,
+    /// Maximum execution time in seconds (defaults to 3600).
     pub timeout_sec: Option<u64>,
 }
 
+/// A task request sent to the external process via stdin as JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeTaskRequest {
+    /// Short task title.
     pub title: String,
+    /// Detailed task description.
     pub description: String,
+    /// The objective this task must fulfill.
     pub objective: String,
+    /// Capability identifier required by this task.
     pub required_capability: String,
+    /// Structured input data for the executor.
     pub input_payload: Value,
 }
 
+/// The structured response parsed from the external process output.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeTaskResponse {
+    /// Human-readable summary of what was accomplished.
     pub summary: String,
+    /// Structured output data produced by the executor.
     pub output_payload: Value,
+    /// References to any artifacts produced during execution.
     #[serde(default)]
     pub artifact_refs: Vec<ArtifactRef>,
+    /// Progress updates parsed from `PROGRESS:` stdout lines.
     #[serde(default)]
     pub progress_updates: Vec<BridgeProgressUpdate>,
+    /// Raw captured stdout from the process.
     #[serde(default)]
     pub raw_stdout: String,
+    /// Raw captured stderr from the process.
     #[serde(default)]
     pub raw_stderr: String,
 }
 
+/// A single progress update parsed from a `PROGRESS:` stdout line.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeProgressUpdate {
+    /// Progress fraction (0.0 to 1.0).
     pub progress: f32,
+    /// Human-readable progress message.
     pub message: String,
 }
 
+/// Executes a task by spawning the configured external process.
 pub fn execute_task(
     attachment: &OpenClawAttachment,
     request: &BridgeTaskRequest,
+) -> Result<BridgeTaskResponse> {
+    execute_task_inner(attachment, request, None)
+}
+
+/// Executes a task with an atomic cancellation flag for cooperative shutdown.
+pub fn execute_task_with_cancel_flag(
+    attachment: &OpenClawAttachment,
+    request: &BridgeTaskRequest,
+    cancel_flag: &AtomicBool,
+) -> Result<BridgeTaskResponse> {
+    execute_task_inner(attachment, request, Some(cancel_flag))
+}
+
+fn execute_task_inner(
+    attachment: &OpenClawAttachment,
+    request: &BridgeTaskRequest,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<BridgeTaskResponse> {
     let mut command = Command::new(&attachment.bin);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
 
     if let Some(working_dir) = &attachment.working_dir {
         command.current_dir(Path::new(working_dir));
@@ -64,23 +115,40 @@ pub fn execute_task(
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(serde_json::to_vec(request)?.as_slice())?;
     }
+    drop(child.stdin.take());
+
+    let stdout_reader = child.stdout.take().map(spawn_stream_reader);
+    let stderr_reader = child.stderr.take().map(spawn_stream_reader);
 
     let timeout = Duration::from_secs(attachment.timeout_sec.unwrap_or(3600));
-    let status = child.wait_timeout(timeout)?.ok_or_else(|| {
-        let _ = child.kill();
-        anyhow!(
-            "openclaw process timed out after {} seconds",
-            timeout.as_secs()
-        )
-    })?;
-    let mut stdout = String::new();
-    if let Some(mut reader) = child.stdout.take() {
-        reader.read_to_string(&mut stdout)?;
-    }
-    let mut stderr = String::new();
-    if let Some(mut reader) = child.stderr.take() {
-        reader.read_to_string(&mut stderr)?;
-    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if cancel_flag.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            terminate_child(&mut child);
+            let _ = join_reader(stdout_reader);
+            let _ = join_reader(stderr_reader);
+            return Err(anyhow!("[E_TASK_CANCELLED] openclaw process cancelled"));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            terminate_child(&mut child);
+            let _ = join_reader(stdout_reader);
+            let _ = join_reader(stderr_reader);
+            return Err(anyhow!(
+                "openclaw process timed out after {} seconds",
+                timeout.as_secs()
+            ));
+        }
+
+        let wait_slice = std::cmp::min(Duration::from_millis(100), deadline - now);
+        match child.wait_timeout(wait_slice)? {
+            Some(status) => break status,
+            None => continue,
+        }
+    };
+    let stdout = join_reader(stdout_reader)?;
+    let stderr = join_reader(stderr_reader)?;
     if !status.success() {
         bail!(
             "openclaw process failed: status={status} stderr={}",
@@ -156,5 +224,187 @@ fn parse_stdout(stdout: &str) -> ParsedStdout {
     ParsedStdout {
         final_payload: payload_lines.join("\n"),
         progress_updates,
+    }
+}
+
+fn spawn_stream_reader<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut content = String::new();
+        reader.read_to_string(&mut content)?;
+        Ok(content)
+    })
+}
+
+fn join_reader(reader: Option<thread::JoinHandle<std::io::Result<String>>>) -> Result<String> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| anyhow!("openclaw stream reader panicked"))?
+            .map_err(Into::into),
+        None => Ok(String::new()),
+    }
+}
+
+#[cfg(unix)]
+fn terminate_child(child: &mut std::process::Child) {
+    let pid = child.id() as i32;
+    unsafe {
+        let _ = libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn write_script(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, script).expect("write script");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    fn sample_request() -> BridgeTaskRequest {
+        BridgeTaskRequest {
+            title: "demo".to_owned(),
+            description: "desc".to_owned(),
+            objective: "obj".to_owned(),
+            required_capability: "openclaw.execution.v1".to_owned(),
+            input_payload: serde_json::json!({ "ok": true }),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_task_handles_large_stderr_without_deadlock() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("large-stderr.sh");
+        write_script(
+            &script_path,
+            r#"#!/bin/sh
+head -c 200000 /dev/zero | tr '\0' 'e' >&2
+printf '{"summary":"ok","output_payload":{"done":true}}'
+"#,
+        );
+
+        let response = execute_task(
+            &OpenClawAttachment {
+                bin: script_path.display().to_string(),
+                working_dir: None,
+                timeout_sec: Some(5),
+            },
+            &sample_request(),
+        )
+        .expect("execute task");
+
+        assert_eq!(response.summary, "ok");
+        assert_eq!(response.output_payload["done"], true);
+        assert!(response.raw_stderr.len() >= 200000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_task_times_out_and_returns_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("timeout.sh");
+        write_script(
+            &script_path,
+            r#"#!/bin/sh
+sleep 2
+printf '{"summary":"late","output_payload":{"done":true}}'
+"#,
+        );
+
+        let error = execute_task(
+            &OpenClawAttachment {
+                bin: script_path.display().to_string(),
+                working_dir: None,
+                timeout_sec: Some(1),
+            },
+            &sample_request(),
+        )
+        .expect_err("timeout should fail");
+
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_task_parses_progress_updates() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("progress.sh");
+        write_script(
+            &script_path,
+            r#"#!/bin/sh
+printf 'PROGRESS:0.2:booting\n'
+printf 'PROGRESS:0.8:almost-done\n'
+printf '{"summary":"done","output_payload":{"ok":true}}'
+"#,
+        );
+
+        let response = execute_task(
+            &OpenClawAttachment {
+                bin: script_path.display().to_string(),
+                working_dir: None,
+                timeout_sec: Some(5),
+            },
+            &sample_request(),
+        )
+        .expect("execute task");
+
+        assert_eq!(response.progress_updates.len(), 2);
+        assert_eq!(response.progress_updates[0].message, "booting");
+        assert_eq!(response.output_payload["ok"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_task_can_be_cancelled() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("cancel.sh");
+        write_script(
+            &script_path,
+            r#"#!/bin/sh
+sleep 5
+printf '{"summary":"late","output_payload":{"done":true}}'
+"#,
+        );
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let toggle = Arc::clone(&cancel_flag);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            toggle.store(true, Ordering::SeqCst);
+        });
+
+        let error = execute_task_inner(
+            &OpenClawAttachment {
+                bin: script_path.display().to_string(),
+                working_dir: None,
+                timeout_sec: Some(10),
+            },
+            &sample_request(),
+            Some(cancel_flag.as_ref()),
+        )
+        .expect_err("cancellation should fail");
+
+        assert!(error.to_string().contains("E_TASK_CANCELLED"));
     }
 }

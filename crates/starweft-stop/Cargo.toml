@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Stop condition evaluation for starweft task completion"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde.workspace = true
+starweft-id = { path = "../starweft-id" }
 starweft-protocol = { path = "../starweft-protocol" }
+time.workspace = true
