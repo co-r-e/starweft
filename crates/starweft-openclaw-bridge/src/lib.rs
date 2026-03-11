@@ -104,7 +104,6 @@ fn execute_task_inner(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
     {
@@ -337,17 +336,13 @@ mod win_job {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
     use std::fs;
-    #[cfg(unix)]
     use std::sync::Arc;
-    #[cfg(unix)]
     use tempfile::TempDir;
 
-    #[cfg(unix)]
     fn write_script(path: &Path, script: &str) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -357,7 +352,6 @@ mod tests {
         fs::set_permissions(path, permissions).expect("chmod");
     }
 
-    #[cfg(unix)]
     fn sample_request() -> BridgeTaskRequest {
         BridgeTaskRequest {
             title: "demo".to_owned(),
@@ -368,7 +362,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_task_handles_large_stderr_without_deadlock() {
         let temp = TempDir::new().expect("tempdir");
@@ -396,7 +389,6 @@ printf '{"summary":"ok","output_payload":{"done":true}}'
         assert!(response.raw_stderr.len() >= 200000);
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_task_times_out_and_returns_error() {
         let temp = TempDir::new().expect("tempdir");
@@ -422,7 +414,6 @@ printf '{"summary":"late","output_payload":{"done":true}}'
         assert!(error.to_string().contains("timed out"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_task_parses_progress_updates() {
         let temp = TempDir::new().expect("tempdir");
@@ -451,7 +442,6 @@ printf '{"summary":"done","output_payload":{"ok":true}}'
         assert_eq!(response.output_payload["ok"], true);
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_task_can_be_cancelled() {
         let temp = TempDir::new().expect("tempdir");
