@@ -85,18 +85,28 @@ pub struct P2pSection {
     pub max_peers: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum P2pTransportKind {
-    #[default]
     LocalMailbox,
     Libp2p,
+}
+
+impl Default for P2pTransportKind {
+    fn default() -> Self {
+        // Unix: file-based local mailbox; Windows: TCP localhost via libp2p
+        if cfg!(unix) {
+            Self::LocalMailbox
+        } else {
+            Self::Libp2p
+        }
+    }
 }
 
 impl Default for P2pSection {
     fn default() -> Self {
         Self {
-            transport: P2pTransportKind::LocalMailbox,
+            transport: P2pTransportKind::default(),
             relay_enabled: true,
             direct_preferred: true,
             max_peers: 128,
@@ -386,8 +396,17 @@ impl Config {
 }
 
 fn default_listen_multiaddr(root: &Path) -> String {
-    let mailbox = root.join("mailbox.sock");
-    format!("/unix/{}", mailbox.display())
+    // On Unix, use file-based local mailbox; on Windows, use TCP localhost.
+    #[cfg(unix)]
+    {
+        let mailbox = root.join("mailbox.sock");
+        format!("/unix/{}", mailbox.display())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        "/ip4/127.0.0.1/tcp/0".to_owned()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -405,10 +424,23 @@ pub struct DataPaths {
 
 impl DataPaths {
     pub fn default() -> Result<Self> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            anyhow!("[E_CONFIG_NOT_FOUND] ホームディレクトリを特定できませんでした")
-        })?;
-        Ok(Self::from_root(home.join(".starweft")))
+        // Unix: ~/.starweft  |  Windows: %LOCALAPPDATA%\starweft
+        #[cfg(unix)]
+        let root = {
+            let home = dirs::home_dir().ok_or_else(|| {
+                anyhow!("[E_CONFIG_NOT_FOUND] ホームディレクトリを特定できませんでした")
+            })?;
+            home.join(".starweft")
+        };
+        #[cfg(not(unix))]
+        let root = {
+            dirs::data_local_dir()
+                .ok_or_else(|| {
+                    anyhow!("[E_CONFIG_NOT_FOUND] ローカルデータディレクトリを特定できませんでした")
+                })?
+                .join("starweft")
+        };
+        Ok(Self::from_root(root))
     }
 
     #[must_use]
@@ -495,7 +527,25 @@ fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path, _mode: u32) -> Result<()> {
+fn set_private_permissions(path: &Path, _mode: u32) -> Result<()> {
+    // On Windows, ensure files/directories are not world-readable.
+    // Mark files as hidden to reduce accidental exposure.
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+                SetFileAttributesW,
+            };
+            let attrs = GetFileAttributesW(wide.as_ptr());
+            if attrs != INVALID_FILE_ATTRIBUTES {
+                let _ = SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN);
+            }
+        }
+    }
+    let _ = path;
     Ok(())
 }
 

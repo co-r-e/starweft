@@ -106,12 +106,20 @@ fn execute_task_inner(
         .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP so we can terminate the tree later
+        command.creation_flags(0x0000_0200);
+    }
 
     if let Some(working_dir) = &attachment.working_dir {
         command.current_dir(Path::new(working_dir));
     }
 
     let mut child = command.spawn()?;
+    #[cfg(windows)]
+    let _job_guard = win_job::assign_to_job(&child);
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(serde_json::to_vec(request)?.as_slice())?;
     }
@@ -262,6 +270,70 @@ fn terminate_child(child: &mut std::process::Child) {
 fn terminate_child(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Windows Job Object helper for process-group termination.
+/// When the `JobGuard` is dropped (or when we call `terminate_child`),
+/// all processes assigned to the job are terminated.
+#[cfg(windows)]
+mod win_job {
+    use std::process::Child;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+
+    pub(crate) struct JobGuard {
+        handle: HANDLE,
+    }
+
+    impl Drop for JobGuard {
+        fn drop(&mut self) {
+            if self.handle != INVALID_HANDLE_VALUE {
+                unsafe {
+                    let _ = TerminateJobObject(self.handle, 1);
+                    let _ = CloseHandle(self.handle);
+                }
+            }
+        }
+    }
+
+    /// Creates a Windows Job Object and assigns the child process to it.
+    /// The job is configured with `KILL_ON_JOB_CLOSE` so all child processes
+    /// are terminated when the guard is dropped.
+    pub(crate) fn assign_to_job(child: &Child) -> Option<JobGuard> {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == INVALID_HANDLE_VALUE || job == 0 {
+                return None;
+            }
+
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set_ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set_ok == 0 {
+                let _ = CloseHandle(job);
+                return None;
+            }
+
+            use std::os::windows::io::AsRawHandle;
+            let process_handle = child.as_raw_handle() as HANDLE;
+            let assign_ok = AssignProcessToJobObject(job, process_handle);
+            if assign_ok == 0 {
+                let _ = CloseHandle(job);
+                return None;
+            }
+
+            Some(JobGuard { handle: job })
+        }
+    }
 }
 
 #[cfg(test)]

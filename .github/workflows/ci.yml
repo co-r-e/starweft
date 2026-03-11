@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +81,8 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p starweft
 
-      - name: Package artifact
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -94,6 +95,17 @@ jobs:
           else
             shasum -a 256 "dist/${ARCHIVE}" > "dist/${ARCHIVE}.sha256"
           fi
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = $env:GITHUB_REF_NAME
+          $ARCHIVE = "starweft-${VERSION}-Windows.zip"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/starweft.exe -DestinationPath "dist/${ARCHIVE}"
+          $hash = (Get-FileHash "dist/${ARCHIVE}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${ARCHIVE}" | Out-File -Encoding ascii "dist/${ARCHIVE}.sha256"
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4

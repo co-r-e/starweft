@@ -10,11 +10,20 @@ homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-libc = "0.2.171"
 serde.workspace = true
 serde_json.workspace = true
 wait-timeout = "0.2.0"
 starweft-protocol = { path = "../starweft-protocol" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.171"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_JobObjects",
+    "Win32_Foundation",
+    "Win32_Security",
+] }
 
 [dev-dependencies]
 tempfile = "3.18.0"

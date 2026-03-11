@@ -183,8 +183,13 @@ fn set_private_permissions(path: &std::path::Path) -> Result<(), std::io::Error>
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &std::path::Path) -> Result<(), std::io::Error> {
-    Ok(())
+fn set_private_permissions(path: &std::path::Path) -> Result<(), std::io::Error> {
+    // Mark private key files as read-only on Windows to prevent accidental
+    // modification. Directory-level ACL protection is applied by the
+    // application's config layer (see config.rs ensure_layout).
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(path, perms)
 }
 
 #[cfg(test)]
