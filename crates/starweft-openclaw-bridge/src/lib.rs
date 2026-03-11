@@ -339,8 +339,12 @@ mod win_job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::sync::Arc;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -353,6 +357,7 @@ mod tests {
         fs::set_permissions(path, permissions).expect("chmod");
     }
 
+    #[cfg(unix)]
     fn sample_request() -> BridgeTaskRequest {
         BridgeTaskRequest {
             title: "demo".to_owned(),
