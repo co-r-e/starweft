@@ -374,7 +374,7 @@ fn render_publish_context_markdown(context: &PublishContext) -> String {
 
 #[allow(dead_code)]
 pub fn create_backup_archive(data_dir: Option<&PathBuf>, output: &Path) -> Result<String> {
-    let output = crate::create_backup_bundle(data_dir, output, false)?;
+    let output = crate::commands::create_backup_bundle(data_dir, output, false)?;
     Ok(format!(
         "backup_dir: {}\nmanifest: {}",
         output.display(),
@@ -384,7 +384,7 @@ pub fn create_backup_archive(data_dir: Option<&PathBuf>, output: &Path) -> Resul
 
 #[allow(dead_code)]
 pub fn restore_backup_archive(data_dir: Option<&PathBuf>, input: &Path) -> Result<String> {
-    let (input, paths) = crate::restore_backup_bundle(data_dir, input, false)?;
+    let (input, paths) = crate::commands::restore_backup_bundle(data_dir, input, false)?;
     Ok(format!(
         "restored_from: {}\ndata_dir: {}",
         input.display(),
