@@ -72,8 +72,9 @@
 - [x] `starweft-store/src/lib.rs` に crate-level doc comment 追加
 
 ### 3-3. パブリッシュ検証
-- [ ] `cargo publish --dry-run` を各 crate で実行
-- [ ] 依存順序での publish 計画を作成
+- [x] 全 23 inter-crate 依存に `version = "0.1.0"` 追加
+- [x] `cargo publish --dry-run` 実行 — leaf crate (`starweft-id`) は成功
+- [x] 依存順序での publish 計画: `starweft-id` → `starweft-crypto` → `starweft-protocol` → `starweft-stop` → `starweft-observation` / `starweft-openclaw-bridge` → `starweft-store` → `starweft-runtime` / `starweft-p2p` → `starweft`
 
 ---
 
@@ -109,8 +110,9 @@
 - [x] `starweft completions zsh` 動作確認
 
 ### 5-2. ドキュメント
-- [ ] README に Windows セットアップ手順を追記
-- [ ] CHANGELOG に Windows 対応を追記
+- [x] README に Windows セットアップ手順を追記
+- [x] CHANGELOG に Windows 対応を追記
+- [x] コードレビュー (`/simplify`) 実施 — バグ 1件 + 品質問題 5件修正
 
 ---
 
