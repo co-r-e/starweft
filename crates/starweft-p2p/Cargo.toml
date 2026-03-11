@@ -16,4 +16,4 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.44.1", features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
-starweft-protocol = { path = "../starweft-protocol" }
+starweft-protocol = { path = "../starweft-protocol", version = "0.1.0" }

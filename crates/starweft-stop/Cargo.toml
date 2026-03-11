@@ -10,6 +10,6 @@ homepage.workspace = true
 
 [dependencies]
 serde.workspace = true
-starweft-id = { path = "../starweft-id" }
-starweft-protocol = { path = "../starweft-protocol" }
+starweft-id = { path = "../starweft-id", version = "0.1.0" }
+starweft-protocol = { path = "../starweft-protocol", version = "0.1.0" }
 time.workspace = true

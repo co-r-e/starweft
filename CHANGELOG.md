@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Windows platform support (x86_64-pc-windows-msvc)
+  - Default transport: libp2p TCP localhost (local mailbox is Unix-only)
+  - Data directory: `%LOCALAPPDATA%\starweft`
+  - Process management: Windows Job Objects for subprocess group termination
+  - File protection: read-only attribute for key files, hidden attribute for data directories
+- Shell completion generation via `starweft completions <shell>` (bash, zsh, fish, powershell, elvish)
+- Global `-v`/`-q` flags for log level control (`-v`: debug, `-vv`: trace, `-q`: warn, `-qq`: error)
+- Registry hardening: mandatory auth on non-loopback binds, body size limits, read/write timeouts, rate limiting
+- SQLite backup API for `backup create` (replaces file copy for consistency)
+- Audit: Ed25519 signature verification and raw JSON tamper detection
+- Store: dead letter management, per-target delivery tracking, outbox delivery summaries
+- `repair list-dead-letters` subcommand
+- `config show` now redacts secrets
+
+### Changed
+
+- CI: added `windows-latest` to test/lint/release matrix (3-platform coverage)
+- CI: serialized E2E tests with `--test-threads=1` to prevent resource conflicts
+- CLI about text updated to Japanese
+- `libc` dependency gated to `cfg(unix)`, `windows-sys` added for Windows APIs
+- Log level resolution priority: `-v/-q` > `--log-level` > config.toml > `RUST_LOG` > default (info)
+
+### Fixed
+
+- Key file overwrite on Windows (`--force`) no longer blocked by read-only attribute
+- `-v` and `-q` flags now conflict (previously `-v` silently won)
+
 ## [0.1.0] - 2025-03-09
 
 ### Added
