@@ -605,13 +605,13 @@ fn planner_context_from_payload(payload: &Value) -> Result<PlannerContext> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{OpenClawPlanningEngine, PlanningEngine};
     use super::{
         PlannerContext, classify_task_failure_action_with_policy,
         fallback_tasks_for_worker_planner, is_planner_task, parse_openclaw_planned_tasks,
         planned_tasks_from_worker_result, planner_task_spec,
     };
-    #[cfg(unix)]
-    use super::{OpenClawPlanningEngine, PlanningEngine};
     use crate::config::{
         Config, NodeRole, OwnerRetryAction, OwnerRetryRule, OwnerSection, PlanningStrategyKind,
     };
