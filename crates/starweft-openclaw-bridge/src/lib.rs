@@ -104,6 +104,7 @@ fn execute_task_inner(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
     {
