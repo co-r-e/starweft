@@ -14,7 +14,7 @@ mod wait;
 mod watch;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use cli::*;
 use config::load_existing_config;
 use tracing_subscriber::EnvFilter;
@@ -36,6 +36,19 @@ fn init_tracing(filter: &str) {
 }
 
 fn resolve_log_filter(cli: &Cli) -> String {
+    // -v/-q flags take highest priority
+    if cli.verbose > 0 {
+        return match cli.verbose {
+            1 => "debug".to_owned(),
+            _ => "trace".to_owned(),
+        };
+    }
+    if cli.quiet > 0 {
+        return match cli.quiet {
+            1 => "warn".to_owned(),
+            _ => "error".to_owned(),
+        };
+    }
     match &cli.command {
         Commands::Run(args) => {
             if let Some(log_level) = args.log_level.as_deref() {
@@ -118,5 +131,14 @@ fn run(cli: Cli) -> Result<()> {
             TaskCommands::Approve(args) => project::run_task_approve(args),
         },
         Commands::Wait(args) => wait::run_wait(args),
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "starweft",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
     }
 }

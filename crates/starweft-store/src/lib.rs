@@ -1,3 +1,8 @@
+//! SQLite-backed persistent storage layer for Starweft.
+//!
+//! Provides an event-sourced task ledger, projection management, outbox
+//! delivery tracking, and WAL-based backup/restore for node state.
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use clap_complete::Shell;
 use starweft_id::{ProjectId, TaskId};
 use starweft_protocol::{RoutedBody, StopScopeType, UnsignedEnvelope};
 
@@ -13,6 +14,12 @@ use crate::config::NodeRole;
     about = "分散マルチエージェントタスク協調プラットフォーム"
 )]
 pub(crate) struct Cli {
+    /// ログ出力を増やす (-v: debug, -vv: trace)
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
+    /// ログ出力を減らす (-q: warn, -qq: error)
+    #[arg(short = 'q', long = "quiet", global = true, action = clap::ArgAction::Count)]
+    pub(crate) quiet: u8,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -79,6 +86,11 @@ pub(crate) enum Commands {
     Stop(StopArgs),
     Status(StatusArgs),
     Wait(WaitArgs),
+    /// シェル補完スクリプトを生成
+    Completions {
+        /// 対象シェル (bash, zsh, fish, powershell, elvish)
+        shell: Shell,
+    },
 }
 
 #[derive(Debug, Subcommand)]

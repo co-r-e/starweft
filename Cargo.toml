@@ -21,6 +21,9 @@ license = "MIT"
 description = "A distributed multi-agent task coordination platform"
 repository = "https://github.com/co-r-e/starweft"
 homepage = "https://co-r-e.com"
+readme = "README.md"
+keywords = ["p2p", "distributed", "multi-agent", "task-coordination", "cli"]
+categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 anyhow = "1.0.98"
