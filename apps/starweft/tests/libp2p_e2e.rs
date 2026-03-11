@@ -480,7 +480,10 @@ fn libp2p_three_node_workflow_and_stop() {
     stop_child(&mut worker_fg);
 }
 
+// OpenClaw サブプロセスに依存するため CI 環境ではタイムアウトする。
+// 手動実行: cargo test --test libp2p_e2e libp2p_worker_plans_vision_via_openclaw -- --ignored
 #[test]
+#[ignore]
 fn libp2p_worker_plans_vision_via_openclaw() {
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");

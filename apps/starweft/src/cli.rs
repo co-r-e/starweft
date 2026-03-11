@@ -7,7 +7,7 @@ use starweft_protocol::{RoutedBody, StopScopeType, UnsignedEnvelope};
 use crate::config::NodeRole;
 
 #[derive(Debug, Parser)]
-#[command(name = "starweft", version, about = "Starweft CLI v0.1 skeleton")]
+#[command(name = "starweft", version, about = "分散マルチエージェントタスク協調プラットフォーム")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,
