@@ -1,3 +1,6 @@
+// E2E テストは OpenClaw mock シェルスクリプトに依存するため Unix のみ
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

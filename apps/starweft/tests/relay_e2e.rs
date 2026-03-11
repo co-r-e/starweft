@@ -1,3 +1,6 @@
+// Relay E2E テストは local_mailbox transport を使用するため Unix のみ
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
