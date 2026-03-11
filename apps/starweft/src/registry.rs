@@ -352,9 +352,7 @@ pub(crate) fn validate_registry_auth_headers(
     let drift_sec = (now - issued_at).whole_seconds().abs();
     if drift_sec > REGISTRY_AUTH_MAX_SKEW_SEC {
         bail!(
-            "[E_REGISTRY_AUTH] timestamp drift {}s exceeds allowed skew {}s",
-            drift_sec,
-            REGISTRY_AUTH_MAX_SKEW_SEC
+            "[E_REGISTRY_AUTH] timestamp drift {drift_sec}s exceeds allowed skew {REGISTRY_AUTH_MAX_SKEW_SEC}s"
         );
     }
 

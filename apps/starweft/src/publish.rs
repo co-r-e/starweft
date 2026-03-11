@@ -353,9 +353,9 @@ pub(crate) fn build_github_publish_payload(
         GitHubPublishMode::PullRequestComment => format!("starweft review update {scope_id}"),
     });
     let target_label = match mode {
-        GitHubPublishMode::Issue => format!("github_issue:{}#{}", repo, target_number),
+        GitHubPublishMode::Issue => format!("github_issue:{repo}#{target_number}"),
         GitHubPublishMode::PullRequestComment => {
-            format!("github_pr_comment:{}#{}", repo, target_number)
+            format!("github_pr_comment:{repo}#{target_number}")
         }
     };
     let payload = GitHubPublishPayload {
@@ -424,7 +424,7 @@ pub(crate) fn post_github_comment(
     let status = response.status();
     let body = response.text()?;
     if !status.is_success() {
-        bail!("[E_GITHUB_PUBLISH_FAILED] status={} body={}", status, body);
+        bail!("[E_GITHUB_PUBLISH_FAILED] status={status} body={body}");
     }
     Ok(serde_json::from_str(&body)?)
 }

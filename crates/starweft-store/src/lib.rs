@@ -3995,9 +3995,7 @@ impl Store {
         )?;
         if changed == 0 {
             bail!(
-                "[E_OUTBOX_DELIVERY_TARGET] unknown outbox delivery target: msg_id={} multiaddr={}",
-                msg_id,
-                multiaddr
+                "[E_OUTBOX_DELIVERY_TARGET] unknown outbox delivery target: msg_id={msg_id} multiaddr={multiaddr}"
             );
         }
         self.refresh_outbox_message_delivery_state(msg_id)
@@ -4086,9 +4084,7 @@ impl Store {
         )?;
         if changed == 0 {
             bail!(
-                "[E_OUTBOX_DELIVERY_TARGET] unknown outbox delivery target: msg_id={} multiaddr={}",
-                msg_id,
-                multiaddr
+                "[E_OUTBOX_DELIVERY_TARGET] unknown outbox delivery target: msg_id={msg_id} multiaddr={multiaddr}"
             );
         }
         self.refresh_outbox_message_delivery_state(msg_id)
@@ -4262,9 +4258,7 @@ fn migrate_connection(connection: &Connection) -> Result<()> {
     let current_version = schema_user_version(connection)?;
     if current_version > STORE_SCHEMA_VERSION {
         bail!(
-            "[E_SCHEMA_VERSION] unsupported future schema version: current={} supported={}",
-            current_version,
-            STORE_SCHEMA_VERSION
+            "[E_SCHEMA_VERSION] unsupported future schema version: current={current_version} supported={STORE_SCHEMA_VERSION}"
         );
     }
 

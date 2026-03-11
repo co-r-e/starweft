@@ -673,10 +673,7 @@ pub(crate) fn build_task_tree_output(
         Some(root_task_id) => {
             let ids = store.task_tree_task_ids(project_id, root_task_id)?;
             if ids.is_empty() {
-                bail!(
-                    "[E_TASK_NOT_FOUND] root task が project に属していません: {}",
-                    root_task_id
-                );
+                bail!("[E_TASK_NOT_FOUND] root task が project に属していません: {root_task_id}");
             }
             Some(
                 ids.into_iter()

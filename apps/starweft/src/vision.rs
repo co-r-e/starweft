@@ -207,7 +207,7 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
             }))?
         );
     } else {
-        println!("vision_id: {}", vision_id);
+        println!("vision_id: {vision_id}");
         println!("msg_id: {}", envelope.msg_id);
         if let Some(owner_actor_id) = owner_actor_id {
             println!("owner_actor_id: {owner_actor_id}");

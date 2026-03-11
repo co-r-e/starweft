@@ -391,9 +391,7 @@ pub(crate) fn ensure_wire_protocol_compatible(config: &Config, protocol: &str) -
         return Ok(());
     }
     bail!(
-        "[E_PROTOCOL_VERSION] 受信メッセージ protocol が未対応です: received={} expected={}",
-        protocol,
-        PROTOCOL_VERSION
+        "[E_PROTOCOL_VERSION] 受信メッセージ protocol が未対応です: received={protocol} expected={PROTOCOL_VERSION}"
     );
 }
 
@@ -1392,7 +1390,7 @@ pub(crate) fn handle_worker_task(
             (
                 TaskExecutionStatus::Failed,
                 BridgeTaskResponse {
-                    summary: format!("bridge failed: openclaw disabled for {}", task_title),
+                    summary: format!("bridge failed: openclaw disabled for {task_title}"),
                     output_payload: serde_json::json!({
                         "bridge_error": "openclaw disabled",
                         "input": task_input,

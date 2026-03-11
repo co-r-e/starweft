@@ -237,8 +237,7 @@ pub(crate) fn render_snapshot_compact_summary_line(output: &str) -> Option<Strin
         let retry = get("max_retry_attempt").unwrap_or("0");
         let action = get("latest_failure_action").unwrap_or("none");
         return Some(format!(
-            "compact_summary: scope=project source={} project_id={} status={} queued={} running={} completed={} average_progress_value={} max_retry_attempt={} latest_failure_action={}",
-            source, project_id, status, queued, running, completed, avg, retry, action
+            "compact_summary: scope=project source={source} project_id={project_id} status={status} queued={queued} running={running} completed={completed} average_progress_value={avg} max_retry_attempt={retry} latest_failure_action={action}"
         ));
     }
     if let Some(task_id) = get("task_id") {
@@ -248,8 +247,7 @@ pub(crate) fn render_snapshot_compact_summary_line(output: &str) -> Option<Strin
         let retry = get("retry_attempt").unwrap_or("0");
         let action = get("latest_failure_action").unwrap_or("none");
         return Some(format!(
-            "compact_summary: scope=task source={} task_id={} status={} assignee_actor_id={} progress_value={} retry_attempt={} latest_failure_action={}",
-            source, task_id, status, assignee, progress, retry, action
+            "compact_summary: scope=task source={source} task_id={task_id} status={status} assignee_actor_id={assignee} progress_value={progress} retry_attempt={retry} latest_failure_action={action}"
         ));
     }
     if let Some(snapshot_id) = get("snapshot_id") {
@@ -258,8 +256,7 @@ pub(crate) fn render_snapshot_compact_summary_line(output: &str) -> Option<Strin
             .or(get("scope"))
             .unwrap_or("unknown");
         return Some(format!(
-            "compact_summary: scope={} source={} snapshot_id={} scope_id={}",
-            scope, source, snapshot_id, scope_id
+            "compact_summary: scope={scope} source={source} snapshot_id={snapshot_id} scope_id={scope_id}"
         ));
     }
     Some(format!("compact_summary: source={source}"))
@@ -364,10 +361,7 @@ pub(crate) fn render_snapshot(args: &SnapshotArgs) -> Result<String> {
             )?;
             return Ok("snapshot_request: queued\nsnapshot_source: remote_request".to_owned());
         }
-        bail!(
-            "[E_PROJECT_NOT_FOUND] project が見つかりません: {}",
-            project_id
-        );
+        bail!("[E_PROJECT_NOT_FOUND] project が見つかりません: {project_id}");
     }
 
     let task_id = starweft_id::TaskId::new(args.task.clone().expect("validated by caller"))?;
@@ -394,7 +388,7 @@ pub(crate) fn render_snapshot(args: &SnapshotArgs) -> Result<String> {
             if let Some(progress_value) = snapshot.progress_value {
                 lines.insert(
                     lines.len() - 1,
-                    format!("progress_value: {:.3}", progress_value),
+                    format!("progress_value: {progress_value:.3}"),
                 );
             }
             if let Some(progress_message) = snapshot.progress_message {
@@ -451,7 +445,7 @@ pub(crate) fn render_snapshot(args: &SnapshotArgs) -> Result<String> {
         )?;
         return Ok("snapshot_request: queued\nsnapshot_source: remote_request".to_owned());
     }
-    bail!("[E_TASK_NOT_FOUND] task が見つかりません: {}", task_id);
+    bail!("[E_TASK_NOT_FOUND] task が見つかりません: {task_id}");
 }
 
 pub(crate) fn run_snapshot(args: SnapshotArgs) -> Result<()> {

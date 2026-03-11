@@ -1203,8 +1203,7 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
         Command::new("sqlite3")
             .arg(&owner_db)
             .arg(format!(
-                "select count(*) from task_results where task_id = '{}';",
-                task_id
+                "select count(*) from task_results where task_id = '{task_id}';"
             ))
             .output()
             .expect("sqlite3 task result count")

@@ -244,8 +244,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
     Command::new("sqlite3")
         .arg(&principal_db)
         .arg(format!(
-            "delete from projects where project_id = '{}';",
-            project_id
+            "delete from projects where project_id = '{project_id}';"
         ))
         .output()
         .expect("sqlite3 delete principal project");
@@ -504,8 +503,7 @@ fn libp2p_relay_forwards_vision_and_charter() {
     Command::new("sqlite3")
         .arg(&principal_db)
         .arg(format!(
-            "delete from projects where project_id = '{}';",
-            project_id
+            "delete from projects where project_id = '{project_id}';"
         ))
         .output()
         .expect("sqlite3 delete principal project");

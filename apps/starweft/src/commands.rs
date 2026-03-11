@@ -302,7 +302,7 @@ pub(crate) fn run_identity_create(args: IdentityCreateArgs) -> Result<()> {
     println!("actor_id: {actor_id}");
     println!("node_id: {node_id}");
     println!("display_name: {}", config.node.display_name);
-    println!("stop_authority: {}", should_create_stop_key);
+    println!("stop_authority: {should_create_stop_key}");
     Ok(())
 }
 
@@ -338,7 +338,7 @@ pub(crate) fn run_identity_show(args: IdentityShowArgs) -> Result<()> {
     println!("node_id: {}", identity.node_id);
     println!("display_name: {}", identity.display_name);
     println!("public_key: {}", identity.public_key);
-    println!("libp2p_peer_id: {}", libp2p_peer_id);
+    println!("libp2p_peer_id: {libp2p_peer_id}");
     if let Some(stop_key) = stop_key {
         println!("stop_public_key: {}", stop_key.public_key);
     }
@@ -553,7 +553,7 @@ pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
             }))?
         );
     } else {
-        println!("stop_id: {}", stop_id);
+        println!("stop_id: {stop_id}");
         println!("msg_id: {}", envelope.msg_id);
     }
     Ok(())

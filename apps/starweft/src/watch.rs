@@ -180,8 +180,7 @@ pub(crate) fn render_log_severity_summary(previous: Option<&str>, current: &str)
         }
     }
     Some(format!(
-        "log_severity: info={} warnings={} errors={}",
-        info, warnings, errors
+        "log_severity: info={info} warnings={warnings} errors={errors}"
     ))
 }
 
