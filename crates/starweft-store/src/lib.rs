@@ -1,19 +1,21 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use starweft_crypto::MessageSignature;
+use starweft_crypto::{MessageSignature, verifying_key_from_base64};
 use starweft_id::{ActorId, MessageId, NodeId, ProjectId, SnapshotId, StopId, TaskId, VisionId};
 use starweft_protocol::{
     ApprovalApplied, ApprovalGranted, Envelope, EvaluationIssued, JoinAccept, JoinOffer,
     JoinReject, MsgType, PROTOCOL_VERSION, ProjectCharter, ProjectStatus, PublishIntentProposed,
     PublishIntentSkipped, PublishResultRecorded, SnapshotResponse, SnapshotScopeType, StopAck,
     StopComplete, StopOrder, StopScopeType, TaskDelegated, TaskExecutionStatus, TaskProgress,
-    TaskResultSubmitted, TaskStatus, VisionConstraints,
+    TaskResultSubmitted, TaskStatus, VisionConstraints, WireEnvelope,
 };
 use starweft_stop::{
     StopReceiptState, next_receipt_state_after_ack, next_receipt_state_after_complete,
@@ -26,8 +28,10 @@ const ACTIVE_TASK_STATUSES_SQL: &str = "('queued', 'accepted', 'running', 'stopp
 /// SQL fragment for terminal task statuses
 const TERMINAL_TASK_STATUSES_SQL: &str = "('completed', 'failed', 'stopped')";
 
-const MIGRATIONS: &str = r#"
-PRAGMA journal_mode = WAL;
+pub const STORE_SCHEMA_VERSION: i32 = 4;
+pub const STORE_SCHEMA_VERSION_LABEL: &str = "starweft-store/4";
+
+const SCHEMA_V1: &str = r#"
 
 CREATE TABLE IF NOT EXISTS local_identity (
   actor_id TEXT PRIMARY KEY,
@@ -200,7 +204,25 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
   msg_type TEXT NOT NULL,
   queued_at TEXT NOT NULL,
   raw_json TEXT NOT NULL,
-  delivery_state TEXT NOT NULL
+  delivery_state TEXT NOT NULL,
+  delivery_attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempted_at TEXT,
+  next_attempt_at TEXT,
+  last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS outbox_deliveries (
+  msg_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  multiaddr TEXT NOT NULL,
+  delivery_state TEXT NOT NULL,
+  delivery_attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempted_at TEXT,
+  next_attempt_at TEXT,
+  last_error TEXT,
+  delivered_at TEXT,
+  PRIMARY KEY (msg_id, multiaddr)
 );
 
 CREATE TABLE IF NOT EXISTS publish_events (
@@ -216,20 +238,20 @@ CREATE TABLE IF NOT EXISTS publish_events (
   created_at TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_certificates_msg_id
-  ON evaluation_certificates(msg_id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_msg_id
-  ON snapshots(msg_id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_events_msg_id
-  ON publish_events(msg_id);
-
 CREATE INDEX IF NOT EXISTS idx_approval_states_project
   ON approval_states(project_id, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_approval_states_task
   ON approval_states(task_id, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_messages_delivery_state
+  ON outbox_messages(delivery_state);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_delivery_state
+  ON outbox_deliveries(delivery_state);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_next_attempt
+  ON outbox_deliveries(next_attempt_at, delivery_state);
 "#;
 
 /// The local node's identity record stored in the database.
@@ -313,6 +335,10 @@ pub struct StoreStats {
     pub running_task_count: u64,
     /// Number of outbox messages awaiting delivery.
     pub queued_outbox_count: u64,
+    /// Number of outbox messages waiting for retry.
+    pub retry_waiting_outbox_count: u64,
+    /// Number of outbox messages moved to dead-letter.
+    pub dead_letter_outbox_count: u64,
     /// Number of stop orders.
     pub stop_order_count: u64,
     /// Number of snapshots.
@@ -352,8 +378,49 @@ pub struct ActorScopedStats {
     pub cached_task_snapshot_count: u64,
 }
 
+/// Delivery state of an outbox message.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum DeliveryState {
+    Queued,
+    RetryWaiting,
+    DeadLetter,
+    DeliveredLocal,
+}
+
+impl DeliveryState {
+    /// Returns the SQL string representation.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::RetryWaiting => "retry_waiting",
+            Self::DeadLetter => "dead_letter",
+            Self::DeliveredLocal => "delivered_local",
+        }
+    }
+}
+
+impl fmt::Display for DeliveryState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_sql())
+    }
+}
+
+impl FromStr for DeliveryState {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "queued" => Ok(Self::Queued),
+            "retry_waiting" => Ok(Self::RetryWaiting),
+            "dead_letter" => Ok(Self::DeadLetter),
+            "delivered_local" => Ok(Self::DeliveredLocal),
+            other => bail!("[E_INVALID_DELIVERY_STATE] 不明な delivery_state: {other}"),
+        }
+    }
+}
+
 /// An outbound message queued for delivery.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct OutboxMessageRecord {
     /// Unique message identifier.
     pub msg_id: String,
@@ -363,8 +430,56 @@ pub struct OutboxMessageRecord {
     pub queued_at: String,
     /// Serialized JSON of the full envelope.
     pub raw_json: String,
-    /// Current delivery state (e.g. `"queued"`, `"delivered"`).
-    pub delivery_state: String,
+    /// Current delivery state.
+    pub delivery_state: DeliveryState,
+    /// Number of delivery attempts recorded so far.
+    pub delivery_attempts: u64,
+    /// When delivery was last attempted, if any.
+    pub last_attempted_at: Option<String>,
+    /// Earliest time when this message should be retried.
+    pub next_attempt_at: Option<String>,
+    /// Last delivery error captured for this message.
+    pub last_error: Option<String>,
+}
+
+/// Per-target delivery state for an outbox message.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct OutboxDeliveryRecord {
+    /// Outbox message identifier.
+    pub msg_id: String,
+    /// Target actor identifier.
+    pub actor_id: ActorId,
+    /// Target node identifier.
+    pub node_id: NodeId,
+    /// Last known delivery address for this target.
+    pub multiaddr: String,
+    /// Current delivery state for this target.
+    pub delivery_state: DeliveryState,
+    /// Number of attempts recorded for this target.
+    pub delivery_attempts: u64,
+    /// When delivery was last attempted, if any.
+    pub last_attempted_at: Option<String>,
+    /// Earliest time when this target should be retried.
+    pub next_attempt_at: Option<String>,
+    /// Last delivery error for this target, if any.
+    pub last_error: Option<String>,
+    /// When delivery completed successfully, if any.
+    pub delivered_at: Option<String>,
+}
+
+/// Aggregated counts of per-target delivery states for a message.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct OutboxDeliverySummary {
+    /// Number of known delivery targets.
+    pub total_targets: u64,
+    /// Targets waiting for first delivery.
+    pub queued_targets: u64,
+    /// Targets waiting for retry.
+    pub retry_waiting_targets: u64,
+    /// Targets moved to dead-letter.
+    pub dead_letter_targets: u64,
+    /// Targets delivered successfully.
+    pub delivered_targets: u64,
 }
 
 /// A recorded task event from the event log.
@@ -684,6 +799,8 @@ pub struct RepairRebuildReport {
 pub struct RepairResumeOutboxReport {
     /// Number of outbox messages resumed.
     pub resumed_messages: u64,
+    /// Number of dead-letter messages resumed.
+    pub resumed_dead_letters: u64,
 }
 
 /// Report produced after reconciling running tasks with stop orders.
@@ -708,6 +825,12 @@ pub struct AuditVerifyLogReport {
     pub lamport_regressions: u64,
     /// Events that failed to parse.
     pub parse_failures: u64,
+    /// Events whose signature could not be re-verified.
+    pub signature_failures: u64,
+    /// Events whose raw envelope did not match decomposed columns.
+    pub raw_json_mismatches: u64,
+    /// Events whose signature could not be checked because `raw_json` or a key was missing.
+    pub unverifiable_signatures: u64,
     /// Detailed error messages for each issue found.
     pub errors: Vec<String>,
 }
@@ -728,16 +851,20 @@ impl Store {
 
         let connection =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        connection.execute_batch(MIGRATIONS)?;
-        ensure_peer_keys_columns(&connection)?;
-        ensure_tasks_progress_columns(&connection)?;
-        ensure_task_events_raw_json_column(&connection)?;
-        ensure_evaluation_certificates_msg_id_column(&connection)?;
-        ensure_snapshots_msg_id_column(&connection)?;
-        ensure_snapshots_requested_by_actor_column(&connection)?;
-        ensure_publish_events_msg_id_index(&connection)?;
+        migrate_connection(&connection)?;
 
         Ok(Self { connection })
+    }
+
+    /// Creates a consistent SQLite backup snapshot of the main database.
+    pub fn backup_database_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        self.connection.backup(DatabaseName::Main, path, None)?;
+        Ok(())
     }
 
     /// Inserts or replaces the local node identity record.
@@ -943,9 +1070,16 @@ impl Store {
         T: Serialize,
     {
         self.connection.execute(
+            "DELETE FROM outbox_deliveries WHERE msg_id = ?1",
+            [envelope.msg_id.as_str()],
+        )?;
+        self.connection.execute(
             r#"
-            INSERT OR REPLACE INTO outbox_messages (msg_id, msg_type, queued_at, raw_json, delivery_state)
-            VALUES (?1, ?2, ?3, ?4, 'queued')
+            INSERT OR REPLACE INTO outbox_messages (
+              msg_id, msg_type, queued_at, raw_json, delivery_state,
+              delivery_attempts, last_attempted_at, next_attempt_at, last_error
+            )
+            VALUES (?1, ?2, ?3, ?4, 'queued', 0, NULL, NULL, NULL)
             "#,
             params![
                 envelope.msg_id.as_str(),
@@ -2804,14 +2938,35 @@ impl Store {
 
     /// Resets all non-queued outbox messages back to `"queued"` for redelivery.
     pub fn reset_outbox_for_resume(&self) -> Result<u64> {
-        let changed = self.connection.execute(
+        let msg_ids = self.non_delivered_outbox_message_ids()?;
+        self.connection.execute(
             r#"
-            UPDATE outbox_messages
-            SET delivery_state = 'queued'
+            UPDATE outbox_deliveries
+            SET delivery_state = 'queued',
+                delivery_attempts = 0,
+                last_attempted_at = NULL,
+                next_attempt_at = NULL,
+                last_error = NULL,
+                delivered_at = NULL
             WHERE delivery_state NOT LIKE 'delivered%'
             "#,
             [],
         )?;
+        let changed = self.connection.execute(
+            r#"
+            UPDATE outbox_messages
+            SET delivery_state = 'queued',
+                delivery_attempts = 0,
+                last_attempted_at = NULL,
+                next_attempt_at = NULL,
+                last_error = NULL
+            WHERE delivery_state NOT LIKE 'delivered%'
+            "#,
+            [],
+        )?;
+        for msg_id in msg_ids {
+            let _ = self.refresh_outbox_message_delivery_state(&msg_id)?;
+        }
         Ok(changed as u64)
     }
 
@@ -3052,102 +3207,151 @@ impl Store {
 
     /// Rebuilds all projection tables by replaying task events from the event log.
     pub fn rebuild_projections_from_task_events(&self) -> Result<RepairRebuildReport> {
-        self.connection.execute("DELETE FROM projects", [])?;
-        self.connection.execute("DELETE FROM tasks", [])?;
-        self.connection.execute("DELETE FROM task_results", [])?;
-        self.connection.execute("DELETE FROM artifacts", [])?;
-        self.connection
-            .execute("DELETE FROM evaluation_certificates", [])?;
-        self.connection.execute("DELETE FROM stop_orders", [])?;
-        self.connection.execute("DELETE FROM stop_receipts", [])?;
-        self.connection.execute("DELETE FROM snapshots", [])?;
-        self.connection.execute("DELETE FROM publish_events", [])?;
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<RepairRebuildReport> {
+            let events = self.list_task_events()?;
+            for statement in [
+                "DELETE FROM approval_states",
+                "DELETE FROM projects",
+                "DELETE FROM tasks",
+                "DELETE FROM task_results",
+                "DELETE FROM artifacts",
+                "DELETE FROM evaluation_certificates",
+                "DELETE FROM stop_orders",
+                "DELETE FROM stop_receipts",
+                "DELETE FROM snapshots",
+                "DELETE FROM publish_events",
+            ] {
+                self.connection.execute(statement, [])?;
+            }
 
-        let events = self.list_task_events()?;
-        let mut report = RepairRebuildReport::default();
+            let mut report = RepairRebuildReport::default();
+            for event in events {
+                report.replayed_events += 1;
+                match event.msg_type.as_str() {
+                    "ProjectCharter" => {
+                        let envelope = decode_task_event::<ProjectCharter>(&event)?;
+                        self.apply_project_charter(&envelope)?;
+                        report.rebuilt_projects += 1;
+                    }
+                    "ApprovalApplied" => {
+                        let envelope = decode_task_event::<ApprovalApplied>(&event)?;
+                        self.apply_approval_applied(&envelope)?;
+                    }
+                    "TaskDelegated" => {
+                        let envelope = decode_task_event::<TaskDelegated>(&event)?;
+                        self.apply_task_delegated(&envelope)?;
+                        report.rebuilt_tasks += 1;
+                    }
+                    "TaskProgress" => {
+                        let envelope = decode_task_event::<TaskProgress>(&event)?;
+                        self.apply_task_progress(&envelope)?;
+                    }
+                    "TaskResultSubmitted" => {
+                        let envelope = decode_task_event::<TaskResultSubmitted>(&event)?;
+                        self.apply_task_result_submitted(&envelope)?;
+                        report.rebuilt_task_results += 1;
+                    }
+                    "EvaluationIssued" => {
+                        let envelope = decode_task_event::<EvaluationIssued>(&event)?;
+                        self.save_evaluation_certificate(&envelope)?;
+                        report.rebuilt_evaluations += 1;
+                    }
+                    "SnapshotResponse" => {
+                        let envelope = decode_task_event::<SnapshotResponse>(&event)?;
+                        self.save_snapshot_response(&envelope)?;
+                        report.rebuilt_snapshots += 1;
+                    }
+                    "PublishIntentProposed" => {
+                        let envelope = decode_task_event::<PublishIntentProposed>(&event)?;
+                        self.save_publish_intent_proposed(&envelope)?;
+                        report.rebuilt_publish_events += 1;
+                    }
+                    "PublishIntentSkipped" => {
+                        let envelope = decode_task_event::<PublishIntentSkipped>(&event)?;
+                        self.save_publish_intent_skipped(&envelope)?;
+                        report.rebuilt_publish_events += 1;
+                    }
+                    "PublishResultRecorded" => {
+                        let envelope = decode_task_event::<PublishResultRecorded>(&event)?;
+                        self.save_publish_result_recorded(&envelope)?;
+                        report.rebuilt_publish_events += 1;
+                    }
+                    "StopOrder" => {
+                        let envelope = decode_task_event::<StopOrder>(&event)?;
+                        self.save_stop_order(&envelope)?;
+                        self.apply_stop_order_projection(&envelope)?;
+                        report.rebuilt_stop_orders += 1;
+                    }
+                    "StopAck" => {
+                        let envelope = decode_task_event::<StopAck>(&event)?;
+                        self.save_stop_ack(&envelope)?;
+                        report.rebuilt_stop_receipts += 1;
+                    }
+                    "StopComplete" => {
+                        let envelope = decode_task_event::<StopComplete>(&event)?;
+                        self.save_stop_complete(&envelope)?;
+                        self.apply_stop_complete_projection(&envelope)?;
+                        report.rebuilt_stop_receipts += 1;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(report)
+        })();
 
-        for event in events {
-            report.replayed_events += 1;
-            match event.msg_type.as_str() {
-                "ProjectCharter" => {
-                    let envelope = decode_task_event::<ProjectCharter>(&event)?;
-                    self.apply_project_charter(&envelope)?;
-                    report.rebuilt_projects += 1;
-                }
-                "ApprovalApplied" => {
-                    let envelope = decode_task_event::<ApprovalApplied>(&event)?;
-                    self.apply_approval_applied(&envelope)?;
-                }
-                "TaskDelegated" => {
-                    let envelope = decode_task_event::<TaskDelegated>(&event)?;
-                    self.apply_task_delegated(&envelope)?;
-                    report.rebuilt_tasks += 1;
-                }
-                "TaskProgress" => {
-                    let envelope = decode_task_event::<TaskProgress>(&event)?;
-                    self.apply_task_progress(&envelope)?;
-                }
-                "TaskResultSubmitted" => {
-                    let envelope = decode_task_event::<TaskResultSubmitted>(&event)?;
-                    self.apply_task_result_submitted(&envelope)?;
-                    report.rebuilt_task_results += 1;
-                }
-                "EvaluationIssued" => {
-                    let envelope = decode_task_event::<EvaluationIssued>(&event)?;
-                    self.save_evaluation_certificate(&envelope)?;
-                    report.rebuilt_evaluations += 1;
-                }
-                "SnapshotResponse" => {
-                    let envelope = decode_task_event::<SnapshotResponse>(&event)?;
-                    self.save_snapshot_response(&envelope)?;
-                    report.rebuilt_snapshots += 1;
-                }
-                "PublishIntentProposed" => {
-                    let envelope = decode_task_event::<PublishIntentProposed>(&event)?;
-                    self.save_publish_intent_proposed(&envelope)?;
-                    report.rebuilt_publish_events += 1;
-                }
-                "PublishIntentSkipped" => {
-                    let envelope = decode_task_event::<PublishIntentSkipped>(&event)?;
-                    self.save_publish_intent_skipped(&envelope)?;
-                    report.rebuilt_publish_events += 1;
-                }
-                "PublishResultRecorded" => {
-                    let envelope = decode_task_event::<PublishResultRecorded>(&event)?;
-                    self.save_publish_result_recorded(&envelope)?;
-                    report.rebuilt_publish_events += 1;
-                }
-                "StopOrder" => {
-                    let envelope = decode_task_event::<StopOrder>(&event)?;
-                    self.save_stop_order(&envelope)?;
-                    self.apply_stop_order_projection(&envelope)?;
-                    report.rebuilt_stop_orders += 1;
-                }
-                "StopAck" => {
-                    let envelope = decode_task_event::<StopAck>(&event)?;
-                    self.save_stop_ack(&envelope)?;
-                    report.rebuilt_stop_receipts += 1;
-                }
-                "StopComplete" => {
-                    let envelope = decode_task_event::<StopComplete>(&event)?;
-                    self.save_stop_complete(&envelope)?;
-                    self.apply_stop_complete_projection(&envelope)?;
-                    report.rebuilt_stop_receipts += 1;
-                }
-                _ => {}
+        match result {
+            Ok(report) => {
+                self.connection.execute_batch("COMMIT")?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
             }
         }
-
-        Ok(report)
     }
 
     /// Resumes pending outbox messages by resetting their delivery state.
     pub fn resume_pending_outbox(&self) -> Result<RepairResumeOutboxReport> {
+        let msg_ids = self.non_delivered_outbox_message_ids()?;
+        let resumed_dead_letters = self.connection.query_row(
+            "SELECT COUNT(*) FROM outbox_messages WHERE delivery_state = 'dead_letter'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        self.connection.execute(
+            r#"
+            UPDATE outbox_deliveries
+            SET delivery_state = 'queued',
+                delivery_attempts = 0,
+                last_attempted_at = NULL,
+                next_attempt_at = NULL,
+                last_error = NULL,
+                delivered_at = NULL
+            WHERE delivery_state NOT LIKE 'delivered%'
+            "#,
+            [],
+        )?;
         let resumed_messages = self.connection.execute(
-            "UPDATE outbox_messages SET delivery_state = 'queued' WHERE delivery_state NOT LIKE 'delivered%'",
+            r#"
+            UPDATE outbox_messages
+            SET delivery_state = 'queued',
+                delivery_attempts = 0,
+                last_attempted_at = NULL,
+                next_attempt_at = NULL,
+                last_error = NULL
+            WHERE delivery_state NOT LIKE 'delivered%'
+            "#,
             [],
         )? as u64;
-        Ok(RepairResumeOutboxReport { resumed_messages })
+        for msg_id in msg_ids {
+            let _ = self.refresh_outbox_message_delivery_state(&msg_id)?;
+        }
+        Ok(RepairResumeOutboxReport {
+            resumed_messages,
+            resumed_dead_letters,
+        })
     }
 
     /// Reconciles running tasks with stop orders, stopping tasks as needed.
@@ -3176,6 +3380,7 @@ impl Store {
         let mut report = AuditVerifyLogReport::default();
         let mut seen_projects = std::collections::HashSet::new();
         let mut lamport_by_project = std::collections::HashMap::<String, u64>::new();
+        let local_identity = self.local_identity()?;
 
         for event in events {
             report.total_events += 1;
@@ -3213,9 +3418,60 @@ impl Store {
                 report.parse_failures += 1;
                 report.errors.push(format!("{}: {}", event.msg_id, error));
             }
+            match verify_task_event_raw_json_consistency(&event) {
+                Ok(()) => {}
+                Err(error) => {
+                    report.raw_json_mismatches += 1;
+                    report.errors.push(format!("{}: {}", event.msg_id, error));
+                }
+            }
+            if event.raw_json.is_none() {
+                report.unverifiable_signatures += 1;
+                continue;
+            }
+            match self.verify_task_event_signature(&event, local_identity.as_ref()) {
+                Ok(()) => {}
+                Err(error) if error.to_string().contains("[E_AUDIT_KEY_MISSING]") => {
+                    report.unverifiable_signatures += 1;
+                    report.errors.push(format!("{}: {}", event.msg_id, error));
+                }
+                Err(error) => {
+                    report.signature_failures += 1;
+                    report.errors.push(format!("{}: {}", event.msg_id, error));
+                }
+            }
         }
 
         Ok(report)
+    }
+
+    fn verify_task_event_signature(
+        &self,
+        event: &TaskEventRecord,
+        local_identity: Option<&LocalIdentityRecord>,
+    ) -> Result<()> {
+        let raw_json = event
+            .raw_json
+            .as_deref()
+            .ok_or_else(|| anyhow!("[E_AUDIT_SIGNATURE] raw_json missing"))?;
+        let envelope: WireEnvelope = serde_json::from_str(raw_json)?;
+        let public_key = if local_identity
+            .as_ref()
+            .is_some_and(|identity| identity.actor_id == envelope.from_actor_id)
+        {
+            local_identity
+                .as_ref()
+                .map(|identity| identity.public_key.clone())
+                .ok_or_else(|| anyhow!("[E_AUDIT_KEY_MISSING] local identity missing"))?
+        } else {
+            let peer_identity = self
+                .peer_identity(&envelope.from_actor_id)?
+                .ok_or_else(|| anyhow!("[E_AUDIT_KEY_MISSING] peer key missing"))?;
+            peer_identity.public_key
+        };
+        let verifying_key = verifying_key_from_base64(&public_key)?;
+        envelope.verify_with_key(&verifying_key)?;
+        Ok(())
     }
 
     /// Returns aggregate statistics across all stored data.
@@ -3228,6 +3484,8 @@ impl Store {
                     (SELECT COUNT(*) FROM projects),
                     (SELECT COUNT(*) FROM tasks WHERE status IN {ACTIVE_TASK_STATUSES_SQL}),
                     (SELECT COUNT(*) FROM outbox_messages WHERE delivery_state = 'queued'),
+                    (SELECT COUNT(*) FROM outbox_messages WHERE delivery_state = 'retry_waiting'),
+                    (SELECT COUNT(*) FROM outbox_messages WHERE delivery_state = 'dead_letter'),
                     (SELECT COUNT(*) FROM stop_orders),
                     (SELECT COUNT(*) FROM snapshots),
                     (SELECT COUNT(*) FROM evaluation_certificates),
@@ -3243,11 +3501,13 @@ impl Store {
                     project_count: row.get::<_, i64>(2)? as u64,
                     running_task_count: row.get::<_, i64>(3)? as u64,
                     queued_outbox_count: row.get::<_, i64>(4)? as u64,
-                    stop_order_count: row.get::<_, i64>(5)? as u64,
-                    snapshot_count: row.get::<_, i64>(6)? as u64,
-                    evaluation_count: row.get::<_, i64>(7)? as u64,
-                    artifact_count: row.get::<_, i64>(8)? as u64,
-                    inbox_unprocessed_count: row.get::<_, i64>(9)? as u64,
+                    retry_waiting_outbox_count: row.get::<_, i64>(5)? as u64,
+                    dead_letter_outbox_count: row.get::<_, i64>(6)? as u64,
+                    stop_order_count: row.get::<_, i64>(7)? as u64,
+                    snapshot_count: row.get::<_, i64>(8)? as u64,
+                    evaluation_count: row.get::<_, i64>(9)? as u64,
+                    artifact_count: row.get::<_, i64>(10)? as u64,
+                    inbox_unprocessed_count: row.get::<_, i64>(11)? as u64,
                 })
             },
         )?;
@@ -3255,66 +3515,92 @@ impl Store {
     }
 
     /// Returns statistics scoped to a specific actor.
+    ///
+    /// Uses CASE-based aggregation to reduce 11 queries to 5 (one per table group).
     pub fn actor_scoped_stats(&self, actor_id: &ActorId) -> Result<ActorScopedStats> {
         let actor_id = actor_id.as_str();
-        Ok(ActorScopedStats {
-            principal_vision_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM visions WHERE principal_actor_id = ?1",
-                [actor_id],
-            )?,
-            principal_project_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM projects WHERE principal_actor_id = ?1",
-                [actor_id],
-            )?,
-            owned_project_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM projects WHERE owner_actor_id = ?1",
-                [actor_id],
-            )?,
-            assigned_task_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM tasks WHERE assignee_actor_id = ?1",
-                [actor_id],
-            )?,
-            active_assigned_task_count: count_query(
-                &self.connection,
+
+        // 1. visions (standalone)
+        let principal_vision_count = count_query(
+            &self.connection,
+            "SELECT COUNT(*) FROM visions WHERE principal_actor_id = ?1",
+            [actor_id],
+        )?;
+
+        // 2. projects: principal + owner in one query
+        let (principal_project_count, owned_project_count) = self.connection.query_row(
+            r#"SELECT
+                COUNT(CASE WHEN principal_actor_id = ?1 THEN 1 END),
+                COUNT(CASE WHEN owner_actor_id = ?1 THEN 1 END)
+            FROM projects
+            WHERE principal_actor_id = ?1 OR owner_actor_id = ?1"#,
+            [actor_id],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )?;
+
+        // 3. tasks: assigned (total + active) + issued in one query
+        let (assigned_task_count, active_assigned_task_count, issued_task_count) =
+            self.connection.query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM tasks WHERE assignee_actor_id = ?1 AND status IN {ACTIVE_TASK_STATUSES_SQL}"
+                    r#"SELECT
+                        COUNT(CASE WHEN assignee_actor_id = ?1 THEN 1 END),
+                        COUNT(CASE WHEN assignee_actor_id = ?1 AND status IN {ACTIVE_TASK_STATUSES_SQL} THEN 1 END),
+                        COUNT(CASE WHEN issuer_actor_id = ?1 THEN 1 END)
+                    FROM tasks
+                    WHERE assignee_actor_id = ?1 OR issuer_actor_id = ?1"#
                 ),
                 [actor_id],
-            )?,
-            issued_task_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM tasks WHERE issuer_actor_id = ?1",
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )?;
+
+        // 4. evaluation_certificates: subject + issuer in one query
+        let (evaluation_subject_count, evaluation_issuer_count) = self.connection.query_row(
+            r#"SELECT
+                COUNT(CASE WHEN subject_actor_id = ?1 THEN 1 END),
+                COUNT(CASE WHEN issuer_actor_id = ?1 THEN 1 END)
+            FROM evaluation_certificates
+            WHERE subject_actor_id = ?1 OR issuer_actor_id = ?1"#,
+            [actor_id],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )?;
+
+        // 5. stop_receipts (standalone)
+        let stop_receipt_count = count_query(
+            &self.connection,
+            "SELECT COUNT(*) FROM stop_receipts WHERE actor_id = ?1",
+            [actor_id],
+        )?;
+
+        // 6. snapshots: project + task in one query
+        let (cached_project_snapshot_count, cached_task_snapshot_count) =
+            self.connection.query_row(
+                r#"SELECT
+                    COUNT(CASE WHEN scope_type = 'project' THEN 1 END),
+                    COUNT(CASE WHEN scope_type = 'task' THEN 1 END)
+                FROM snapshots
+                WHERE COALESCE(requested_by_actor_id, json_extract(snapshot_json, '$.requested_by_actor_id')) = ?1"#,
                 [actor_id],
-            )?,
-            evaluation_subject_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM evaluation_certificates WHERE subject_actor_id = ?1",
-                [actor_id],
-            )?,
-            evaluation_issuer_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM evaluation_certificates WHERE issuer_actor_id = ?1",
-                [actor_id],
-            )?,
-            stop_receipt_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM stop_receipts WHERE actor_id = ?1",
-                [actor_id],
-            )?,
-            cached_project_snapshot_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM snapshots WHERE scope_type = 'project' AND COALESCE(requested_by_actor_id, json_extract(snapshot_json, '$.requested_by_actor_id')) = ?1",
-                [actor_id],
-            )?,
-            cached_task_snapshot_count: count_query(
-                &self.connection,
-                "SELECT COUNT(*) FROM snapshots WHERE scope_type = 'task' AND COALESCE(requested_by_actor_id, json_extract(snapshot_json, '$.requested_by_actor_id')) = ?1",
-                [actor_id],
-            )?,
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )?;
+
+        Ok(ActorScopedStats {
+            principal_vision_count,
+            principal_project_count,
+            owned_project_count,
+            assigned_task_count,
+            active_assigned_task_count,
+            issued_task_count,
+            evaluation_subject_count,
+            evaluation_issuer_count,
+            stop_receipt_count,
+            cached_project_snapshot_count,
+            cached_task_snapshot_count,
         })
     }
 
@@ -3488,40 +3774,459 @@ impl Store {
         }
     }
 
-    /// Returns up to `limit` outbox messages with `"queued"` delivery state.
+    /// Returns up to `limit` outbox messages that are ready for delivery now.
     pub fn queued_outbox_messages(&self, limit: usize) -> Result<Vec<OutboxMessageRecord>> {
+        let now = format_time(OffsetDateTime::now_utc())?;
         let mut statement = self.connection.prepare(
             r#"
-            SELECT msg_id, msg_type, queued_at, raw_json, delivery_state
+            SELECT msg_id, msg_type, queued_at, raw_json, delivery_state,
+                   delivery_attempts, last_attempted_at, next_attempt_at, last_error
             FROM outbox_messages
             WHERE delivery_state = 'queued'
-            ORDER BY queued_at ASC
-            LIMIT ?1
+               OR (
+                    delivery_state = 'retry_waiting'
+                AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
+               )
+            ORDER BY COALESCE(next_attempt_at, queued_at) ASC, queued_at ASC
+            LIMIT ?2
             "#,
         )?;
 
-        let rows = statement.query_map([limit as i64], |row| {
-            Ok(OutboxMessageRecord {
-                msg_id: row.get(0)?,
-                msg_type: row.get(1)?,
-                queued_at: row.get(2)?,
-                raw_json: row.get(3)?,
-                delivery_state: row.get(4)?,
-            })
-        })?;
-
+        let rows = statement.query_map(params![now, limit as i64], map_outbox_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    /// Updates the delivery state for a specific outbox message.
-    pub fn mark_outbox_delivery_state(&self, msg_id: &str, delivery_state: &str) -> Result<()> {
+    /// Returns one outbox message by ID, if present.
+    pub fn outbox_message(&self, msg_id: &str) -> Result<Option<OutboxMessageRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT msg_id, msg_type, queued_at, raw_json, delivery_state,
+                   delivery_attempts, last_attempted_at, next_attempt_at, last_error
+            FROM outbox_messages
+            WHERE msg_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([msg_id], map_outbox_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns dead-letter outbox messages, newest first.
+    pub fn dead_letter_outbox_messages(&self, limit: usize) -> Result<Vec<OutboxMessageRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT msg_id, msg_type, queued_at, raw_json, delivery_state,
+                   delivery_attempts, last_attempted_at, next_attempt_at, last_error
+            FROM outbox_messages
+            WHERE delivery_state = 'dead_letter'
+            ORDER BY COALESCE(last_attempted_at, queued_at) DESC, queued_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map([limit as i64], map_outbox_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Ensures per-target delivery rows exist for the given message.
+    pub fn sync_outbox_delivery_targets(
+        &self,
+        msg_id: &str,
+        targets: &[PeerAddressRecord],
+    ) -> Result<u64> {
+        let mut inserted = 0_u64;
+        for target in targets {
+            let changed = self.connection.execute(
+                r#"
+                INSERT OR IGNORE INTO outbox_deliveries (
+                  msg_id, actor_id, node_id, multiaddr, delivery_state,
+                  delivery_attempts, last_attempted_at, next_attempt_at, last_error, delivered_at
+                )
+                VALUES (?1, ?2, ?3, ?4, 'queued', 0, NULL, NULL, NULL, NULL)
+                "#,
+                params![
+                    msg_id,
+                    target.actor_id.as_str(),
+                    target.node_id.as_str(),
+                    &target.multiaddr,
+                ],
+            )?;
+            inserted += changed as u64;
+        }
+        if inserted > 0 {
+            let _ = self.refresh_outbox_message_delivery_state(msg_id)?;
+        }
+        Ok(inserted)
+    }
+
+    /// Lists ready per-target deliveries for a specific outbox message.
+    pub fn ready_outbox_deliveries(
+        &self,
+        msg_id: &str,
+        limit: usize,
+    ) -> Result<Vec<OutboxDeliveryRecord>> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT msg_id, actor_id, node_id, multiaddr, delivery_state,
+                   delivery_attempts, last_attempted_at, next_attempt_at, last_error, delivered_at
+            FROM outbox_deliveries
+            WHERE msg_id = ?1
+              AND (
+                    delivery_state = 'queued'
+                 OR (
+                        delivery_state = 'retry_waiting'
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+                 )
+              )
+            ORDER BY COALESCE(next_attempt_at, last_attempted_at, multiaddr) ASC, multiaddr ASC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows =
+            statement.query_map(params![msg_id, now, limit as i64], map_outbox_delivery_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Lists all known per-target deliveries for an outbox message.
+    pub fn outbox_deliveries(&self, msg_id: &str) -> Result<Vec<OutboxDeliveryRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT msg_id, actor_id, node_id, multiaddr, delivery_state,
+                   delivery_attempts, last_attempted_at, next_attempt_at, last_error, delivered_at
+            FROM outbox_deliveries
+            WHERE msg_id = ?1
+            ORDER BY multiaddr ASC
+            "#,
+        )?;
+        let rows = statement.query_map([msg_id], map_outbox_delivery_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Returns dead-letter per-target deliveries, newest first.
+    pub fn dead_letter_outbox_deliveries(&self, limit: usize) -> Result<Vec<OutboxDeliveryRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT msg_id, actor_id, node_id, multiaddr, delivery_state,
+                   delivery_attempts, last_attempted_at, next_attempt_at, last_error, delivered_at
+            FROM outbox_deliveries
+            WHERE delivery_state = 'dead_letter'
+            ORDER BY COALESCE(last_attempted_at, multiaddr) DESC, multiaddr DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map([limit as i64], map_outbox_delivery_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Summarizes per-target delivery states for a specific outbox message.
+    pub fn outbox_delivery_summary(&self, msg_id: &str) -> Result<OutboxDeliverySummary> {
+        self.connection
+            .query_row(
+                r#"
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'queued' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'retry_waiting' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'dead_letter' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'delivered_local' THEN 1 ELSE 0 END), 0)
+            FROM outbox_deliveries
+            WHERE msg_id = ?1
+            "#,
+                [msg_id],
+                |row| {
+                    Ok(OutboxDeliverySummary {
+                        total_targets: row.get::<_, i64>(0)? as u64,
+                        queued_targets: row.get::<_, i64>(1)? as u64,
+                        retry_waiting_targets: row.get::<_, i64>(2)? as u64,
+                        dead_letter_targets: row.get::<_, i64>(3)? as u64,
+                        delivered_targets: row.get::<_, i64>(4)? as u64,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    /// Marks an outbox message as delivered and clears retry metadata.
+    pub fn mark_outbox_delivered(&self, msg_id: &str) -> Result<()> {
         self.connection.execute(
-            "UPDATE outbox_messages SET delivery_state = ?2 WHERE msg_id = ?1",
-            params![msg_id, delivery_state],
+            r#"
+            UPDATE outbox_messages
+            SET delivery_state = 'delivered_local',
+                delivery_attempts = delivery_attempts + 1,
+                last_attempted_at = ?2,
+                next_attempt_at = NULL,
+                last_error = NULL
+            WHERE msg_id = ?1
+            "#,
+            params![msg_id, format_time(OffsetDateTime::now_utc())?],
         )?;
         Ok(())
     }
+
+    /// Marks a specific outbox delivery target as delivered and refreshes the aggregate state.
+    pub fn mark_outbox_delivery_target_delivered(
+        &self,
+        msg_id: &str,
+        multiaddr: &str,
+    ) -> Result<DeliveryState> {
+        let changed = self.connection.execute(
+            r#"
+            UPDATE outbox_deliveries
+            SET delivery_state = 'delivered_local',
+                delivery_attempts = delivery_attempts + 1,
+                last_attempted_at = ?3,
+                next_attempt_at = NULL,
+                last_error = NULL,
+                delivered_at = ?3
+            WHERE msg_id = ?1 AND multiaddr = ?2
+            "#,
+            params![msg_id, multiaddr, format_time(OffsetDateTime::now_utc())?],
+        )?;
+        if changed == 0 {
+            bail!(
+                "[E_OUTBOX_DELIVERY_TARGET] unknown outbox delivery target: msg_id={} multiaddr={}",
+                msg_id,
+                multiaddr
+            );
+        }
+        self.refresh_outbox_message_delivery_state(msg_id)
+    }
+
+    /// Updates the delivery state for a specific outbox message.
+    pub fn mark_outbox_delivery_state(
+        &self,
+        msg_id: &str,
+        delivery_state: &DeliveryState,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE outbox_messages SET delivery_state = ?2 WHERE msg_id = ?1",
+            params![msg_id, delivery_state.as_sql()],
+        )?;
+        Ok(())
+    }
+
+    /// Records a failed delivery attempt and schedules retry or dead-lettering.
+    pub fn mark_outbox_delivery_failure(
+        &self,
+        msg_id: &str,
+        error: &str,
+        retry_at: OffsetDateTime,
+        max_attempts: u64,
+    ) -> Result<DeliveryState> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let retry_at_str = format_time(retry_at)?;
+        let state_str: String = self.connection.query_row(
+            r#"
+            UPDATE outbox_messages
+            SET delivery_attempts = delivery_attempts + 1,
+                last_attempted_at = ?2,
+                delivery_state = CASE
+                    WHEN delivery_attempts + 1 >= ?3 THEN 'dead_letter'
+                    ELSE 'retry_waiting'
+                END,
+                next_attempt_at = CASE
+                    WHEN delivery_attempts + 1 >= ?3 THEN NULL
+                    ELSE ?4
+                END,
+                last_error = ?5
+            WHERE msg_id = ?1
+            RETURNING delivery_state
+            "#,
+            params![msg_id, now, max_attempts as i64, retry_at_str, error],
+            |row| row.get(0),
+        )?;
+        DeliveryState::from_str(&state_str)
+    }
+
+    /// Records a failed delivery attempt for one target and refreshes the aggregate message state.
+    pub fn mark_outbox_delivery_target_failure(
+        &self,
+        msg_id: &str,
+        multiaddr: &str,
+        error: &str,
+        retry_at: OffsetDateTime,
+        max_attempts: u64,
+    ) -> Result<DeliveryState> {
+        let changed = self.connection.execute(
+            r#"
+            UPDATE outbox_deliveries
+            SET delivery_attempts = delivery_attempts + 1,
+                last_attempted_at = ?3,
+                delivery_state = CASE
+                    WHEN delivery_attempts + 1 >= ?4 THEN 'dead_letter'
+                    ELSE 'retry_waiting'
+                END,
+                next_attempt_at = CASE
+                    WHEN delivery_attempts + 1 >= ?4 THEN NULL
+                    ELSE ?5
+                END,
+                last_error = ?6,
+                delivered_at = NULL
+            WHERE msg_id = ?1 AND multiaddr = ?2
+            "#,
+            params![
+                msg_id,
+                multiaddr,
+                format_time(OffsetDateTime::now_utc())?,
+                max_attempts as i64,
+                format_time(retry_at)?,
+                error,
+            ],
+        )?;
+        if changed == 0 {
+            bail!(
+                "[E_OUTBOX_DELIVERY_TARGET] unknown outbox delivery target: msg_id={} multiaddr={}",
+                msg_id,
+                multiaddr
+            );
+        }
+        self.refresh_outbox_message_delivery_state(msg_id)
+    }
+
+    fn refresh_outbox_message_delivery_state(&self, msg_id: &str) -> Result<DeliveryState> {
+        let summary = self.connection.query_row(
+            r#"
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'queued' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'retry_waiting' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'dead_letter' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN delivery_state = 'delivered_local' THEN 1 ELSE 0 END), 0),
+                   COALESCE(MAX(delivery_attempts), 0),
+                   MAX(last_attempted_at),
+                   MIN(CASE WHEN delivery_state = 'retry_waiting' THEN next_attempt_at END),
+                   GROUP_CONCAT(
+                     CASE
+                       WHEN delivery_state IN ('retry_waiting', 'dead_letter') AND last_error IS NOT NULL
+                         THEN multiaddr || ': ' || last_error
+                       ELSE NULL
+                     END,
+                     ' | '
+                   )
+            FROM outbox_deliveries
+            WHERE msg_id = ?1
+            "#,
+            [msg_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)? as u64,
+                    row.get::<_, i64>(5)? as u64,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )?;
+
+        if summary.0 == 0 {
+            return self
+                .outbox_message(msg_id)?
+                .map(|record| record.delivery_state)
+                .ok_or_else(|| anyhow!("[E_OUTBOX_MESSAGE] outbox message not found: {msg_id}"));
+        }
+
+        let state = if summary.3 > 0 {
+            DeliveryState::DeadLetter
+        } else if summary.2 > 0 {
+            DeliveryState::RetryWaiting
+        } else if summary.1 > 0 {
+            DeliveryState::Queued
+        } else if summary.4 == summary.0 {
+            DeliveryState::DeliveredLocal
+        } else {
+            DeliveryState::Queued
+        };
+        let next_attempt_at = (state == DeliveryState::RetryWaiting)
+            .then_some(summary.7)
+            .flatten();
+        let last_error = matches!(
+            state,
+            DeliveryState::RetryWaiting | DeliveryState::DeadLetter
+        )
+        .then_some(summary.8)
+        .flatten();
+        self.connection.execute(
+            r#"
+            UPDATE outbox_messages
+            SET delivery_state = ?2,
+                delivery_attempts = ?3,
+                last_attempted_at = ?4,
+                next_attempt_at = ?5,
+                last_error = ?6
+            WHERE msg_id = ?1
+            "#,
+            params![
+                msg_id,
+                state.as_sql(),
+                summary.5 as i64,
+                summary.6,
+                next_attempt_at,
+                last_error,
+            ],
+        )?;
+        Ok(state)
+    }
+
+    fn non_delivered_outbox_message_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT msg_id FROM outbox_messages WHERE delivery_state NOT LIKE 'delivered%'",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+}
+
+fn map_outbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxMessageRecord> {
+    let state_str: String = row.get(4)?;
+    let delivery_state = DeliveryState::from_str(&state_str).map_err(|e| {
+        sql_conversion_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
+    Ok(OutboxMessageRecord {
+        msg_id: row.get(0)?,
+        msg_type: row.get(1)?,
+        queued_at: row.get(2)?,
+        raw_json: row.get(3)?,
+        delivery_state,
+        delivery_attempts: row.get::<_, i64>(5)? as u64,
+        last_attempted_at: row.get(6)?,
+        next_attempt_at: row.get(7)?,
+        last_error: row.get(8)?,
+    })
+}
+
+fn map_outbox_delivery_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxDeliveryRecord> {
+    let state_str: String = row.get(4)?;
+    let delivery_state = DeliveryState::from_str(&state_str).map_err(|e| {
+        sql_conversion_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
+    Ok(OutboxDeliveryRecord {
+        msg_id: row.get(0)?,
+        actor_id: ActorId::new(row.get::<_, String>(1)?).map_err(sql_conversion_error)?,
+        node_id: NodeId::new(row.get::<_, String>(2)?).map_err(sql_conversion_error)?,
+        multiaddr: row.get(3)?,
+        delivery_state,
+        delivery_attempts: row.get::<_, i64>(5)? as u64,
+        last_attempted_at: row.get(6)?,
+        next_attempt_at: row.get(7)?,
+        last_error: row.get(8)?,
+        delivered_at: row.get(9)?,
+    })
 }
 
 fn count_query<P>(connection: &Connection, query: &str, params: P) -> Result<u64>
@@ -3544,6 +4249,103 @@ fn stop_scope_type_name(scope_type: &StopScopeType) -> &'static str {
         StopScopeType::Project => "project",
         StopScopeType::TaskTree => "task_tree",
     }
+}
+
+fn migrate_connection(connection: &Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+
+    let current_version = schema_user_version(connection)?;
+    if current_version > STORE_SCHEMA_VERSION {
+        bail!(
+            "[E_SCHEMA_VERSION] unsupported future schema version: current={} supported={}",
+            current_version,
+            STORE_SCHEMA_VERSION
+        );
+    }
+
+    if current_version == STORE_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        for version in (current_version + 1)..=STORE_SCHEMA_VERSION {
+            apply_migration(connection, version)?;
+            set_schema_user_version(connection, version)?;
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn apply_migration(connection: &Connection, version: i32) -> Result<()> {
+    match version {
+        1 => {
+            connection.execute_batch(SCHEMA_V1)?;
+            ensure_peer_keys_columns(connection)?;
+            ensure_tasks_progress_columns(connection)?;
+            ensure_task_events_raw_json_column(connection)?;
+            ensure_evaluation_certificates_msg_id_column(connection)?;
+            ensure_snapshots_msg_id_column(connection)?;
+            ensure_snapshots_requested_by_actor_column(connection)?;
+            ensure_publish_events_msg_id_index(connection)?;
+            Ok(())
+        }
+        2 => {
+            ensure_outbox_delivery_metadata_columns(connection)?;
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_outbox_messages_delivery_state ON outbox_messages(delivery_state);",
+            )?;
+            Ok(())
+        }
+        3 => {
+            ensure_outbox_deliveries_table(connection)?;
+            connection.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_delivery_state
+                  ON outbox_deliveries(delivery_state);
+                CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_next_attempt
+                  ON outbox_deliveries(next_attempt_at, delivery_state);
+                "#,
+            )?;
+            Ok(())
+        }
+        4 => {
+            ensure_outbox_deliveries_table(connection)?;
+            ensure_outbox_deliveries_delivered_at_column(connection)?;
+            connection.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_delivery_state
+                  ON outbox_deliveries(delivery_state);
+                CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_next_attempt
+                  ON outbox_deliveries(next_attempt_at, delivery_state);
+                "#,
+            )?;
+            Ok(())
+        }
+        _ => bail!("[E_SCHEMA_VERSION] unknown schema migration target: {version}"),
+    }
+}
+
+fn schema_user_version(connection: &Connection) -> Result<i32> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn set_schema_user_version(connection: &Connection, version: i32) -> Result<()> {
+    connection.pragma_update(None, "user_version", version)?;
+    Ok(())
 }
 
 fn ensure_peer_keys_columns(connection: &Connection) -> Result<()> {
@@ -3609,6 +4411,91 @@ fn ensure_task_events_raw_json_column(connection: &Connection) -> Result<()> {
 
     if !has_raw_json {
         connection.execute("ALTER TABLE task_events ADD COLUMN raw_json TEXT", [])?;
+    }
+
+    Ok(())
+}
+
+fn ensure_outbox_delivery_metadata_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(outbox_messages)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_delivery_attempts = false;
+    let mut has_last_attempted_at = false;
+    let mut has_next_attempt_at = false;
+    let mut has_last_error = false;
+
+    for column in columns {
+        match column?.as_str() {
+            "delivery_attempts" => has_delivery_attempts = true,
+            "last_attempted_at" => has_last_attempted_at = true,
+            "next_attempt_at" => has_next_attempt_at = true,
+            "last_error" => has_last_error = true,
+            _ => {}
+        }
+    }
+
+    if !has_delivery_attempts {
+        connection.execute(
+            "ALTER TABLE outbox_messages ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_last_attempted_at {
+        connection.execute(
+            "ALTER TABLE outbox_messages ADD COLUMN last_attempted_at TEXT",
+            [],
+        )?;
+    }
+    if !has_next_attempt_at {
+        connection.execute(
+            "ALTER TABLE outbox_messages ADD COLUMN next_attempt_at TEXT",
+            [],
+        )?;
+    }
+    if !has_last_error {
+        connection.execute("ALTER TABLE outbox_messages ADD COLUMN last_error TEXT", [])?;
+    }
+
+    Ok(())
+}
+
+fn ensure_outbox_deliveries_table(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS outbox_deliveries (
+          msg_id TEXT NOT NULL,
+          actor_id TEXT NOT NULL,
+          node_id TEXT NOT NULL,
+          multiaddr TEXT NOT NULL,
+          delivery_state TEXT NOT NULL,
+          delivery_attempts INTEGER NOT NULL DEFAULT 0,
+          last_attempted_at TEXT,
+          next_attempt_at TEXT,
+          last_error TEXT,
+          delivered_at TEXT,
+          PRIMARY KEY (msg_id, multiaddr)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn ensure_outbox_deliveries_delivered_at_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(outbox_deliveries)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_delivered_at = false;
+    for column in columns {
+        if column? == "delivered_at" {
+            has_delivered_at = true;
+            break;
+        }
+    }
+
+    if !has_delivered_at {
+        connection.execute(
+            "ALTER TABLE outbox_deliveries ADD COLUMN delivered_at TEXT",
+            [],
+        )?;
     }
 
     Ok(())
@@ -3797,6 +4684,10 @@ fn decode_task_event<T>(event: &TaskEventRecord) -> Result<Envelope<T>>
 where
     T: DeserializeOwned,
 {
+    if let Some(raw_json) = &event.raw_json {
+        return Ok(serde_json::from_str(raw_json)?);
+    }
+
     Ok(Envelope {
         protocol: PROTOCOL_VERSION.to_owned(),
         msg_id: MessageId::new(event.msg_id.clone())?,
@@ -3872,6 +4763,63 @@ fn validate_task_event_shape(event: &TaskEventRecord) -> Result<()> {
     Ok(())
 }
 
+fn verify_task_event_raw_json_consistency(event: &TaskEventRecord) -> Result<()> {
+    let Some(raw_json) = &event.raw_json else {
+        return Ok(());
+    };
+    let envelope: Envelope<Value> = serde_json::from_str(raw_json)?;
+    if envelope.msg_id.as_str() != event.msg_id {
+        bail!(
+            "raw_json msg_id mismatch: raw={} indexed={}",
+            envelope.msg_id,
+            event.msg_id
+        );
+    }
+    if format!("{:?}", envelope.msg_type) != event.msg_type {
+        bail!(
+            "raw_json msg_type mismatch: raw={:?} indexed={}",
+            envelope.msg_type,
+            event.msg_type
+        );
+    }
+    if envelope.from_actor_id.as_str() != event.from_actor_id {
+        bail!(
+            "raw_json from_actor_id mismatch: raw={} indexed={}",
+            envelope.from_actor_id,
+            event.from_actor_id
+        );
+    }
+    if envelope.to_actor_id.as_ref().map(ActorId::as_str) != event.to_actor_id.as_deref() {
+        bail!("raw_json to_actor_id mismatch");
+    }
+    if envelope.project_id.as_ref().map(ProjectId::as_str) != Some(event.project_id.as_str()) {
+        bail!("raw_json project_id mismatch");
+    }
+    if envelope.task_id.as_ref().map(TaskId::as_str) != event.task_id.as_deref() {
+        bail!("raw_json task_id mismatch");
+    }
+    if envelope.lamport_ts != event.lamport_ts {
+        bail!(
+            "raw_json lamport_ts mismatch: raw={} indexed={}",
+            envelope.lamport_ts,
+            event.lamport_ts
+        );
+    }
+    if format_time(envelope.created_at)? != event.created_at {
+        bail!("raw_json created_at mismatch");
+    }
+
+    let body = serde_json::from_str::<Value>(&event.body_json)?;
+    if envelope.body != body {
+        bail!("raw_json body_json mismatch");
+    }
+    let signature = serde_json::from_str::<Value>(&event.signature_json)?;
+    if serde_json::to_value(&envelope.signature)? != signature {
+        bail!("raw_json signature_json mismatch");
+    }
+    Ok(())
+}
+
 fn parse_msg_type_name(value: &str) -> Result<MsgType> {
     Ok(match value {
         "VisionIntent" => MsgType::VisionIntent,
@@ -3905,13 +4853,16 @@ fn sql_conversion_error(error: impl std::error::Error + Send + Sync + 'static) -
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalIdentityRecord, PeerAddressRecord, Store, VisionRecord, format_time};
-    use rusqlite::params;
-    use serde_json::json;
+    use super::{
+        DeliveryState, LocalIdentityRecord, PeerAddressRecord, STORE_SCHEMA_VERSION, Store,
+        VisionRecord, decode_task_event, format_time, schema_user_version,
+    };
+    use rusqlite::{Connection, params};
+    use serde_json::{Value, json};
     use starweft_crypto::StoredKeypair;
-    use starweft_id::{ActorId, NodeId, ProjectId, StopId, TaskId, VisionId};
+    use starweft_id::{ActorId, MessageId, NodeId, ProjectId, StopId, TaskId, VisionId};
     use starweft_protocol::{
-        EvaluationIssued, EvaluationPolicy, ParticipantPolicy, ProjectCharter,
+        ApprovalApplied, EvaluationIssued, EvaluationPolicy, ParticipantPolicy, ProjectCharter,
         PublishIntentProposed, SnapshotResponse, SnapshotScopeType, StopAck, StopAckState,
         StopComplete, StopFinalState, TaskDelegated, TaskExecutionStatus, TaskProgress,
         TaskResultSubmitted, TaskStatus, UnsignedEnvelope,
@@ -4145,6 +5096,597 @@ mod tests {
             .expect("latest snapshot")
             .expect("snapshot exists");
         assert!(cached.snapshot_json.contains("\"status\":\"active\""));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn rebuild_projections_clears_stale_approval_state_rows() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-approval-rebuild-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let project_id = ProjectId::generate();
+        let owner_actor_id = ActorId::generate();
+        let principal_actor_id = ActorId::generate();
+        let granted_msg_id = MessageId::generate();
+
+        store
+            .connection
+            .execute(
+                r#"
+                INSERT INTO approval_states (
+                  scope_type, scope_id, project_id, task_id, approval_granted_msg_id,
+                  approval_applied_msg_id, approval_updated, resumed_task_ids_json, dispatched, updated_at
+                ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, ?6, 0, ?7)
+                "#,
+                params![
+                    "project",
+                    "stale-scope",
+                    project_id.as_str(),
+                    granted_msg_id.as_str(),
+                    MessageId::generate().as_str(),
+                    "[]",
+                    format_time(OffsetDateTime::now_utc() + time::Duration::hours(1))
+                        .expect("time"),
+                ],
+            )
+            .expect("insert stale approval state");
+
+        let approval = UnsignedEnvelope::new(
+            owner_actor_id,
+            Some(principal_actor_id),
+            ApprovalApplied {
+                scope_type: starweft_protocol::ApprovalScopeType::Project,
+                scope_id: project_id.to_string(),
+                approval_granted_msg_id: granted_msg_id,
+                approval_updated: true,
+                resumed_task_ids: vec!["task_approved".to_owned()],
+                dispatched: true,
+                applied_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .sign(&key)
+        .expect("sign approval");
+
+        store
+            .append_task_event(&approval)
+            .expect("append approval event");
+
+        let report = store
+            .rebuild_projections_from_task_events()
+            .expect("rebuild projections");
+        assert_eq!(report.replayed_events, 1);
+
+        let projection = store
+            .approval_projection_for_project(&project_id)
+            .expect("approval projection")
+            .expect("projection exists");
+        assert_eq!(projection.scope_id, project_id.to_string());
+
+        let approval_row_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM approval_states", [], |row| row.get(0))
+            .expect("approval row count");
+        assert_eq!(approval_row_count, 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn decode_task_event_prefers_raw_json_when_available() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-raw-json-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let principal_actor_id = ActorId::generate();
+        let owner_actor_id = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let expires_at = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+
+        let snapshot = UnsignedEnvelope::new(
+            owner_actor_id,
+            Some(principal_actor_id),
+            SnapshotResponse {
+                scope_type: SnapshotScopeType::Project,
+                scope_id: project_id.to_string(),
+                snapshot: json!({ "project_id": project_id }),
+            },
+        )
+        .with_project_id(project_id)
+        .with_expires_at(expires_at)
+        .sign(&key)
+        .expect("sign snapshot");
+
+        store
+            .append_task_event(&snapshot)
+            .expect("append task event");
+
+        let event = store
+            .list_task_events()
+            .expect("list task events")
+            .into_iter()
+            .next()
+            .expect("task event exists");
+        let decoded = decode_task_event::<SnapshotResponse>(&event).expect("decode task event");
+        assert_eq!(decoded.expires_at, Some(expires_at));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn open_upgrades_legacy_schema_and_sets_user_version() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-migration-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let path = temp.join("node.db");
+        let connection = Connection::open(&path).expect("open legacy db");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA user_version = 0;
+                CREATE TABLE peer_keys (
+                  actor_id TEXT PRIMARY KEY,
+                  node_id TEXT NOT NULL,
+                  public_key TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                CREATE TABLE tasks (
+                  task_id TEXT PRIMARY KEY,
+                  project_id TEXT NOT NULL,
+                  parent_task_id TEXT,
+                  issuer_actor_id TEXT NOT NULL,
+                  assignee_actor_id TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  required_capability TEXT,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                CREATE TABLE task_events (
+                  msg_id TEXT PRIMARY KEY,
+                  project_id TEXT NOT NULL,
+                  task_id TEXT,
+                  msg_type TEXT NOT NULL,
+                  from_actor_id TEXT NOT NULL,
+                  to_actor_id TEXT,
+                  lamport_ts INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  body_json TEXT NOT NULL,
+                  signature_json TEXT NOT NULL
+                );
+                CREATE TABLE evaluation_certificates (
+                  eval_cert_id TEXT PRIMARY KEY,
+                  project_id TEXT NOT NULL,
+                  task_id TEXT,
+                  subject_actor_id TEXT NOT NULL,
+                  issuer_actor_id TEXT NOT NULL,
+                  scores_json TEXT NOT NULL,
+                  comment TEXT,
+                  issued_at TEXT NOT NULL,
+                  signature_json TEXT NOT NULL
+                );
+                CREATE TABLE snapshots (
+                  snapshot_id TEXT PRIMARY KEY,
+                  scope_type TEXT NOT NULL,
+                  scope_id TEXT NOT NULL,
+                  snapshot_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                CREATE TABLE publish_events (
+                  event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  msg_id TEXT,
+                  msg_type TEXT NOT NULL,
+                  scope_type TEXT NOT NULL,
+                  scope_id TEXT NOT NULL,
+                  target TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  summary TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                CREATE TABLE outbox_messages (
+                  msg_id TEXT PRIMARY KEY,
+                  msg_type TEXT NOT NULL,
+                  queued_at TEXT NOT NULL,
+                  raw_json TEXT NOT NULL,
+                  delivery_state TEXT NOT NULL
+                );
+                "#,
+            )
+            .expect("seed legacy schema");
+        drop(connection);
+
+        let store = Store::open(&path).expect("open migrated store");
+
+        assert_eq!(
+            schema_user_version(&store.connection).expect("user_version"),
+            STORE_SCHEMA_VERSION
+        );
+
+        let has_raw_json: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('task_events') WHERE name = 'raw_json'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("task_events raw_json");
+        assert_eq!(has_raw_json, 1);
+
+        let has_requested_by_actor_id: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('snapshots') WHERE name = 'requested_by_actor_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("snapshots requested_by_actor_id");
+        assert_eq!(has_requested_by_actor_id, 1);
+
+        let has_delivery_attempts: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('outbox_messages') WHERE name = 'delivery_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outbox delivery_attempts");
+        assert_eq!(has_delivery_attempts, 1);
+
+        let has_outbox_deliveries: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'outbox_deliveries'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outbox deliveries table");
+        assert_eq!(has_outbox_deliveries, 1);
+
+        let has_delivered_at: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('outbox_deliveries') WHERE name = 'delivered_at'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outbox deliveries delivered_at");
+        assert_eq!(has_delivered_at, 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn open_rejects_future_schema_version() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-future-schema-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let path = temp.join("node.db");
+        let connection = Connection::open(&path).expect("open db");
+        connection
+            .execute_batch("PRAGMA user_version = 99;")
+            .expect("set future schema version");
+        drop(connection);
+
+        let error = Store::open(&path).err().expect("future schema should fail");
+        assert!(error.to_string().contains("E_SCHEMA_VERSION"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn outbox_delivery_failure_transitions_to_dead_letter_and_resume_resets_metadata() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-outbox-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            None,
+            PublishIntentProposed {
+                scope_type: "project".to_owned(),
+                scope_id: "project_01".to_owned(),
+                target: "github_issue:owner/repo#1".to_owned(),
+                reason: "test".to_owned(),
+                summary: "summary".to_owned(),
+                context: json!({"ok": true}),
+                proposed_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .sign(&key)
+        .expect("sign publish intent");
+        store.queue_outbox(&envelope).expect("queue outbox");
+
+        let retry_state = store
+            .mark_outbox_delivery_failure(
+                envelope.msg_id.as_str(),
+                "network down",
+                OffsetDateTime::now_utc() + time::Duration::seconds(60),
+                2,
+            )
+            .expect("mark retry failure");
+        assert_eq!(retry_state, DeliveryState::RetryWaiting);
+        assert!(
+            store
+                .queued_outbox_messages(10)
+                .expect("queued messages")
+                .is_empty()
+        );
+
+        let dead_letter_state = store
+            .mark_outbox_delivery_failure(
+                envelope.msg_id.as_str(),
+                "still down",
+                OffsetDateTime::now_utc() + time::Duration::seconds(60),
+                2,
+            )
+            .expect("mark dead letter failure");
+        assert_eq!(dead_letter_state, DeliveryState::DeadLetter);
+
+        let record = store
+            .connection
+            .query_row(
+                r#"
+                SELECT delivery_state, delivery_attempts, next_attempt_at, last_error
+                FROM outbox_messages
+                WHERE msg_id = ?1
+                "#,
+                [envelope.msg_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("outbox record");
+        assert_eq!(record.0, "dead_letter");
+        assert_eq!(record.1, 2);
+        assert!(record.2.is_none());
+        assert_eq!(record.3.as_deref(), Some("still down"));
+
+        let report = store.resume_pending_outbox().expect("resume outbox");
+        assert_eq!(report.resumed_messages, 1);
+
+        let reset_record = store
+            .connection
+            .query_row(
+                r#"
+                SELECT delivery_state, delivery_attempts, next_attempt_at, last_error
+                FROM outbox_messages
+                WHERE msg_id = ?1
+                "#,
+                [envelope.msg_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("reset outbox record");
+        assert_eq!(reset_record.0, "queued");
+        assert_eq!(reset_record.1, 0);
+        assert!(reset_record.2.is_none());
+        assert!(reset_record.3.is_none());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn verify_task_event_log_detects_raw_json_and_signature_tampering() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-audit-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let owner_key = StoredKeypair::generate();
+        let owner_actor_id = ActorId::generate();
+        let principal_actor_id = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let vision_id = VisionId::generate();
+        let now = OffsetDateTime::now_utc();
+
+        store
+            .upsert_local_identity(&LocalIdentityRecord {
+                actor_id: owner_actor_id.clone(),
+                node_id: NodeId::generate(),
+                actor_type: "owner".to_owned(),
+                display_name: "owner".to_owned(),
+                public_key: owner_key.public_key.clone(),
+                private_key_ref: "actor.key".to_owned(),
+                created_at: now,
+            })
+            .expect("local identity");
+
+        let charter = UnsignedEnvelope::new(
+            owner_actor_id.clone(),
+            Some(principal_actor_id.clone()),
+            ProjectCharter {
+                project_id: project_id.clone(),
+                vision_id: vision_id.clone(),
+                principal_actor_id: principal_actor_id.clone(),
+                owner_actor_id: owner_actor_id.clone(),
+                title: "Project".to_owned(),
+                objective: "Objective".to_owned(),
+                stop_authority_actor_id: principal_actor_id,
+                participant_policy: ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: EvaluationPolicy {
+                    quality_weight: 1.0,
+                    speed_weight: 1.0,
+                    reliability_weight: 1.0,
+                    alignment_weight: 1.0,
+                },
+            },
+        )
+        .with_vision_id(vision_id)
+        .with_project_id(project_id)
+        .sign(&owner_key)
+        .expect("sign charter");
+        store.append_task_event(&charter).expect("append event");
+
+        let ok_report = store.verify_task_event_log().expect("verify ok");
+        assert_eq!(ok_report.signature_failures, 0);
+        assert_eq!(ok_report.raw_json_mismatches, 0);
+
+        let mut raw_value = serde_json::from_str::<Value>(
+            &store
+                .list_task_events()
+                .expect("task events")
+                .into_iter()
+                .next()
+                .expect("task event")
+                .raw_json
+                .expect("raw json"),
+        )
+        .expect("parse raw json");
+        raw_value["body"]["objective"] = Value::String("Tampered objective".to_owned());
+        store
+            .connection
+            .execute(
+                "UPDATE task_events SET raw_json = ?2 WHERE msg_id = ?1",
+                params![
+                    charter.msg_id.as_str(),
+                    serde_json::to_string(&raw_value).expect("raw json")
+                ],
+            )
+            .expect("tamper raw json");
+
+        let report = store.verify_task_event_log().expect("verify tampered");
+        assert_eq!(report.signature_failures, 1);
+        assert_eq!(report.raw_json_mismatches, 1);
+        assert_eq!(report.unverifiable_signatures, 0);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn per_target_outbox_delivery_updates_aggregate_state() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-outbox-targets-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let key = StoredKeypair::generate();
+        let actor_a = ActorId::generate();
+        let actor_b = ActorId::generate();
+        let node_a = NodeId::generate();
+        let node_b = NodeId::generate();
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            None,
+            PublishIntentProposed {
+                scope_type: "project".to_owned(),
+                scope_id: "project_01".to_owned(),
+                target: "github_issue:owner/repo#1".to_owned(),
+                reason: "test".to_owned(),
+                summary: "summary".to_owned(),
+                context: json!({"ok": true}),
+                proposed_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .sign(&key)
+        .expect("sign publish intent");
+        store.queue_outbox(&envelope).expect("queue outbox");
+        store
+            .sync_outbox_delivery_targets(
+                envelope.msg_id.as_str(),
+                &[
+                    PeerAddressRecord {
+                        actor_id: actor_a,
+                        node_id: node_a,
+                        multiaddr: "/unix/tmp/worker-a.sock".to_owned(),
+                        last_seen_at: None,
+                    },
+                    PeerAddressRecord {
+                        actor_id: actor_b,
+                        node_id: node_b,
+                        multiaddr: "/ip4/127.0.0.1/tcp/9000".to_owned(),
+                        last_seen_at: None,
+                    },
+                ],
+            )
+            .expect("sync targets");
+
+        let first_state = store
+            .mark_outbox_delivery_target_delivered(
+                envelope.msg_id.as_str(),
+                "/unix/tmp/worker-a.sock",
+            )
+            .expect("mark delivered");
+        assert_eq!(first_state, DeliveryState::Queued);
+
+        let second_state = store
+            .mark_outbox_delivery_target_failure(
+                envelope.msg_id.as_str(),
+                "/ip4/127.0.0.1/tcp/9000",
+                "network down",
+                OffsetDateTime::now_utc() + time::Duration::seconds(60),
+                2,
+            )
+            .expect("mark target retry");
+        assert_eq!(second_state, DeliveryState::RetryWaiting);
+
+        let summary = store
+            .outbox_delivery_summary(envelope.msg_id.as_str())
+            .expect("delivery summary");
+        assert_eq!(summary.total_targets, 2);
+        assert_eq!(summary.delivered_targets, 1);
+        assert_eq!(summary.retry_waiting_targets, 1);
+        assert_eq!(summary.dead_letter_targets, 0);
+
+        let record = store
+            .outbox_message(envelope.msg_id.as_str())
+            .expect("outbox message")
+            .expect("record exists");
+        assert_eq!(record.delivery_state, DeliveryState::RetryWaiting);
+        assert_eq!(record.delivery_attempts, 1);
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .expect("last error")
+                .contains("/ip4/127.0.0.1/tcp/9000")
+        );
+
+        let final_state = store
+            .mark_outbox_delivery_target_delivered(
+                envelope.msg_id.as_str(),
+                "/ip4/127.0.0.1/tcp/9000",
+            )
+            .expect("mark second delivered");
+        assert_eq!(final_state, DeliveryState::DeliveredLocal);
+        assert_eq!(
+            store
+                .outbox_message(envelope.msg_id.as_str())
+                .expect("outbox message")
+                .expect("record exists")
+                .delivery_state,
+            DeliveryState::DeliveredLocal
+        );
 
         let _ = fs::remove_dir_all(temp);
     }

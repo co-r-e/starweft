@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,6 +73,70 @@ pub(crate) const REGISTRY_NONCE_HEADER: &str = "x-starweft-registry-nonce";
 pub(crate) const REGISTRY_CONTENT_SHA256_HEADER: &str = "x-starweft-registry-content-sha256";
 pub(crate) const REGISTRY_SIGNATURE_HEADER: &str = "x-starweft-registry-signature";
 pub(crate) const REGISTRY_AUTH_MAX_SKEW_SEC: i64 = 300;
+pub(crate) const REGISTRY_MAX_HEADER_BYTES: usize = 8 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ParsedRegistryRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) header_map: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RegistryHttpError {
+    pub(crate) status_line: &'static str,
+    pub(crate) error: &'static str,
+    pub(crate) detail: String,
+    pub(crate) headers: Vec<(&'static str, String)>,
+}
+
+impl RegistryHttpError {
+    pub(crate) fn bad_request(detail: impl Into<String>) -> Self {
+        Self {
+            status_line: "HTTP/1.1 400 Bad Request",
+            error: "bad_request",
+            detail: detail.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub(crate) fn unauthorized(detail: impl Into<String>) -> Self {
+        Self {
+            status_line: "HTTP/1.1 401 Unauthorized",
+            error: "unauthorized",
+            detail: detail.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub(crate) fn payload_too_large(max_body_bytes: usize) -> Self {
+        Self {
+            status_line: "HTTP/1.1 413 Payload Too Large",
+            error: "payload_too_large",
+            detail: format!("registry request body exceeds max_body_bytes={max_body_bytes}"),
+            headers: Vec::new(),
+        }
+    }
+
+    pub(crate) fn request_timeout(detail: impl Into<String>) -> Self {
+        Self {
+            status_line: "HTTP/1.1 408 Request Timeout",
+            error: "request_timeout",
+            detail: detail.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub(crate) fn headers_too_large(max_header_bytes: usize) -> Self {
+        Self {
+            status_line: "HTTP/1.1 431 Request Header Fields Too Large",
+            error: "headers_too_large",
+            detail: format!("registry request headers exceed max_header_bytes={max_header_bytes}"),
+            headers: Vec::new(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Auth helpers
@@ -204,6 +269,65 @@ pub(crate) fn parse_http_headers(headers: &str) -> HashMap<String, String> {
         .collect()
 }
 
+pub(crate) fn registry_bind_requires_auth(bind: &str) -> Result<bool> {
+    let mut saw_any = false;
+    for address in bind
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve registry bind address: {bind}"))?
+    {
+        saw_any = true;
+        if !address.ip().is_loopback() {
+            return Ok(true);
+        }
+    }
+    if !saw_any {
+        bail!("[E_REGISTRY_BIND] registry bind did not resolve to any socket address: {bind}");
+    }
+    Ok(false)
+}
+
+pub(crate) fn parse_registry_request_line(
+    request_line: &str,
+) -> std::result::Result<(String, String), RegistryHttpError> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| RegistryHttpError::bad_request("registry request missing method"))?;
+    let path = parts
+        .next()
+        .ok_or_else(|| RegistryHttpError::bad_request("registry request missing path"))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| RegistryHttpError::bad_request("registry request missing HTTP version"))?;
+    if parts.next().is_some() {
+        return Err(RegistryHttpError::bad_request(
+            "registry request line has unexpected trailing fields",
+        ));
+    }
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(RegistryHttpError::bad_request(format!(
+            "unsupported HTTP version: {version}"
+        )));
+    }
+    Ok((method.to_owned(), path.to_owned()))
+}
+
+pub(crate) fn parse_registry_content_length(
+    header_map: &HashMap<String, String>,
+    max_body_bytes: usize,
+) -> std::result::Result<usize, RegistryHttpError> {
+    let Some(raw) = header_map.get("content-length") else {
+        return Ok(0);
+    };
+    let content_length = raw.parse::<usize>().map_err(|_| {
+        RegistryHttpError::bad_request(format!("invalid content-length header: {raw}"))
+    })?;
+    if content_length > max_body_bytes {
+        return Err(RegistryHttpError::payload_too_large(max_body_bytes));
+    }
+    Ok(content_length)
+}
+
 pub(crate) fn validate_registry_auth_headers(
     secret: &str,
     method: &str,
@@ -264,6 +388,75 @@ pub(crate) fn validate_registry_auth_headers(
         nonce: nonce.clone(),
         issued_at,
     })
+}
+
+fn registry_timeout_duration(timeout_ms: u64) -> Option<Duration> {
+    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
+}
+
+fn map_registry_read_error(error: std::io::Error) -> RegistryHttpError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            RegistryHttpError::request_timeout("registry request timed out while reading")
+        }
+        _ => RegistryHttpError::bad_request(format!("failed to read registry request: {error}")),
+    }
+}
+
+pub(crate) fn read_registry_http_request(
+    stream: &mut TcpStream,
+    max_body_bytes: usize,
+) -> std::result::Result<Option<ParsedRegistryRequest>, RegistryHttpError> {
+    use std::io::Read;
+
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).map_err(map_registry_read_error)?;
+        if read == 0 {
+            if request.is_empty() {
+                return Ok(None);
+            }
+            return Err(RegistryHttpError::bad_request(
+                "connection closed before registry headers completed",
+            ));
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+        if request.len() > REGISTRY_MAX_HEADER_BYTES {
+            return Err(RegistryHttpError::headers_too_large(
+                REGISTRY_MAX_HEADER_BYTES,
+            ));
+        }
+    };
+    let headers = String::from_utf8(request[..header_end].to_vec()).map_err(|error| {
+        RegistryHttpError::bad_request(format!("registry headers are not utf8: {error}"))
+    })?;
+    let request_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| RegistryHttpError::bad_request("registry request missing request line"))?;
+    let (method, path) = parse_registry_request_line(request_line)?;
+    let header_map = parse_http_headers(&headers);
+    let content_length = parse_registry_content_length(&header_map, max_body_bytes)?;
+    while request.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).map_err(map_registry_read_error)?;
+        if read == 0 {
+            return Err(RegistryHttpError::bad_request(
+                "connection closed before registry request body completed",
+            ));
+        }
+        request.extend_from_slice(&chunk[..read]);
+    }
+    let body = request[header_end..header_end + content_length].to_vec();
+    Ok(Some(ParsedRegistryRequest {
+        method,
+        path,
+        header_map,
+        body,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -384,15 +577,185 @@ pub(crate) fn registry_endpoint(base: &str, path: &str) -> String {
     )
 }
 
+fn registry_json_response(
+    status_line: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: serde_json::Value,
+) -> Result<HttpResponse> {
+    Ok((status_line, headers, serde_json::to_vec(&body)?))
+}
+
+fn registry_http_error_response(error: RegistryHttpError) -> Result<HttpResponse> {
+    registry_json_response(
+        error.status_line,
+        error.headers,
+        serde_json::json!({
+            "error": error.error,
+            "detail": error.detail,
+        }),
+    )
+}
+
+fn write_registry_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result<()> {
+    use std::io::Write;
+
+    let (status_line, response_headers, response_body) = response;
+    write!(
+        stream,
+        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response_body.len()
+    )?;
+    for (name, value) in response_headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "\r\n")?;
+    stream.write_all(&response_body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn validate_registry_peer_record(
+    record: &RegistryPeerRecord,
+) -> std::result::Result<(), RegistryHttpError> {
+    if record.actor_id.is_empty() {
+        return Err(RegistryHttpError::bad_request(
+            "registry announce actor_id must not be empty",
+        ));
+    }
+    if record.node_id.is_empty() {
+        return Err(RegistryHttpError::bad_request(
+            "registry announce node_id must not be empty",
+        ));
+    }
+    if record.public_key.is_empty() {
+        return Err(RegistryHttpError::bad_request(
+            "registry announce public_key must not be empty",
+        ));
+    }
+    if record.listen_addresses.is_empty() {
+        return Err(RegistryHttpError::bad_request(
+            "registry announce listen_addresses must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_registry_request(
+    args: &RegistryServeArgs,
+    shared_secret: Option<&str>,
+    peer_addr: &SocketAddr,
+    request: &ParsedRegistryRequest,
+    entries: &Mutex<HashMap<String, RegistryPeerRecord>>,
+    replay_cache: &Mutex<HashMap<String, OffsetDateTime>>,
+    rate_limits: &Mutex<HashMap<String, RegistryRateLimitBucket>>,
+    now: OffsetDateTime,
+) -> Result<HttpResponse> {
+    if let Some(limit) = registry_rate_limit_for(args, &request.method, &request.path) {
+        let rate_limit_key = format!("{}:{}:{}", peer_addr.ip(), request.method, request.path);
+        if let Some(retry_after) = enforce_registry_rate_limit(
+            &mut rate_limits.lock().expect("registry rate limits"),
+            &rate_limit_key,
+            limit,
+            args.rate_limit_window_sec,
+            now,
+        ) {
+            return registry_json_response(
+                "HTTP/1.1 429 Too Many Requests",
+                vec![("Retry-After", retry_after.to_string())],
+                serde_json::json!({
+                    "error": "rate_limited",
+                    "detail": "registry rate limit exceeded",
+                }),
+            );
+        }
+    }
+
+    if let Some(secret) = shared_secret {
+        let validated = match validate_registry_auth_headers(
+            secret,
+            &request.method,
+            &request.path,
+            &request.header_map,
+            &request.body,
+            now,
+        ) {
+            Ok(validated) => validated,
+            Err(error) => {
+                return registry_http_error_response(RegistryHttpError::unauthorized(
+                    error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = remember_registry_nonce(
+            &mut replay_cache.lock().expect("registry replay cache"),
+            &validated.nonce,
+            now,
+        ) {
+            return registry_http_error_response(RegistryHttpError::unauthorized(
+                error.to_string(),
+            ));
+        }
+    }
+
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/peers") => {
+            let cutoff = now - TimeDuration::seconds(args.ttl_sec as i64);
+            let mut guard = entries.lock().expect("registry entries");
+            guard.retain(|_, record| record.published_at >= cutoff);
+            let response = guard.values().cloned().collect::<Vec<_>>();
+            registry_json_response(
+                "HTTP/1.1 200 OK",
+                Vec::new(),
+                serde_json::to_value(response)?,
+            )
+        }
+        ("POST", "/announce") => {
+            let record = match serde_json::from_slice::<RegistryPeerRecord>(&request.body) {
+                Ok(record) => record,
+                Err(error) => {
+                    return registry_http_error_response(RegistryHttpError::bad_request(format!(
+                        "invalid announce body: {error}"
+                    )));
+                }
+            };
+            if let Err(error) = validate_registry_peer_record(&record) {
+                return registry_http_error_response(error);
+            }
+            entries
+                .lock()
+                .expect("registry entries")
+                .insert(record.actor_id.clone(), record);
+            registry_json_response(
+                "HTTP/1.1 200 OK",
+                Vec::new(),
+                serde_json::json!({"ok": true}),
+            )
+        }
+        _ => registry_json_response(
+            "HTTP/1.1 404 Not Found",
+            Vec::new(),
+            serde_json::json!({"error": "not_found", "detail": "registry route not found"}),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry server
 // ---------------------------------------------------------------------------
 
 pub(crate) fn run_registry_serve(args: RegistryServeArgs) -> Result<()> {
-    use std::io::{Read, Write};
     use std::net::TcpListener;
 
     let shared_secret = resolve_registry_serve_shared_secret(&args)?;
+    if shared_secret.is_none()
+        && !args.allow_insecure_no_auth
+        && registry_bind_requires_auth(&args.bind)?
+    {
+        bail!(
+            "[E_REGISTRY_AUTH_REQUIRED] non-loopback registry bind requires --shared-secret/--shared-secret-env or --allow-insecure-no-auth"
+        );
+    }
     let listener = TcpListener::bind(&args.bind)
         .with_context(|| format!("failed to bind registry on {}", args.bind))?;
     let entries = Arc::new(Mutex::new(HashMap::<String, RegistryPeerRecord>::new()));
@@ -403,150 +766,31 @@ pub(crate) fn run_registry_serve(args: RegistryServeArgs) -> Result<()> {
         let entries = Arc::clone(&entries);
         let replay_cache = Arc::clone(&replay_cache);
         let rate_limits = Arc::clone(&rate_limits);
-        let ttl_sec = args.ttl_sec;
+        stream.set_read_timeout(registry_timeout_duration(args.read_timeout_ms))?;
+        stream.set_write_timeout(registry_timeout_duration(args.write_timeout_ms))?;
 
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        let header_end = loop {
-            let read = stream.read(&mut chunk)?;
-            if read == 0 {
-                break None;
-            }
-            request.extend_from_slice(&chunk[..read]);
-            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                break Some(position + 4);
-            }
+        let response = match read_registry_http_request(&mut stream, args.max_body_bytes) {
+            Ok(Some(request)) => match process_registry_request(
+                &args,
+                shared_secret.as_deref(),
+                &peer_addr,
+                &request,
+                &entries,
+                &replay_cache,
+                &rate_limits,
+                OffsetDateTime::now_utc(),
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    registry_http_error_response(RegistryHttpError::bad_request(error.to_string()))?
+                }
+            },
+            Ok(None) => continue,
+            Err(error) => registry_http_error_response(error)?,
         };
-        let Some(header_end) = header_end else {
-            continue;
-        };
-        let headers = String::from_utf8(request[..header_end].to_vec())?;
-        let request_line = headers
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow!("registry request missing request line"))?;
-        let header_map = parse_http_headers(&headers);
-        let content_length = header_map
-            .get("content-length")
-            .map(|value| value.parse::<usize>())
-            .transpose()?
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let read = stream.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&chunk[..read]);
+        if let Err(error) = write_registry_http_response(&mut stream, response) {
+            eprintln!("{error:#}");
         }
-        let body =
-            &request[header_end..header_end + content_length.min(request.len() - header_end)];
-        let mut request_parts = request_line.split_whitespace();
-        let method = request_parts
-            .next()
-            .ok_or_else(|| anyhow!("registry request missing method"))?;
-        let path = request_parts
-            .next()
-            .ok_or_else(|| anyhow!("registry request missing path"))?;
-        let now = OffsetDateTime::now_utc();
-
-        let dispatch_route = |method: &str, path: &str, body: &[u8]| -> Result<HttpResponse> {
-            match (method, path) {
-                ("GET", "/peers") => {
-                    let cutoff = now - TimeDuration::seconds(ttl_sec as i64);
-                    let mut guard = entries.lock().expect("registry entries");
-                    guard.retain(|_, record| record.published_at >= cutoff);
-                    let response = guard.values().cloned().collect::<Vec<_>>();
-                    Ok((
-                        "HTTP/1.1 200 OK",
-                        Vec::new(),
-                        serde_json::to_vec(&response)?,
-                    ))
-                }
-                ("POST", "/announce") => {
-                    let record = serde_json::from_slice::<RegistryPeerRecord>(body)?;
-                    entries
-                        .lock()
-                        .expect("registry entries")
-                        .insert(record.actor_id.clone(), record);
-                    Ok(("HTTP/1.1 200 OK", Vec::new(), br#"{"ok":true}"#.to_vec()))
-                }
-                _ => Ok((
-                    "HTTP/1.1 404 Not Found",
-                    Vec::new(),
-                    br#"{"error":"not found"}"#.to_vec(),
-                )),
-            }
-        };
-
-        let unauthorized_response = |error: &anyhow::Error| -> Result<HttpResponse> {
-            Ok((
-                "HTTP/1.1 401 Unauthorized",
-                Vec::new(),
-                serde_json::to_vec(
-                    &serde_json::json!({"error": "unauthorized", "detail": error.to_string()}),
-                )?,
-            ))
-        };
-
-        let require_auth = |body: &[u8]| -> Result<HttpResponse> {
-            let secret = shared_secret
-                .as_deref()
-                .expect("shared_secret checked before call");
-            match validate_registry_auth_headers(secret, method, path, &header_map, body, now) {
-                Ok(validated) => {
-                    match remember_registry_nonce(
-                        &mut replay_cache.lock().expect("registry replay cache"),
-                        &validated.nonce,
-                        now,
-                    ) {
-                        Ok(()) => dispatch_route(method, path, body),
-                        Err(error) => unauthorized_response(&error),
-                    }
-                }
-                Err(error) => unauthorized_response(&error),
-            }
-        };
-
-        let (status_line, response_headers, response_body) =
-            if let Some(limit) = registry_rate_limit_for(&args, method, path) {
-                let rate_limit_key = format!("{}:{method}:{path}", peer_addr.ip());
-                if let Some(retry_after) = enforce_registry_rate_limit(
-                    &mut rate_limits.lock().expect("registry rate limits"),
-                    &rate_limit_key,
-                    limit,
-                    args.rate_limit_window_sec,
-                    now,
-                ) {
-                    (
-                        "HTTP/1.1 429 Too Many Requests",
-                        vec![("Retry-After", retry_after.to_string())],
-                        serde_json::to_vec(&serde_json::json!({
-                            "error": "rate_limited",
-                            "detail": "registry rate limit exceeded"
-                        }))?,
-                    )
-                } else if shared_secret.is_some() {
-                    require_auth(body)?
-                } else {
-                    dispatch_route(method, path, body)?
-                }
-            } else if shared_secret.is_some() {
-                require_auth(body)?
-            } else {
-                dispatch_route(method, path, body)?
-            };
-
-        write!(
-            stream,
-            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            response_body.len()
-        )?;
-        for (name, value) in response_headers {
-            write!(stream, "{name}: {value}\r\n")?;
-        }
-        write!(stream, "\r\n")?;
-        stream.write_all(&response_body)?;
-        stream.flush()?;
     }
 }
 
@@ -911,5 +1155,73 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn registry_bind_requires_auth_for_non_loopback_addresses() {
+        assert!(!registry_bind_requires_auth("127.0.0.1:7777").expect("loopback bind"));
+        assert!(registry_bind_requires_auth("0.0.0.0:7777").expect("public bind"));
+    }
+
+    #[test]
+    fn parse_registry_content_length_rejects_oversized_payload() {
+        let headers = HashMap::from([("content-length".to_owned(), "1025".to_owned())]);
+        let error = parse_registry_content_length(&headers, 1024)
+            .expect_err("oversized payload must be rejected");
+        assert_eq!(error.status_line, "HTTP/1.1 413 Payload Too Large");
+    }
+
+    #[test]
+    fn process_registry_request_rejects_invalid_announce_payload() {
+        let args = RegistryServeArgs {
+            bind: "127.0.0.1:7777".to_owned(),
+            ttl_sec: 300,
+            rate_limit_window_sec: 60,
+            announce_rate_limit: 300,
+            peers_rate_limit: 900,
+            shared_secret: None,
+            shared_secret_env: None,
+            max_body_bytes: 65_536,
+            read_timeout_ms: 5_000,
+            write_timeout_ms: 5_000,
+            allow_insecure_no_auth: false,
+        };
+        let request = ParsedRegistryRequest {
+            method: "POST".to_owned(),
+            path: "/announce".to_owned(),
+            header_map: HashMap::from([("content-length".to_owned(), "2".to_owned())]),
+            body: b"{}".to_vec(),
+        };
+        let response = process_registry_request(
+            &args,
+            None,
+            &"127.0.0.1:7777".parse().expect("socket addr"),
+            &request,
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(HashMap::new()),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("invalid announce payload should return response");
+        assert_eq!(response.0, "HTTP/1.1 400 Bad Request");
+    }
+
+    #[test]
+    fn run_registry_serve_rejects_public_bind_without_auth_by_default() {
+        let error = run_registry_serve(RegistryServeArgs {
+            bind: "0.0.0.0:0".to_owned(),
+            ttl_sec: 300,
+            rate_limit_window_sec: 60,
+            announce_rate_limit: 300,
+            peers_rate_limit: 900,
+            shared_secret: None,
+            shared_secret_env: None,
+            max_body_bytes: 65_536,
+            read_timeout_ms: 5_000,
+            write_timeout_ms: 5_000,
+            allow_insecure_no_auth: false,
+        })
+        .expect_err("public bind without auth must fail");
+        assert!(error.to_string().contains("E_REGISTRY_AUTH_REQUIRED"));
     }
 }

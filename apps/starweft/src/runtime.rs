@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -29,7 +28,9 @@ use starweft_protocol::{
 };
 use starweft_runtime::RuntimePipeline;
 use starweft_stop::{classify_stop_impact, should_owner_emit_completion};
-use starweft_store::{LocalIdentityRecord, PeerAddressRecord, Store, VisionRecord};
+use starweft_store::{
+    LocalIdentityRecord, PeerAddressRecord, STORE_SCHEMA_VERSION_LABEL, Store, VisionRecord,
+};
 use time::OffsetDateTime;
 
 use crate::cli::RunArgs;
@@ -330,7 +331,7 @@ pub(crate) fn run_node_once(
         task_completion_queue.rx,
         worker_runtime,
     )?;
-    flush_outbox(config, store, transport)?;
+    flush_outbox(config, paths, store, transport)?;
     let stats = store.stats()?;
     let outbox_preview = store.queued_outbox_messages(10)?;
     Ok(RunTick {
@@ -363,6 +364,13 @@ pub(crate) fn validate_runtime_compatibility(config: &Config) -> Result<()> {
             "[E_PROTOCOL_VERSION] protocol_version が未対応です: configured={} runtime={}",
             config.compatibility.protocol_version,
             PROTOCOL_VERSION
+        );
+    }
+    if config.compatibility.schema_version != STORE_SCHEMA_VERSION_LABEL {
+        bail!(
+            "[E_SCHEMA_VERSION] schema_version が未対応です: configured={} runtime={}",
+            config.compatibility.schema_version,
+            STORE_SCHEMA_VERSION_LABEL
         );
     }
     if config.openclaw.capability_version != config.compatibility.bridge_capability_version {
@@ -408,13 +416,17 @@ pub(crate) struct InboxProcessingContext<'a> {
 // process_local_inbox / flush_outbox / delivery helpers / wire routing
 // ---------------------------------------------------------------------------
 
+const OUTBOX_RETRY_DELAY_MILLIS: i64 = 250;
+const OUTBOX_MAX_DELIVERY_ATTEMPTS: u64 = 20;
+const ENVELOPE_EXPIRY_SKEW_SEC: i64 = 30;
+
 pub(crate) fn process_local_inbox(ctx: &InboxProcessingContext<'_>) -> Result<()> {
     let local_identity = ctx.store.local_identity()?;
 
     for line in ctx.transport.receive(ctx.topology)? {
         let wire: WireEnvelope = serde_json::from_str(&line)?;
         if ctx.config.node.role == NodeRole::Relay {
-            relay_incoming_wire(ctx.config, ctx.store, ctx.transport, &wire)?;
+            relay_incoming_wire(ctx.config, ctx.paths, ctx.store, ctx.transport, &wire)?;
             continue;
         }
         route_incoming_wire(
@@ -438,46 +450,92 @@ pub(crate) fn process_local_inbox(ctx: &InboxProcessingContext<'_>) -> Result<()
 
 pub(crate) fn flush_outbox(
     config: &Config,
+    paths: &DataPaths,
     store: &Store,
     transport: &RuntimeTransport,
 ) -> Result<()> {
     let queued = store.queued_outbox_messages(100)?;
     let peers = store.list_peer_addresses()?;
-    let p2p_log = Path::new(&config.node.data_dir)
-        .join("logs")
-        .join("p2p.log");
+    let p2p_log = paths.logs_dir.join("p2p.log");
 
     for message in queued {
         let wire: WireEnvelope = serde_json::from_str(&message.raw_json)?;
         let targets = resolve_delivery_targets(config, &wire, &peers);
-        if targets.is_empty() {
+        store.sync_outbox_delivery_targets(&message.msg_id, &targets)?;
+        let deliveries = store.ready_outbox_deliveries(&message.msg_id, 100)?;
+        if deliveries.is_empty() {
+            if !targets.is_empty() || !store.outbox_deliveries(&message.msg_id)?.is_empty() {
+                continue;
+            }
+            let state = store.mark_outbox_delivery_failure(
+                &message.msg_id,
+                "no delivery targets available",
+                OffsetDateTime::now_utc() + time::Duration::milliseconds(OUTBOX_RETRY_DELAY_MILLIS),
+                OUTBOX_MAX_DELIVERY_ATTEMPTS,
+            )?;
+            write_runtime_log(
+                &p2p_log,
+                &format!(
+                    "delivery_state_changed {} {} attempts={} reason=no_targets",
+                    wire.msg_id,
+                    state,
+                    message.delivery_attempts + 1
+                ),
+            )?;
             continue;
         }
         let payload = serde_json::to_string(&wire)?;
-        let mut delivered_all = true;
-        for target in targets {
+        for target in deliveries {
             match transport.deliver(&target.multiaddr.parse::<Multiaddr>()?, &payload) {
                 Ok(Some(delivery)) => {
-                    write_runtime_log(
-                        &p2p_log,
-                        &format!("delivered {} to {}", wire.msg_id, delivery.target),
+                    let state = store.mark_outbox_delivery_target_delivered(
+                        &message.msg_id,
+                        &target.multiaddr,
                     )?;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    delivered_all = false;
                     write_runtime_log(
                         &p2p_log,
                         &format!(
-                            "delivery_failed {} {}: {error}",
+                            "delivered {} to {} aggregate_state={}",
+                            wire.msg_id, delivery.target, state
+                        ),
+                    )?;
+                }
+                Ok(None) => {
+                    let error = format!("unsupported delivery target {}", target.multiaddr);
+                    let state = store.mark_outbox_delivery_target_failure(
+                        &message.msg_id,
+                        &target.multiaddr,
+                        &error,
+                        OffsetDateTime::now_utc()
+                            + time::Duration::milliseconds(OUTBOX_RETRY_DELAY_MILLIS),
+                        OUTBOX_MAX_DELIVERY_ATTEMPTS,
+                    )?;
+                    write_runtime_log(
+                        &p2p_log,
+                        &format!(
+                            "delivery_failed {} {}: {error} aggregate_state={state}",
+                            wire.msg_id, target.multiaddr
+                        ),
+                    )?;
+                }
+                Err(error) => {
+                    let state = store.mark_outbox_delivery_target_failure(
+                        &message.msg_id,
+                        &target.multiaddr,
+                        &error.to_string(),
+                        OffsetDateTime::now_utc()
+                            + time::Duration::milliseconds(OUTBOX_RETRY_DELAY_MILLIS),
+                        OUTBOX_MAX_DELIVERY_ATTEMPTS,
+                    )?;
+                    write_runtime_log(
+                        &p2p_log,
+                        &format!(
+                            "delivery_failed {} {}: {error} aggregate_state={state}",
                             wire.msg_id, target.multiaddr
                         ),
                     )?;
                 }
             }
-        }
-        if delivered_all {
-            store.mark_outbox_delivery_state(&message.msg_id, "delivered_local")?;
         }
     }
 
@@ -522,6 +580,7 @@ pub(crate) fn resolve_relay_targets(
 
 pub(crate) fn relay_incoming_wire(
     config: &Config,
+    paths: &DataPaths,
     store: &Store,
     transport: &RuntimeTransport,
     wire: &WireEnvelope,
@@ -532,9 +591,7 @@ pub(crate) fn relay_incoming_wire(
     let peers = store.list_peer_addresses()?;
     let targets = resolve_relay_targets(config, wire, &peers);
     let payload = serde_json::to_string(wire)?;
-    let relay_log = Path::new(&config.node.data_dir)
-        .join("logs")
-        .join("relay.log");
+    let relay_log = paths.logs_dir.join("relay.log");
     for target in targets {
         if let Some(delivery) =
             transport.deliver(&target.multiaddr.parse::<Multiaddr>()?, &payload)?
@@ -577,6 +634,7 @@ where
     let verifying_key = verifying_key_from_base64(public_key)?;
     let envelope: Envelope<T> = wire.decode()?;
     envelope.verify_with_key(&verifying_key)?;
+    ensure_envelope_fresh(&envelope)?;
     Ok(envelope)
 }
 
@@ -586,6 +644,7 @@ pub(crate) fn verify_bootstrap_capability_query(
     let envelope: Envelope<CapabilityQuery> = wire.decode()?;
     let verifying_key = verifying_key_from_base64(&envelope.body.public_key)?;
     envelope.verify_with_key(&verifying_key)?;
+    ensure_envelope_fresh(&envelope)?;
     Ok(envelope)
 }
 
@@ -595,7 +654,24 @@ pub(crate) fn verify_bootstrap_capability_advertisement(
     let envelope: Envelope<CapabilityAdvertisement> = wire.decode()?;
     let verifying_key = verifying_key_from_base64(&envelope.body.public_key)?;
     envelope.verify_with_key(&verifying_key)?;
+    ensure_envelope_fresh(&envelope)?;
     Ok(envelope)
+}
+
+pub(crate) fn ensure_envelope_fresh<T>(envelope: &Envelope<T>) -> Result<()> {
+    let Some(expires_at) = envelope.expires_at else {
+        return Ok(());
+    };
+    let cutoff = expires_at + time::Duration::seconds(ENVELOPE_EXPIRY_SKEW_SEC);
+    if OffsetDateTime::now_utc() > cutoff {
+        bail!(
+            "[E_MESSAGE_EXPIRED] msg_id={} expires_at={} skew_sec={}",
+            envelope.msg_id,
+            expires_at,
+            ENVELOPE_EXPIRY_SKEW_SEC
+        );
+    }
+    Ok(())
 }
 
 pub(crate) struct IncomingWireContext<'a> {
@@ -632,6 +708,9 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
             return Ok(());
         }
         _ => {}
+    }
+    if ctx.store.inbox_message_processed(&wire.msg_id)? {
+        return Ok(());
     }
     let peer_identity = ctx
         .store
@@ -2822,13 +2901,18 @@ pub(crate) fn handle_worker_stop_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, NodeRole, OwnerRetryAction, OwnerRetryRule, OwnerSection};
+    use crate::config::{
+        Config, DataPaths, NodeRole, OwnerRetryAction, OwnerRetryRule, OwnerSection,
+    };
     use crate::decision::FailureAction;
     use crate::helpers::submission_is_approved;
     use starweft_crypto::StoredKeypair;
     use starweft_id::{ActorId, NodeId, ProjectId, TaskId, VisionId};
-    use starweft_protocol::{ApprovalGranted, ApprovalScopeType, TaskDelegated, UnsignedEnvelope};
-    use starweft_store::{PeerAddressRecord, PeerIdentityRecord, Store};
+    use starweft_protocol::{
+        ApprovalGranted, ApprovalScopeType, EvaluationPolicy, ParticipantPolicy, ProjectCharter,
+        TaskDelegated, UnsignedEnvelope,
+    };
+    use starweft_store::{DeliveryState, PeerAddressRecord, PeerIdentityRecord, Store};
     use std::path::Path;
     use tempfile::TempDir;
     use time::OffsetDateTime;
@@ -3240,11 +3324,106 @@ mod tests {
     }
 
     #[test]
+    fn validate_runtime_compatibility_rejects_schema_mismatch() {
+        let mut config = Config::for_role(NodeRole::Owner, Path::new("/tmp/starweft"), None);
+        config.compatibility.schema_version = "starweft-store/legacy".to_owned();
+        let error =
+            validate_runtime_compatibility(&config).expect_err("schema mismatch should fail");
+        assert!(error.to_string().contains("E_SCHEMA_VERSION"));
+    }
+
+    #[test]
     fn ensure_wire_protocol_compatible_rejects_unexpected_protocol() {
         let config = Config::for_role(NodeRole::Owner, Path::new("/tmp/starweft"), None);
         let error =
             ensure_wire_protocol_compatible(&config, "starweft/legacy").expect_err("must fail");
         assert!(error.to_string().contains("E_PROTOCOL_VERSION"));
+    }
+
+    #[test]
+    fn verify_and_decode_rejects_expired_message() {
+        let keypair = StoredKeypair::generate();
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            Some(ActorId::generate()),
+            ApprovalGranted {
+                scope_type: ApprovalScopeType::Project,
+                scope_id: "project_01".to_owned(),
+                approved_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_expires_at(OffsetDateTime::now_utc() - time::Duration::minutes(1))
+        .sign(&keypair)
+        .expect("sign envelope");
+
+        let error = verify_and_decode::<ApprovalGranted>(
+            envelope.into_wire().expect("wire"),
+            &keypair.public_key,
+        )
+        .expect_err("expired message should fail");
+        assert!(error.to_string().contains("E_MESSAGE_EXPIRED"));
+    }
+
+    #[test]
+    fn route_incoming_wire_skips_processed_duplicates_before_peer_lookup() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let config = Config::for_role(NodeRole::Owner, temp.path(), None);
+        let topology = RuntimeTopology::default();
+        let transport = RuntimeTransport::local_mailbox();
+        let (task_completion_tx, _task_completion_rx) = mpsc::channel();
+        let worker_runtime = WorkerRuntimeState::default();
+        let paths = DataPaths::from_root(temp.path());
+        let local_identity = None;
+        let owner_key = StoredKeypair::generate();
+        let project_id = ProjectId::generate();
+        let vision_id = VisionId::generate();
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            Some(ActorId::generate()),
+            ProjectCharter {
+                project_id: project_id.clone(),
+                vision_id: vision_id.clone(),
+                principal_actor_id: ActorId::generate(),
+                owner_actor_id: ActorId::generate(),
+                title: "project".to_owned(),
+                objective: "objective".to_owned(),
+                stop_authority_actor_id: ActorId::generate(),
+                participant_policy: ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: EvaluationPolicy {
+                    quality_weight: 1.0,
+                    speed_weight: 1.0,
+                    reliability_weight: 1.0,
+                    alignment_weight: 1.0,
+                },
+            },
+        )
+        .with_project_id(project_id)
+        .with_vision_id(vision_id)
+        .sign(&owner_key)
+        .expect("sign project charter");
+        store.save_inbox_message(&envelope).expect("save inbox");
+        store
+            .mark_inbox_message_processed(&envelope.msg_id)
+            .expect("mark processed");
+
+        route_incoming_wire(
+            &IncomingWireContext {
+                config: &config,
+                paths: &paths,
+                store: &store,
+                topology: &topology,
+                transport: &transport,
+                local_identity: &local_identity,
+                actor_key: None,
+                task_completion_tx: &task_completion_tx,
+                worker_runtime: &worker_runtime,
+            },
+            envelope.into_wire().expect("wire"),
+        )
+        .expect("duplicate should short-circuit");
     }
 
     #[test]
@@ -3426,6 +3605,145 @@ mod tests {
                 .iter()
                 .any(|message| message.msg_type == "ApprovalGranted")
         );
+    }
+
+    #[test]
+    fn flush_outbox_schedules_retry_for_unsupported_targets() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let config = Config::for_role(NodeRole::Owner, temp.path(), None);
+        DataPaths::from_root(temp.path())
+            .ensure_layout()
+            .expect("layout");
+        let owner_actor = ActorId::generate();
+        store
+            .add_peer_address(&PeerAddressRecord {
+                actor_id: owner_actor.clone(),
+                node_id: NodeId::generate(),
+                multiaddr: "/ip4/127.0.0.1/tcp/9000".to_owned(),
+                last_seen_at: None,
+            })
+            .expect("peer address");
+
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            Some(owner_actor),
+            ApprovalGranted {
+                scope_type: ApprovalScopeType::Project,
+                scope_id: "project_01".to_owned(),
+                approved_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .sign(&StoredKeypair::generate())
+        .expect("sign envelope");
+        RuntimePipeline::new(&store)
+            .queue_outgoing(&envelope)
+            .expect("queue outbox");
+
+        let paths = DataPaths::from_root(temp.path());
+        flush_outbox(&config, &paths, &store, &RuntimeTransport::local_mailbox())
+            .expect("flush outbox");
+
+        let record = store
+            .outbox_message(envelope.msg_id.as_str())
+            .expect("outbox message")
+            .expect("record exists");
+        assert_eq!(
+            record.delivery_state,
+            starweft_store::DeliveryState::RetryWaiting
+        );
+        assert_eq!(record.delivery_attempts, 1);
+        assert!(record.next_attempt_at.is_some());
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .expect("last error")
+                .contains("unsupported delivery target")
+        );
+    }
+
+    #[test]
+    fn flush_outbox_retries_only_failed_targets() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let config = Config::for_role(NodeRole::Owner, temp.path(), None);
+        let paths = DataPaths::from_root(temp.path());
+        paths.ensure_layout().expect("layout");
+        let owner_actor = ActorId::generate();
+        let success_mailbox = Path::new(&format!(
+            "target-mailbox-{}.sock",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ))
+        .to_path_buf();
+        let success_addr = format!("/unix/{}", success_mailbox.display());
+        store
+            .add_peer_address(&PeerAddressRecord {
+                actor_id: owner_actor.clone(),
+                node_id: NodeId::generate(),
+                multiaddr: success_addr.clone(),
+                last_seen_at: None,
+            })
+            .expect("success peer");
+        store
+            .add_peer_address(&PeerAddressRecord {
+                actor_id: owner_actor.clone(),
+                node_id: NodeId::generate(),
+                multiaddr: "/ip4/127.0.0.1/tcp/9000".to_owned(),
+                last_seen_at: None,
+            })
+            .expect("retry peer");
+
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            Some(owner_actor),
+            ApprovalGranted {
+                scope_type: ApprovalScopeType::Project,
+                scope_id: "project_01".to_owned(),
+                approved_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .sign(&StoredKeypair::generate())
+        .expect("sign envelope");
+        RuntimePipeline::new(&store)
+            .queue_outgoing(&envelope)
+            .expect("queue outbox");
+
+        flush_outbox(&config, &paths, &store, &RuntimeTransport::local_mailbox())
+            .expect("flush outbox");
+
+        let deliveries = store
+            .outbox_deliveries(envelope.msg_id.as_str())
+            .expect("outbox deliveries");
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().any(|record| {
+            record.multiaddr == success_addr
+                && record.delivery_state == DeliveryState::DeliveredLocal
+        }));
+        assert!(deliveries.iter().any(|record| {
+            record.multiaddr == "/ip4/127.0.0.1/tcp/9000"
+                && record.delivery_state == DeliveryState::RetryWaiting
+        }));
+        assert_eq!(
+            std::fs::read_to_string(&success_mailbox)
+                .expect("success mailbox")
+                .lines()
+                .count(),
+            1
+        );
+
+        store.resume_pending_outbox().expect("resume outbox");
+        flush_outbox(&config, &paths, &store, &RuntimeTransport::local_mailbox())
+            .expect("flush resumed outbox");
+
+        assert_eq!(
+            std::fs::read_to_string(&success_mailbox)
+                .expect("success mailbox")
+                .lines()
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_file(&success_mailbox);
     }
 
     #[test]

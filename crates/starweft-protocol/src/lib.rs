@@ -380,6 +380,35 @@ impl WireEnvelope {
             signature: self.signature,
         })
     }
+
+    /// Verifies the wire envelope's signature against the given public key.
+    pub fn verify_with_key(
+        &self,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<(), ProtocolError> {
+        if self.signature.alg != "ed25519" {
+            return Err(ProtocolError::UnsupportedAlgorithm(
+                self.signature.alg.clone(),
+            ));
+        }
+
+        let signable = SignableEnvelope {
+            protocol: &self.protocol,
+            msg_id: &self.msg_id,
+            msg_type: &self.msg_type,
+            from_actor_id: &self.from_actor_id,
+            to_actor_id: &self.to_actor_id,
+            vision_id: &self.vision_id,
+            project_id: &self.project_id,
+            task_id: &self.task_id,
+            lamport_ts: self.lamport_ts,
+            created_at: self.created_at,
+            expires_at: &self.expires_at,
+            body: &self.body,
+        };
+        verify_bytes(verifying_key, &canonical_json(&signable)?, &self.signature)?;
+        Ok(())
+    }
 }
 
 /// Lifecycle status of a project.
@@ -1082,6 +1111,28 @@ mod tests {
 
         envelope
             .verify_with_key(&keypair.verifying_key().expect("verifying key"))
+            .expect("verify");
+    }
+
+    #[test]
+    fn wire_envelope_round_trip_verifies() {
+        let keypair = StoredKeypair::generate();
+        let actor_id = ActorId::generate();
+        let wire = UnsignedEnvelope::new(
+            actor_id,
+            None,
+            VisionIntent {
+                title: "vision".to_owned(),
+                raw_vision_text: "build something".to_owned(),
+                constraints: VisionConstraints::default(),
+            },
+        )
+        .sign(&keypair)
+        .expect("sign")
+        .into_wire()
+        .expect("wire");
+
+        wire.verify_with_key(&keypair.verifying_key().expect("verifying key"))
             .expect("verify");
     }
 }

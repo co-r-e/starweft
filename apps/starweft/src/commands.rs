@@ -80,15 +80,10 @@ pub(crate) fn create_backup_bundle(
     fs::create_dir_all(&output)?;
     copy_file_if_exists(&paths.config_toml, &output.join("config.toml"))?;
     copy_dir_if_exists(&paths.identity_dir, &output.join("identity"))?;
-    copy_file_if_exists(&paths.ledger_db, &output.join("ledger").join("node.db"))?;
-    copy_file_if_exists(
-        &paths.ledger_db.with_extension("db-wal"),
-        &output.join("ledger").join("node.db-wal"),
-    )?;
-    copy_file_if_exists(
-        &paths.ledger_db.with_extension("db-shm"),
-        &output.join("ledger").join("node.db-shm"),
-    )?;
+    if paths.ledger_db.exists() {
+        Store::open(&paths.ledger_db)?
+            .backup_database_to_path(output.join("ledger").join("node.db"))?;
+    }
     copy_dir_if_exists(&paths.artifacts_dir, &output.join("artifacts"))?;
     copy_dir_if_exists(&paths.logs_dir, &output.join("logs"))?;
     copy_dir_if_exists(&paths.cache_dir, &output.join("cache"))?;
@@ -179,6 +174,43 @@ pub(crate) fn run_repair_resume_outbox(args: CommonDataDirArgs) -> Result<()> {
     let store = Store::open(&paths.ledger_db)?;
     let report = store.resume_pending_outbox()?;
     println!("requeued_outbox_messages: {}", report.resumed_messages);
+    println!(
+        "requeued_dead_letter_messages: {}",
+        report.resumed_dead_letters
+    );
+    Ok(())
+}
+
+pub(crate) fn run_repair_list_dead_letters(args: RepairListDeadLettersArgs) -> Result<()> {
+    let (_, paths) = load_existing_config(args.data_dir.as_ref())?;
+    let store = Store::open(&paths.ledger_db)?;
+    let messages = store.dead_letter_outbox_messages(args.limit)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&messages)?);
+        return Ok(());
+    }
+    if messages.is_empty() {
+        println!("dead_letter_outbox: none");
+        return Ok(());
+    }
+    println!("dead_letter_outbox: {}", messages.len());
+    for message in messages {
+        let summary = store.outbox_delivery_summary(&message.msg_id)?;
+        println!(
+            "{} {} attempts={} targets={}/{} dead={} retry={} last_attempted_at={} error={}",
+            message.msg_type,
+            message.msg_id,
+            message.delivery_attempts,
+            summary.delivered_targets,
+            summary.total_targets,
+            summary.dead_letter_targets,
+            summary.retry_waiting_targets,
+            message
+                .last_attempted_at
+                .unwrap_or_else(|| "none".to_owned()),
+            message.last_error.unwrap_or_else(|| "none".to_owned())
+        );
+    }
     Ok(())
 }
 
@@ -198,7 +230,18 @@ pub(crate) fn run_audit_verify_log(args: CommonDataDirArgs) -> Result<()> {
     println!("checked_events: {}", report.total_events);
     println!(
         "invalid_events: {}",
-        report.missing_task_ids + report.lamport_regressions + report.parse_failures
+        report.duplicate_project_charters
+            + report.missing_task_ids
+            + report.lamport_regressions
+            + report.parse_failures
+            + report.signature_failures
+            + report.raw_json_mismatches
+    );
+    println!("signature_failures: {}", report.signature_failures);
+    println!("raw_json_mismatches: {}", report.raw_json_mismatches);
+    println!(
+        "unverifiable_signatures: {}",
+        report.unverifiable_signatures
     );
     if !report.errors.is_empty() {
         for error in report.errors {
@@ -433,10 +476,11 @@ pub(crate) fn run_openclaw_attach(args: OpenClawAttachArgs) -> Result<()> {
 
 pub(crate) fn run_config_show(args: ConfigShowArgs) -> Result<()> {
     let (config, _) = load_existing_config(args.data_dir.as_ref())?;
+    let redacted = config.redacted();
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&config)?);
+        println!("{}", serde_json::to_string_pretty(&redacted)?);
     } else {
-        println!("{}", toml::to_string_pretty(&config)?);
+        println!("{}", toml::to_string_pretty(&redacted)?);
     }
     Ok(())
 }
@@ -519,9 +563,12 @@ pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::{Config, DataPaths, NodeRole};
+    use starweft_id::{ActorId, NodeId};
+    use starweft_store::{LocalIdentityRecord, Store};
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+    use time::OffsetDateTime;
 
     fn write_backup_source(root: &Path) -> DataPaths {
         let paths = DataPaths::from_root(root);
@@ -531,9 +578,18 @@ mod tests {
 
         fs::write(&paths.actor_key, "actor-key").expect("write actor key");
         fs::write(&paths.stop_authority_key, "stop-key").expect("write stop key");
-        fs::write(&paths.ledger_db, "node-db").expect("write ledger");
-        fs::write(paths.ledger_db.with_extension("db-wal"), "node-db-wal").expect("write wal");
-        fs::write(paths.ledger_db.with_extension("db-shm"), "node-db-shm").expect("write shm");
+        let store = Store::open(&paths.ledger_db).expect("store");
+        store
+            .upsert_local_identity(&LocalIdentityRecord {
+                actor_id: ActorId::generate(),
+                node_id: NodeId::generate(),
+                actor_type: "worker".to_owned(),
+                display_name: "backup-source".to_owned(),
+                public_key: "public-key".to_owned(),
+                private_key_ref: paths.actor_key.display().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+            })
+            .expect("save local identity");
 
         let nested_artifact = paths.artifacts_dir.join("nested").join("artifact.json");
         fs::create_dir_all(nested_artifact.parent().expect("artifact parent"))
@@ -572,20 +628,13 @@ mod tests {
             fs::read_to_string(&restore_paths.stop_authority_key).expect("restored stop key"),
             "stop-key"
         );
-        assert_eq!(
-            fs::read_to_string(&restore_paths.ledger_db).expect("restored ledger"),
-            "node-db"
-        );
-        assert_eq!(
-            fs::read_to_string(restore_paths.ledger_db.with_extension("db-wal"))
-                .expect("restored wal"),
-            "node-db-wal"
-        );
-        assert_eq!(
-            fs::read_to_string(restore_paths.ledger_db.with_extension("db-shm"))
-                .expect("restored shm"),
-            "node-db-shm"
-        );
+        let restored_store = Store::open(&restore_paths.ledger_db).expect("restored store");
+        let restored_identity = restored_store
+            .local_identity()
+            .expect("local identity")
+            .expect("identity exists");
+        assert_eq!(restored_identity.display_name, "backup-source");
+        assert_eq!(restored_identity.public_key, "public-key");
         assert_eq!(
             fs::read_to_string(
                 restore_paths
@@ -620,16 +669,53 @@ mod tests {
         let restore_paths = DataPaths::from_root(&restore_root);
         fs::create_dir_all(restore_paths.ledger_db.parent().expect("ledger parent"))
             .expect("create ledger dir");
-        fs::write(
-            restore_paths.ledger_db.with_extension("db-wal"),
-            "existing wal",
-        )
-        .expect("write existing wal");
+        fs::write(&restore_paths.ledger_db, "existing db").expect("write existing db");
 
         let restore_root_arg = restore_root.clone();
         let error = restore_backup_bundle(Some(&restore_root_arg), &backup_dir, false)
-            .expect_err("wal conflict should fail");
+            .expect_err("db conflict should fail");
         assert!(error.to_string().contains("E_RESTORE_CONFLICT"));
-        assert!(error.to_string().contains("node.db-wal"));
+        assert!(error.to_string().contains("node.db"));
+    }
+
+    #[test]
+    fn repair_list_dead_letters_renders_entries() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("node");
+        let paths = write_backup_source(&data_dir);
+        let store = Store::open(&paths.ledger_db).expect("store");
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            None,
+            starweft_protocol::PublishIntentProposed {
+                scope_type: "project".to_owned(),
+                scope_id: "project_01".to_owned(),
+                target: "github_issue:owner/repo#1".to_owned(),
+                reason: "test".to_owned(),
+                summary: "summary".to_owned(),
+                context: serde_json::json!({ "ok": true }),
+                proposed_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .sign(&starweft_crypto::StoredKeypair::generate())
+        .expect("sign outbox");
+        store.queue_outbox(&envelope).expect("queue outbox");
+        store
+            .mark_outbox_delivery_failure(
+                envelope.msg_id.as_str(),
+                "network down",
+                OffsetDateTime::now_utc(),
+                1,
+            )
+            .expect("mark dead letter");
+
+        let messages = store.dead_letter_outbox_messages(10).expect("dead letters");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].delivery_state,
+            starweft_store::DeliveryState::DeadLetter
+        );
+        assert_eq!(messages[0].delivery_attempts, 1);
+        assert_eq!(messages[0].last_error.as_deref(), Some("network down"));
     }
 }

@@ -30,7 +30,7 @@ pub struct PeerEndpoint {
 impl PeerEndpoint {
     /// Parses and validates the address as a multiaddr.
     pub fn validate(&self) -> Result<Multiaddr> {
-        self.address.parse().map_err(Into::into)
+        parse_starweft_multiaddr(&self.address)
     }
 }
 
@@ -47,10 +47,17 @@ impl ListenAddress {
     /// Parses a raw address string, validating transport support.
     pub fn parse(raw: impl Into<String>) -> Result<Self> {
         let raw = raw.into();
-        let multiaddr = raw.parse::<Multiaddr>()?;
+        let multiaddr = parse_starweft_multiaddr(&raw)?;
         validate_supported_transport(&multiaddr)?;
         Ok(Self { raw, multiaddr })
     }
+}
+
+fn parse_starweft_multiaddr(raw: &str) -> Result<Multiaddr> {
+    if let Some(path) = raw.strip_prefix("/unix//") {
+        return Ok(Multiaddr::empty().with(Protocol::Unix(format!("/{path}").into())));
+    }
+    raw.parse::<Multiaddr>().map_err(Into::into)
 }
 
 /// Network topology describing local listen addresses and remote seed peers.

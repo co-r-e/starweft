@@ -247,12 +247,15 @@ pub fn run_audit(request: AuditRequest) -> Result<String> {
 
     let report = store.verify_task_event_log()?;
     Ok(format!(
-        "audit_action: verify_log\ntotal_events: {}\nmissing_task_ids: {}\nduplicate_project_charters: {}\nlamport_regressions: {}\nparse_failures: {}\nstatus: {}",
+        "audit_action: verify_log\ntotal_events: {}\nmissing_task_ids: {}\nduplicate_project_charters: {}\nlamport_regressions: {}\nparse_failures: {}\nsignature_failures: {}\nraw_json_mismatches: {}\nunverifiable_signatures: {}\nstatus: {}",
         report.total_events,
         report.missing_task_ids,
         report.duplicate_project_charters,
         report.lamport_regressions,
         report.parse_failures,
+        report.signature_failures,
+        report.raw_json_mismatches,
+        report.unverifiable_signatures,
         if report.errors.is_empty() {
             "ok"
         } else {

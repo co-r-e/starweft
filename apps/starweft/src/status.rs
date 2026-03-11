@@ -30,6 +30,8 @@ pub(crate) struct StatusCompactSummary {
     pub(crate) health: String,
     pub(crate) role_detail: String,
     pub(crate) queued_outbox: u64,
+    pub(crate) retry_waiting_outbox: u64,
+    pub(crate) dead_letter_outbox: u64,
     pub(crate) running_tasks: u64,
     pub(crate) inbox_unprocessed: u64,
     pub(crate) stop_orders: u64,
@@ -58,6 +60,8 @@ pub(crate) struct StatusView {
     pub(crate) active_projects: u64,
     pub(crate) running_tasks: u64,
     pub(crate) queued_outbox: u64,
+    pub(crate) retry_waiting_outbox: u64,
+    pub(crate) dead_letter_outbox: u64,
     pub(crate) inbox_unprocessed: u64,
     pub(crate) stop_orders: u64,
     pub(crate) snapshots: u64,
@@ -84,6 +88,7 @@ pub(crate) struct StatusView {
     pub(crate) cached_project_snapshots: u64,
     pub(crate) cached_task_snapshots: u64,
     pub(crate) queued_outbox_preview: Vec<String>,
+    pub(crate) dead_letter_outbox_preview: Vec<String>,
     pub(crate) latest_stop_id: Option<String>,
     pub(crate) latest_project_id: Option<String>,
     pub(crate) latest_project_status: Option<String>,
@@ -194,9 +199,11 @@ pub(crate) fn render_status_compact_summary_line(view: &StatusView) -> String {
         .clone()
         .unwrap_or_else(|| "none".to_owned());
     format!(
-        "compact_summary: role={} queued_outbox={} running_tasks={} inbox_unprocessed={} stop_orders={} latest_stop_id={} role_detail={}",
+        "compact_summary: role={} queued_outbox={} retry_waiting_outbox={} dead_letter_outbox={} running_tasks={} inbox_unprocessed={} stop_orders={} latest_stop_id={} role_detail={}",
         view.compact_summary.role,
         view.compact_summary.queued_outbox,
+        view.compact_summary.retry_waiting_outbox,
+        view.compact_summary.dead_letter_outbox,
         view.compact_summary.running_tasks,
         view.compact_summary.inbox_unprocessed,
         view.compact_summary.stop_orders,
@@ -523,12 +530,22 @@ pub(crate) fn render_status_output(args: &StatusArgs, view: &StatusView) -> Resu
         format!("active_projects: {}", view.active_projects),
         format!("running_tasks: {}", view.running_tasks),
         format!("queued_outbox: {}", view.queued_outbox),
+        format!("retry_waiting_outbox: {}", view.retry_waiting_outbox),
+        format!("dead_letter_outbox: {}", view.dead_letter_outbox),
         format!(
             "queued_outbox_preview: {}",
             if view.queued_outbox_preview.is_empty() {
                 "none".to_owned()
             } else {
                 view.queued_outbox_preview.join(", ")
+            }
+        ),
+        format!(
+            "dead_letter_outbox_preview: {}",
+            if view.dead_letter_outbox_preview.is_empty() {
+                "none".to_owned()
+            } else {
+                view.dead_letter_outbox_preview.join(", ")
             }
         ),
         format!("inbox_unprocessed: {}", view.inbox_unprocessed),
@@ -743,8 +760,35 @@ pub(crate) fn load_status_view_with(
     let queued_outbox_preview = store
         .queued_outbox_messages(3)?
         .into_iter()
-        .map(|message| message.msg_type)
-        .collect();
+        .map(|message| {
+            let summary = store.outbox_delivery_summary(&message.msg_id)?;
+            Ok(format!(
+                "{}({}; targets={}; delivered={}; retry={}; dead={})",
+                message.msg_type,
+                message.delivery_state,
+                summary.total_targets,
+                summary.delivered_targets,
+                summary.retry_waiting_targets,
+                summary.dead_letter_targets
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let dead_letter_outbox_preview = store
+        .dead_letter_outbox_messages(3)?
+        .into_iter()
+        .map(|message| {
+            let summary = store.outbox_delivery_summary(&message.msg_id)?;
+            Ok(format!(
+                "{}#{} attempts={} dead_targets={}/{} error={}",
+                message.msg_type,
+                message.msg_id,
+                message.delivery_attempts,
+                summary.dead_letter_targets,
+                summary.total_targets,
+                message.last_error.unwrap_or_else(|| "none".to_owned())
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let actor_scoped_stats = identity
         .as_ref()
         .map(|record| store.actor_scoped_stats(&record.actor_id))
@@ -758,6 +802,8 @@ pub(crate) fn load_status_view_with(
             health: String::new(),
             role_detail: String::new(),
             queued_outbox: stats.queued_outbox_count,
+            retry_waiting_outbox: stats.retry_waiting_outbox_count,
+            dead_letter_outbox: stats.dead_letter_outbox_count,
             running_tasks: stats.running_task_count,
             inbox_unprocessed: stats.inbox_unprocessed_count,
             stop_orders: stats.stop_order_count,
@@ -799,6 +845,8 @@ pub(crate) fn load_status_view_with(
         active_projects: stats.project_count,
         running_tasks: stats.running_task_count,
         queued_outbox: stats.queued_outbox_count,
+        retry_waiting_outbox: stats.retry_waiting_outbox_count,
+        dead_letter_outbox: stats.dead_letter_outbox_count,
         inbox_unprocessed: stats.inbox_unprocessed_count,
         stop_orders: stats.stop_order_count,
         snapshots: stats.snapshot_count,
@@ -831,6 +879,7 @@ pub(crate) fn load_status_view_with(
         cached_project_snapshots: actor_scoped_stats.cached_project_snapshot_count,
         cached_task_snapshots: actor_scoped_stats.cached_task_snapshot_count,
         queued_outbox_preview,
+        dead_letter_outbox_preview,
         latest_stop_id,
         latest_project_id: latest_project_snapshot
             .as_ref()
@@ -1082,6 +1131,8 @@ mod tests {
                 health: String::new(),
                 role_detail: String::new(),
                 queued_outbox: 2,
+                retry_waiting_outbox: 1,
+                dead_letter_outbox: 0,
                 running_tasks: 0,
                 inbox_unprocessed: 0,
                 stop_orders: 0,
@@ -1096,7 +1147,7 @@ mod tests {
             transport_peer_id: None,
             p2p: "ready".to_owned(),
             protocol_version: "starweft/0.1".to_owned(),
-            schema_version: "starweft-store/1".to_owned(),
+            schema_version: "starweft-store/4".to_owned(),
             bridge_capability_version: "openclaw.execution.v1".to_owned(),
             listen_addresses: 1,
             seed_peers: 0,
@@ -1105,6 +1156,8 @@ mod tests {
             active_projects: 0,
             running_tasks: 0,
             queued_outbox: 2,
+            retry_waiting_outbox: 1,
+            dead_letter_outbox: 0,
             inbox_unprocessed: 0,
             stop_orders: 0,
             snapshots: 0,
@@ -1135,6 +1188,7 @@ mod tests {
             cached_project_snapshots: 0,
             cached_task_snapshots: 0,
             queued_outbox_preview: vec![],
+            dead_letter_outbox_preview: vec![],
             latest_stop_id: None,
             latest_project_id: None,
             latest_project_status: None,
@@ -1177,13 +1231,13 @@ mod tests {
 
     #[test]
     fn status_compact_watch_summary_reports_compact_delta() {
-        let previous = "compact_summary: role=worker queued_outbox=2 running_tasks=0 inbox_unprocessed=0 stop_orders=0 latest_stop_id=none role_detail=assigned_tasks=3";
-        let current = "compact_summary: role=worker queued_outbox=0 running_tasks=0 inbox_unprocessed=0 stop_orders=1 latest_stop_id=stop_01 role_detail=assigned_tasks=3";
+        let previous = "compact_summary: role=worker queued_outbox=2 retry_waiting_outbox=1 dead_letter_outbox=0 running_tasks=0 inbox_unprocessed=0 stop_orders=0 latest_stop_id=none role_detail=assigned_tasks=3";
+        let current = "compact_summary: role=worker queued_outbox=0 retry_waiting_outbox=0 dead_letter_outbox=1 running_tasks=0 inbox_unprocessed=0 stop_orders=1 latest_stop_id=stop_01 role_detail=assigned_tasks=3";
 
         assert_eq!(
             render_status_compact_watch_summary(Some(previous), current),
             Some(
-                "compact_delta: role=worker queued_outbox=2 running_tasks=0 inbox_unprocessed=0 stop_orders=0 latest_stop_id=none role_detail=assigned_tasks=3 -> role=worker queued_outbox=0 running_tasks=0 inbox_unprocessed=0 stop_orders=1 latest_stop_id=stop_01 role_detail=assigned_tasks=3"
+                "compact_delta: role=worker queued_outbox=2 retry_waiting_outbox=1 dead_letter_outbox=0 running_tasks=0 inbox_unprocessed=0 stop_orders=0 latest_stop_id=none role_detail=assigned_tasks=3 -> role=worker queued_outbox=0 retry_waiting_outbox=0 dead_letter_outbox=1 running_tasks=0 inbox_unprocessed=0 stop_orders=1 latest_stop_id=stop_01 role_detail=assigned_tasks=3"
                     .to_owned()
             )
         );

@@ -16,27 +16,41 @@ mod watch;
 use anyhow::Result;
 use clap::Parser;
 use cli::*;
+use config::load_existing_config;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
-    init_tracing();
+    let cli = Cli::parse();
+    init_tracing(&resolve_log_filter(&cli));
 
-    if let Err(error) = run() {
+    if let Err(error) = run(cli) {
         eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
 
-fn init_tracing() {
+fn init_tracing(filter: &str) {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info")))
         .try_init();
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn resolve_log_filter(cli: &Cli) -> String {
+    match &cli.command {
+        Commands::Run(args) => {
+            if let Some(log_level) = args.log_level.as_deref() {
+                return log_level.to_owned();
+            }
+            if let Ok((config, _)) = load_existing_config(args.data_dir.as_ref()) {
+                return config.node.log_level;
+            }
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned())
+        }
+        _ => std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned()),
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init(args) => commands::run_init(args),
         Commands::Backup { command } => match command {
@@ -48,6 +62,7 @@ fn run() -> Result<()> {
                 commands::run_repair_rebuild_projections(args)
             }
             RepairCommands::ResumeOutbox(args) => commands::run_repair_resume_outbox(args),
+            RepairCommands::ListDeadLetters(args) => commands::run_repair_list_dead_letters(args),
             RepairCommands::ReconcileRunningTasks(args) => {
                 commands::run_repair_reconcile_running_tasks(args)
             }

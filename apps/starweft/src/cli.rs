@@ -87,6 +87,7 @@ pub(crate) enum BackupCommands {
 pub(crate) enum RepairCommands {
     RebuildProjections(CommonDataDirArgs),
     ResumeOutbox(CommonDataDirArgs),
+    ListDeadLetters(RepairListDeadLettersArgs),
     ReconcileRunningTasks(CommonDataDirArgs),
 }
 
@@ -127,6 +128,16 @@ pub(crate) enum TaskCommands {
 pub(crate) struct CommonDataDirArgs {
     #[arg(long)]
     pub(crate) data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RepairListDeadLettersArgs {
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 20)]
+    pub(crate) limit: usize,
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -393,6 +404,14 @@ pub(crate) struct RegistryServeArgs {
     pub(crate) shared_secret: Option<String>,
     #[arg(long)]
     pub(crate) shared_secret_env: Option<String>,
+    #[arg(long, default_value_t = 65_536)]
+    pub(crate) max_body_bytes: usize,
+    #[arg(long, default_value_t = 5_000)]
+    pub(crate) read_timeout_ms: u64,
+    #[arg(long, default_value_t = 5_000)]
+    pub(crate) write_timeout_ms: u64,
+    #[arg(long)]
+    pub(crate) allow_insecure_no_auth: bool,
 }
 
 #[derive(Debug, Subcommand)]

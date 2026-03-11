@@ -250,7 +250,7 @@ impl Default for CompatibilitySection {
     fn default() -> Self {
         Self {
             protocol_version: "starweft/0.1".to_owned(),
-            schema_version: "starweft-store/1".to_owned(),
+            schema_version: starweft_store::STORE_SCHEMA_VERSION_LABEL.to_owned(),
             bridge_capability_version: "openclaw.execution.v1".to_owned(),
             allow_legacy_protocols: false,
         }
@@ -357,8 +357,19 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes =
             std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(std::str::from_utf8(&bytes)?)
-            .with_context(|| format!("failed to parse {}", path.display()))
+        let mut config: Self = toml::from_str(std::str::from_utf8(&bytes)?)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        normalize_schema_version_label(&mut config);
+        Ok(config)
+    }
+
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut redacted = self.clone();
+        if redacted.discovery.registry_shared_secret.is_some() {
+            redacted.discovery.registry_shared_secret = Some("<redacted>".to_owned());
+        }
+        redacted
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -367,7 +378,10 @@ impl Config {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+        std::fs::write(path, text)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        set_private_file_permissions(path)?;
+        Ok(())
     }
 }
 
@@ -440,6 +454,7 @@ impl DataPaths {
         ] {
             std::fs::create_dir_all(directory)
                 .with_context(|| format!("failed to create {}", directory.display()))?;
+            set_private_directory_permissions(directory)?;
         }
         Ok(())
     }
@@ -469,4 +484,133 @@ pub fn expand_home(path: &Path) -> Result<PathBuf> {
         return Ok(home.join(stripped));
     }
     Ok(path.to_path_buf())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set private permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    set_private_permissions(path, 0o600)
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    set_private_permissions(path, 0o700)
+}
+
+fn normalize_schema_version_label(config: &mut Config) {
+    let Some(version) = config
+        .compatibility
+        .schema_version
+        .strip_prefix("starweft-store/")
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return;
+    };
+    if version <= starweft_store::STORE_SCHEMA_VERSION {
+        config.compatibility.schema_version = starweft_store::STORE_SCHEMA_VERSION_LABEL.to_owned();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn redacted_masks_inline_registry_secret() {
+        let mut config = Config::for_role(NodeRole::Worker, Path::new("/tmp/starweft"), None);
+        config.discovery.registry_shared_secret = Some("super-secret".to_owned());
+
+        let redacted = config.redacted();
+
+        assert_eq!(
+            redacted.discovery.registry_shared_secret.as_deref(),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            config.discovery.registry_shared_secret.as_deref(),
+            Some("super-secret")
+        );
+    }
+
+    #[test]
+    fn load_normalizes_older_schema_version_label() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[node]
+role = "worker"
+display_name = "worker-node"
+data_dir = "/tmp/starweft"
+listen = ["/unix//tmp/starweft/mailbox.sock"]
+log_level = "info"
+
+[identity]
+actor_key_path = "/tmp/starweft/identity/actor_key"
+stop_authority_key_path = ""
+
+[compatibility]
+protocol_version = "starweft/0.1"
+schema_version = "starweft-store/1"
+bridge_capability_version = "openclaw.execution.v1"
+allow_legacy_protocols = false
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load(&path).expect("load config");
+        assert_eq!(
+            config.compatibility.schema_version,
+            starweft_store::STORE_SCHEMA_VERSION_LABEL
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_and_layout_use_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("node");
+        let paths = DataPaths::from_root(&root);
+        let config = Config::for_role(NodeRole::Worker, &root, None);
+
+        paths.ensure_layout().expect("layout");
+        config.save(&paths.config_toml).expect("save config");
+
+        let config_mode = std::fs::metadata(&paths.config_toml)
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(config_mode, 0o600);
+
+        for directory in [
+            &paths.root,
+            &paths.identity_dir,
+            &paths.artifacts_dir,
+            &paths.logs_dir,
+            &paths.cache_dir,
+            paths.ledger_db.parent().expect("ledger parent"),
+        ] {
+            let mode = std::fs::metadata(directory)
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "unexpected mode for {}", directory.display());
+        }
+    }
 }

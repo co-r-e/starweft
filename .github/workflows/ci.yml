@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -38,3 +39,64 @@ jobs:
 
       - name: Build docs
         run: cargo doc --no-deps
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.87.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  release:
+    name: Release Artifact (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ci, security]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.87.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p starweft
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE="starweft-${VERSION}-${RUNNER_OS}.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/${ARCHIVE}" -C target/release starweft
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${ARCHIVE}" > "dist/${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "dist/${ARCHIVE}" > "dist/${ARCHIVE}.sha256"
+          fi
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: starweft-${{ github.ref_name }}-${{ matrix.os }}
+          path: dist/*
