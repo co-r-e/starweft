@@ -95,9 +95,12 @@ pub enum P2pTransportKind {
 impl Default for P2pTransportKind {
     fn default() -> Self {
         // Unix: file-based local mailbox; Windows: TCP localhost via libp2p
-        if cfg!(unix) {
+        #[cfg(unix)]
+        {
             Self::LocalMailbox
-        } else {
+        }
+        #[cfg(not(unix))]
+        {
             Self::Libp2p
         }
     }
@@ -540,7 +543,7 @@ fn set_private_permissions(path: &Path, _mode: u32) -> Result<()> {
                 SetFileAttributesW,
             };
             let attrs = GetFileAttributesW(wide.as_ptr());
-            if attrs != INVALID_FILE_ATTRIBUTES {
+            if attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_HIDDEN == 0) {
                 let _ = SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN);
             }
         }

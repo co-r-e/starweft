@@ -109,8 +109,8 @@ fn execute_task_inner(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP so we can terminate the tree later
-        command.creation_flags(0x0000_0200);
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
     if let Some(working_dir) = &attachment.working_dir {
@@ -122,8 +122,8 @@ fn execute_task_inner(
     let _job_guard = win_job::assign_to_job(&child);
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(serde_json::to_vec(request)?.as_slice())?;
+        // stdin is dropped here, sending EOF to the child
     }
-    drop(child.stdin.take());
 
     let stdout_reader = child.stdout.take().map(spawn_stream_reader);
     let stderr_reader = child.stderr.take().map(spawn_stream_reader);

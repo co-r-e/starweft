@@ -15,10 +15,10 @@ use crate::config::NodeRole;
 )]
 pub(crate) struct Cli {
     /// ログ出力を増やす (-v: debug, -vv: trace)
-    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count, conflicts_with = "quiet")]
     pub(crate) verbose: u8,
     /// ログ出力を減らす (-q: warn, -qq: error)
-    #[arg(short = 'q', long = "quiet", global = true, action = clap::ArgAction::Count)]
+    #[arg(short = 'q', long = "quiet", global = true, action = clap::ArgAction::Count, conflicts_with = "verbose")]
     pub(crate) quiet: u8,
     #[command(subcommand)]
     pub(crate) command: Commands,

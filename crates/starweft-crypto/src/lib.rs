@@ -113,6 +113,17 @@ impl StoredKeypair {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Clear read-only before overwrite (Windows sets read-only for protection).
+        // On Unix, set_private_permissions uses mode 0o600, not readonly, so this
+        // branch only activates on Windows where readonly was previously set.
+        #[allow(clippy::permissions_set_readonly_false)]
+        if path.exists() {
+            let mut perms = std::fs::metadata(path)?.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                std::fs::set_permissions(path, perms)?;
+            }
+        }
         std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
         set_private_permissions(path)?;
         Ok(())
