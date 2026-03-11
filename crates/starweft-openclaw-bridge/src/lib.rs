@@ -306,7 +306,7 @@ mod win_job {
     pub(crate) fn assign_to_job(child: &Child) -> Option<JobGuard> {
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job == INVALID_HANDLE_VALUE || job == 0 {
+            if job == INVALID_HANDLE_VALUE || job.is_null() {
                 return None;
             }
 
