@@ -293,6 +293,7 @@ impl TransportDriver for LocalMailboxTransport {
             .append(true)
             .open(&mailbox_path)?;
         writeln!(file, "{payload}")?;
+        file.sync_data()?;
         Ok(Some(DeliveryReport {
             target: mailbox_path.display().to_string(),
         }))

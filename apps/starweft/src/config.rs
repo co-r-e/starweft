@@ -220,7 +220,7 @@ fn default_owner_retry_rules() -> Vec<OwnerRetryRule> {
             reason: "transient execution failure".to_owned(),
         },
         OwnerRetryRule {
-            pattern: "stderr".to_owned(),
+            pattern: "worker unavailable".to_owned(),
             action: OwnerRetryAction::RetryDifferentWorker,
             reason: "transient execution failure".to_owned(),
         },

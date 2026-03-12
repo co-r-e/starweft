@@ -350,18 +350,6 @@ pub(crate) fn run_peer_add(args: PeerAddArgs) -> Result<()> {
     let (mut config, paths) = load_existing_config(args.data_dir.as_ref())?;
     let store = Store::open(&paths.ledger_db)?;
     parse_multiaddr(&args.multiaddr)?;
-    let existing_peers = store.list_peer_addresses()?;
-    if !existing_peers
-        .iter()
-        .any(|peer| peer.multiaddr == args.multiaddr)
-        && existing_peers.len() >= usize::from(config.p2p.max_peers)
-    {
-        bail!(
-            "[E_PEER_LIMIT] peer 上限に達しています: configured={} current={}",
-            config.p2p.max_peers,
-            existing_peers.len()
-        );
-    }
 
     let peer_suffix = extract_peer_suffix(&args.multiaddr);
     let actor_id = match args.actor_id {
@@ -372,6 +360,18 @@ pub(crate) fn run_peer_add(args: PeerAddArgs) -> Result<()> {
         Some(node_id) => NodeId::new(node_id)?,
         None => NodeId::new(format!("node_peer_{peer_suffix}"))?,
     };
+
+    let existing_peers = store.list_peer_addresses()?;
+    let is_existing = existing_peers.iter().any(|peer| {
+        peer.actor_id == actor_id && peer.node_id == node_id && peer.multiaddr == args.multiaddr
+    });
+    if !is_existing && existing_peers.len() >= usize::from(config.p2p.max_peers) {
+        bail!(
+            "[E_PEER_LIMIT] peer 上限に達しています: configured={} current={}",
+            config.p2p.max_peers,
+            existing_peers.len()
+        );
+    }
     store.add_peer_address(&PeerAddressRecord {
         actor_id: actor_id.clone(),
         node_id: node_id.clone(),

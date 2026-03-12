@@ -98,13 +98,20 @@ pub(crate) struct ReadyStopCompletion {
 }
 
 impl WorkerRuntimeState {
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, WorkerRuntimeInner> {
+        self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("WorkerRuntimeState mutex was poisoned; recovering");
+            e.into_inner()
+        })
+    }
+
     pub(crate) fn register_task(&self, task_id: &TaskId, cancel_flag: Arc<AtomicBool>) {
-        let mut inner = self.inner.lock().expect("worker runtime state");
+        let mut inner = self.lock_inner();
         inner.running_tasks.insert(task_id.to_string(), cancel_flag);
     }
 
     pub(crate) fn cancel_tasks(&self, task_ids: &[TaskId]) -> Vec<TaskId> {
-        let inner = self.inner.lock().expect("worker runtime state");
+        let inner = self.lock_inner();
         let mut running = Vec::new();
         for task_id in task_ids {
             if let Some(cancel_flag) = inner.running_tasks.get(task_id.as_str()) {
@@ -116,7 +123,7 @@ impl WorkerRuntimeState {
     }
 
     pub(crate) fn has_pending_stop_for(&self, task_id: &TaskId) -> bool {
-        let inner = self.inner.lock().expect("worker runtime state");
+        let inner = self.lock_inner();
         inner
             .pending_stops
             .values()
@@ -134,7 +141,7 @@ impl WorkerRuntimeState {
             return;
         }
 
-        let mut inner = self.inner.lock().expect("worker runtime state");
+        let mut inner = self.lock_inner();
         let entry = inner
             .pending_stops
             .entry(stop_id.to_string())
@@ -150,7 +157,7 @@ impl WorkerRuntimeState {
     }
 
     pub(crate) fn complete_task(&self, task_id: &TaskId) -> Vec<ReadyStopCompletion> {
-        let mut inner = self.inner.lock().expect("worker runtime state");
+        let mut inner = self.lock_inner();
         inner.running_tasks.remove(task_id.as_str());
 
         let mut ready_ids = Vec::new();
@@ -865,7 +872,16 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
             runtime.ingest_snapshot_response(&envelope)?;
         }
         MsgType::StopOrder => {
-            let stop_key = peer_identity.stop_public_key.as_deref().unwrap_or(pk);
+            let stop_key = match peer_identity.stop_public_key.as_deref() {
+                Some(key) => key,
+                None => {
+                    tracing::warn!(
+                        from_actor = %wire.from_actor_id,
+                        "stop_public_key が未設定のため message signing key で StopOrder を検証します"
+                    );
+                    pk
+                }
+            };
             let envelope = verify_and_decode::<StopOrder>(wire, stop_key)?;
             match ctx.config.node.role {
                 NodeRole::Owner => {

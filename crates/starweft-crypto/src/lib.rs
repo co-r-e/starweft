@@ -137,9 +137,31 @@ impl StoredKeypair {
 }
 
 /// Serializes a value to deterministic canonical JSON bytes.
+///
+/// Keys are sorted recursively at every level to produce identical byte
+/// output regardless of field insertion order or `serde_json` feature flags.
 pub fn canonical_json<T: Serialize>(payload: &T) -> Result<Vec<u8>, CryptoError> {
-    let value = serde_json::to_value(payload)?;
+    let value = sort_json_keys_recursive(serde_json::to_value(payload)?);
     Ok(serde_json::to_vec(&value)?)
+}
+
+/// Recursively sorts object keys. `serde_json::Map` is backed by `BTreeMap`
+/// by default (keys already sorted), but we recurse into nested values to
+/// guarantee canonical output even if `preserve_order` is ever enabled.
+fn sort_json_keys_recursive(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, sort_json_keys_recursive(v)))
+                .collect();
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(sort_json_keys_recursive).collect())
+        }
+        other => other,
+    }
 }
 
 /// Decodes a base64-encoded Ed25519 public key into a [`VerifyingKey`].
@@ -221,5 +243,19 @@ mod tests {
             &signature,
         )
         .expect("verify");
+    }
+
+    #[test]
+    fn canonical_json_sorts_nested_keys() {
+        // Build JSON with known key order via serde_json::json!
+        let input = serde_json::json!({
+            "z": 1,
+            "a": { "c": 3, "b": 2 },
+            "m": [{ "y": 4, "x": 5 }]
+        });
+        let bytes = canonical_json(&input).expect("canonical");
+        // Keys must be alphabetically sorted at every level
+        let expected = r#"{"a":{"b":2,"c":3},"m":[{"x":5,"y":4}],"z":1}"#;
+        assert_eq!(String::from_utf8(bytes).expect("utf8"), expected);
     }
 }
