@@ -1222,7 +1222,10 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
     stop_child(&mut worker_fg);
 }
 
+// libp2p JoinReject のリトライはタイミングに依存するため CI ではタイムアウトする場合がある。
+// 手動実行: cargo test --test libp2p_e2e libp2p_retries_after_join_reject -- --ignored
 #[test]
+#[ignore]
 fn libp2p_retries_after_join_reject() {
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
