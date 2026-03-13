@@ -1,63 +1,18 @@
 // E2E テストは OpenClaw mock シェルスクリプトに依存するため Unix のみ
 #![cfg(unix)]
 
-use std::collections::HashMap;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+mod common;
+
+use std::path::Path;
+use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use common::{
+    parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run, spawn_foreground,
+    stop_child, test_lock, wait_for_contains,
+};
 use tempfile::TempDir;
-
-fn starweft_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_starweft"))
-}
-
-fn run(args: &[&str]) -> String {
-    let output = Command::new(starweft_bin())
-        .args(args)
-        .output()
-        .expect("run command");
-    if !output.status.success() {
-        panic!(
-            "command failed: {:?}\nstdout:\n{}\nstderr:\n{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8(output.stdout).expect("utf8 stdout")
-}
-
-fn spawn_foreground(args: &[&str]) -> Child {
-    Command::new(starweft_bin())
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn foreground process")
-}
-
-fn stop_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn parse_keyed_output(stdout: &str) -> HashMap<String, String> {
-    stdout
-        .lines()
-        .filter_map(|line| line.split_once(": "))
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
-}
-
-fn replace_transport_with_libp2p(config_path: &Path) {
-    let config = std::fs::read_to_string(config_path).expect("read config");
-    let updated = config.replace("transport = \"local_mailbox\"", "transport = \"libp2p\"");
-    std::fs::write(config_path, updated).expect("write config");
-}
 
 fn set_worker_accept_join_offers(config_path: &Path, accept: bool) {
     let config = std::fs::read_to_string(config_path).expect("read config");
@@ -171,38 +126,6 @@ esac
     let mut perms = std::fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).expect("chmod");
-}
-
-fn wait_for_contains(path: &Path, sql: &str, needle: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let output = Command::new("sqlite3")
-            .arg(path)
-            .arg(sql)
-            .output()
-            .expect("sqlite3");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains(needle) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {needle} in sqlite query {sql}");
-}
-
-fn reserve_tcp_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
-fn test_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 #[test]
@@ -335,26 +258,33 @@ fn libp2p_three_node_workflow_and_stop() {
         owner_dir.to_str().expect("path"),
     ]);
 
-    let mut owner_fg = spawn_foreground(&[
-        "run",
-        "--data-dir",
-        owner_dir.to_str().expect("path"),
-        "--foreground",
-    ]);
     let mut worker_fg = spawn_foreground(&[
         "run",
         "--data-dir",
         worker_dir.to_str().expect("path"),
         "--foreground",
     ]);
+    thread::sleep(Duration::from_secs(2));
+    let mut owner_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.execution.v1",
+        Duration::from_secs(30),
+    );
     let mut principal_fg = spawn_foreground(&[
         "run",
         "--data-dir",
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(1));
 
     run(&[
         "vision",
@@ -369,7 +299,6 @@ fn libp2p_three_node_workflow_and_stop() {
         &owner["actor_id"],
     ]);
 
-    let owner_db = owner_dir.join("ledger").join("node.db");
     let principal_db = principal_dir.join("ledger").join("node.db");
     let worker_db = worker_dir.join("ledger").join("node.db");
     wait_for_contains(
@@ -483,10 +412,7 @@ fn libp2p_three_node_workflow_and_stop() {
     stop_child(&mut worker_fg);
 }
 
-// OpenClaw サブプロセスに依存するため CI 環境ではタイムアウトする。
-// 手動実行: cargo test --test libp2p_e2e libp2p_worker_plans_vision_via_openclaw -- --ignored
 #[test]
-#[ignore]
 fn libp2p_worker_plans_vision_via_openclaw() {
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
@@ -1109,20 +1035,30 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
         worker_dir.to_str().expect("path"),
         "--foreground",
     ]);
+    thread::sleep(Duration::from_secs(2));
     let mut owner_fg = spawn_foreground(&[
         "run",
         "--data-dir",
         owner_dir.to_str().expect("path"),
         "--foreground",
     ]);
+
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    let principal_db = principal_dir.join("ledger").join("node.db");
+    let worker_db = worker_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.execution.v1",
+        Duration::from_secs(30),
+    );
     let mut principal_fg = spawn_foreground(&[
         "run",
         "--data-dir",
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(1));
     run(&[
         "vision",
         "submit",
@@ -1136,9 +1072,6 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
         &owner["actor_id"],
     ]);
 
-    let owner_db = owner_dir.join("ledger").join("node.db");
-    let principal_db = principal_dir.join("ledger").join("node.db");
-    let worker_db = worker_dir.join("ledger").join("node.db");
     wait_for_contains(
         &worker_db,
         "select status from tasks;",
@@ -1222,10 +1155,7 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
     stop_child(&mut worker_fg);
 }
 
-// libp2p JoinReject のリトライはタイミングに依存するため CI ではタイムアウトする場合がある。
-// 手動実行: cargo test --test libp2p_e2e libp2p_retries_after_join_reject -- --ignored
 #[test]
-#[ignore]
 fn libp2p_retries_after_join_reject() {
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
@@ -1680,25 +1610,33 @@ fn libp2p_worker_executes_via_openclaw_bridge() {
         &owner["public_key"],
     ]);
 
-    let mut owner_fg = spawn_foreground(&[
-        "run",
-        "--data-dir",
-        owner_dir.to_str().expect("path"),
-        "--foreground",
-    ]);
     let mut worker_fg = spawn_foreground(&[
         "run",
         "--data-dir",
         worker_dir.to_str().expect("path"),
         "--foreground",
     ]);
+    thread::sleep(Duration::from_secs(2));
+    let mut owner_fg = spawn_foreground(&[
+        "run",
+        "--data-dir",
+        owner_dir.to_str().expect("path"),
+        "--foreground",
+    ]);
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.execution.v1",
+        Duration::from_secs(30),
+    );
     let mut principal_fg = spawn_foreground(&[
         "run",
         "--data-dir",
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(1));
 
     run(&[
         "vision",
@@ -1713,7 +1651,6 @@ fn libp2p_worker_executes_via_openclaw_bridge() {
         &owner["actor_id"],
     ]);
 
-    let owner_db = owner_dir.join("ledger").join("node.db");
     wait_for_contains(
         &owner_db,
         "select output_payload_json from task_results;",

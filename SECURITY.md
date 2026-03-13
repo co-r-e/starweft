@@ -49,3 +49,7 @@ We request that you give us reasonable time to address reported vulnerabilities 
 
 - **Email:** [contact@co-r-e.com](mailto:contact@co-r-e.com)
 - **Contact form:** [https://co-r-e.com/contact](https://co-r-e.com/contact)
+
+## Operations
+
+Operational security guidance for secrets, key rotation, and TLS termination lives in `docs/security/operations.md`.

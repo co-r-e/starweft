@@ -1,80 +1,34 @@
 // Relay E2E テストは local_mailbox transport を使用するため Unix のみ
 #![cfg(unix)]
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+mod common;
+
+use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use common::{
+    parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run, spawn_foreground,
+    stop_child, test_lock, wait_for_contains, wait_for_file_contains,
+};
 use tempfile::TempDir;
-
-fn starweft_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_starweft"))
-}
-
-fn run(args: &[&str]) -> String {
-    let output = Command::new(starweft_bin())
-        .args(args)
-        .output()
-        .expect("run command");
-    if !output.status.success() {
-        panic!(
-            "command failed: {:?}\nstdout:\n{}\nstderr:\n{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8(output.stdout).expect("utf8 stdout")
-}
-
-fn spawn_foreground(args: &[&str]) -> Child {
-    Command::new(starweft_bin())
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn foreground process")
-}
-
-fn stop_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn parse_keyed_output(stdout: &str) -> HashMap<String, String> {
-    stdout
-        .lines()
-        .filter_map(|line| line.split_once(": "))
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect()
-}
-
-fn wait_for_contains(path: &Path, sql: &str, needle: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let output = Command::new("sqlite3")
-            .arg(path)
-            .arg(sql)
-            .output()
-            .expect("sqlite3");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains(needle) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {needle} in sqlite query {sql}");
-}
 
 #[test]
 fn local_mailbox_relay_forwards_vision_and_charter() {
+    let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
     let principal_dir = base.join("principal");
     let relay_dir = base.join("relay");
     let owner_dir = base.join("owner");
+    let unique = base
+        .file_name()
+        .expect("tempdir name")
+        .to_string_lossy()
+        .into_owned();
+    let principal_socket = format!("/unix/principal-{unique}.sock");
+    let relay_socket = format!("/unix/relay-{unique}.sock");
+    let owner_socket = format!("/unix/owner-{unique}.sock");
 
     run(&[
         "init",
@@ -83,7 +37,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         "--data-dir",
         principal_dir.to_str().expect("path"),
         "--listen",
-        "/unix/principal.sock",
+        &principal_socket,
     ]);
     run(&[
         "init",
@@ -92,7 +46,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         "--data-dir",
         relay_dir.to_str().expect("path"),
         "--listen",
-        "/unix/relay.sock",
+        &relay_socket,
     ]);
     run(&[
         "init",
@@ -101,7 +55,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         "--data-dir",
         owner_dir.to_str().expect("path"),
         "--listen",
-        "/unix/owner.sock",
+        &owner_socket,
     ]);
     run(&[
         "identity",
@@ -132,7 +86,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
     run(&[
         "peer",
         "add",
-        "/unix/relay.sock",
+        &relay_socket,
         "--data-dir",
         principal_dir.to_str().expect("path"),
         "--actor-id",
@@ -145,7 +99,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
     run(&[
         "peer",
         "add",
-        "/unix/principal.sock",
+        &principal_socket,
         "--data-dir",
         relay_dir.to_str().expect("path"),
         "--actor-id",
@@ -160,7 +114,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
     run(&[
         "peer",
         "add",
-        "/unix/owner.sock",
+        &owner_socket,
         "--data-dir",
         relay_dir.to_str().expect("path"),
         "--actor-id",
@@ -173,7 +127,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
     run(&[
         "peer",
         "add",
-        "/unix/relay.sock",
+        &relay_socket,
         "--data-dir",
         owner_dir.to_str().expect("path"),
         "--actor-id",
@@ -205,7 +159,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         "--foreground",
     ]);
 
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_secs(2));
     run(&[
         "vision",
         "submit",
@@ -225,13 +179,13 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         &owner_db,
         "select title from projects;",
         "Relay Vision project",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
     wait_for_contains(
         &principal_db,
         "select title from projects;",
         "Relay Vision project",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
     let project_id = String::from_utf8(
         Command::new("sqlite3")
@@ -266,7 +220,7 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         &principal_db,
         "select scope_id from snapshots;",
         &project_id,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     run(&[
@@ -285,13 +239,13 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         &principal_db,
         "select ack_state from stop_receipts;",
         "stopped",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
     wait_for_contains(
         &owner_db,
         "select status from projects;",
         "stopped",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     stop_child(&mut principal_fg);
@@ -299,16 +253,17 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
     stop_child(&mut relay_fg);
 }
 
-// libp2p relay 転送はタイミングに依存するため CI ではタイムアウトする場合がある。
-// 手動実行: cargo test --test relay_e2e libp2p_relay_forwards_vision_and_charter -- --ignored
 #[test]
-#[ignore]
 fn libp2p_relay_forwards_vision_and_charter() {
+    let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
     let principal_dir = base.join("principal");
     let relay_dir = base.join("relay");
     let owner_dir = base.join("owner");
+    let principal_port = reserve_tcp_port();
+    let relay_port = reserve_tcp_port();
+    let owner_port = reserve_tcp_port();
 
     run(&[
         "init",
@@ -317,7 +272,7 @@ fn libp2p_relay_forwards_vision_and_charter() {
         "--data-dir",
         principal_dir.to_str().expect("path"),
         "--listen",
-        "/ip4/127.0.0.1/tcp/4501",
+        &format!("/ip4/127.0.0.1/tcp/{principal_port}"),
     ]);
     run(&[
         "init",
@@ -326,7 +281,7 @@ fn libp2p_relay_forwards_vision_and_charter() {
         "--data-dir",
         relay_dir.to_str().expect("path"),
         "--listen",
-        "/ip4/127.0.0.1/tcp/4502",
+        &format!("/ip4/127.0.0.1/tcp/{relay_port}"),
     ]);
     run(&[
         "init",
@@ -335,7 +290,7 @@ fn libp2p_relay_forwards_vision_and_charter() {
         "--data-dir",
         owner_dir.to_str().expect("path"),
         "--listen",
-        "/ip4/127.0.0.1/tcp/4503",
+        &format!("/ip4/127.0.0.1/tcp/{owner_port}"),
     ]);
     run(&[
         "identity",
@@ -361,9 +316,7 @@ fn libp2p_relay_forwards_vision_and_charter() {
         relay_dir.join("config.toml"),
         owner_dir.join("config.toml"),
     ] {
-        let config = std::fs::read_to_string(&path).expect("read config");
-        let updated = config.replace("transport = \"local_mailbox\"", "transport = \"libp2p\"");
-        std::fs::write(&path, updated).expect("write config");
+        replace_transport_with_libp2p(&path);
     }
 
     let principal = parse_keyed_output(&run(&[
@@ -388,7 +341,10 @@ fn libp2p_relay_forwards_vision_and_charter() {
     run(&[
         "peer",
         "add",
-        &format!("/ip4/127.0.0.1/tcp/4502/p2p/{}", relay["libp2p_peer_id"]),
+        &format!(
+            "/ip4/127.0.0.1/tcp/{relay_port}/p2p/{}",
+            relay["libp2p_peer_id"]
+        ),
         "--data-dir",
         principal_dir.to_str().expect("path"),
         "--actor-id",
@@ -402,7 +358,7 @@ fn libp2p_relay_forwards_vision_and_charter() {
         "peer",
         "add",
         &format!(
-            "/ip4/127.0.0.1/tcp/4501/p2p/{}",
+            "/ip4/127.0.0.1/tcp/{principal_port}/p2p/{}",
             principal["libp2p_peer_id"]
         ),
         "--data-dir",
@@ -419,7 +375,10 @@ fn libp2p_relay_forwards_vision_and_charter() {
     run(&[
         "peer",
         "add",
-        &format!("/ip4/127.0.0.1/tcp/4503/p2p/{}", owner["libp2p_peer_id"]),
+        &format!(
+            "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
+            owner["libp2p_peer_id"]
+        ),
         "--data-dir",
         relay_dir.to_str().expect("path"),
         "--actor-id",
@@ -432,7 +391,10 @@ fn libp2p_relay_forwards_vision_and_charter() {
     run(&[
         "peer",
         "add",
-        &format!("/ip4/127.0.0.1/tcp/4502/p2p/{}", relay["libp2p_peer_id"]),
+        &format!(
+            "/ip4/127.0.0.1/tcp/{relay_port}/p2p/{}",
+            relay["libp2p_peer_id"]
+        ),
         "--data-dir",
         owner_dir.to_str().expect("path"),
         "--actor-id",
@@ -464,7 +426,8 @@ fn libp2p_relay_forwards_vision_and_charter() {
         "--foreground",
     ]);
 
-    thread::sleep(Duration::from_secs(4));
+    let relay_runtime_log = relay_dir.join("logs").join("relay.log");
+    wait_for_file_contains(&relay_runtime_log, "queued relay", Duration::from_secs(30));
     run(&[
         "vision",
         "submit",
@@ -484,13 +447,13 @@ fn libp2p_relay_forwards_vision_and_charter() {
         &owner_db,
         "select title from projects;",
         "Libp2p Relay Vision project",
-        Duration::from_secs(40),
+        Duration::from_secs(60),
     );
     wait_for_contains(
         &principal_db,
         "select title from projects;",
         "Libp2p Relay Vision project",
-        Duration::from_secs(40),
+        Duration::from_secs(60),
     );
     let project_id = String::from_utf8(
         Command::new("sqlite3")

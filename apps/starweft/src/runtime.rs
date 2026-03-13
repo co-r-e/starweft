@@ -479,6 +479,7 @@ pub(crate) fn flush_outbox(
                 OUTBOX_MAX_DELIVERY_ATTEMPTS,
             )?;
             write_runtime_log(
+                config,
                 &p2p_log,
                 &format!(
                     "delivery_state_changed {} {} attempts={} reason=no_targets",
@@ -498,6 +499,7 @@ pub(crate) fn flush_outbox(
                         &target.multiaddr,
                     )?;
                     write_runtime_log(
+                        config,
                         &p2p_log,
                         &format!(
                             "delivered {} to {} aggregate_state={}",
@@ -516,6 +518,7 @@ pub(crate) fn flush_outbox(
                         OUTBOX_MAX_DELIVERY_ATTEMPTS,
                     )?;
                     write_runtime_log(
+                        config,
                         &p2p_log,
                         &format!(
                             "delivery_failed {} {}: {error} aggregate_state={state}",
@@ -533,6 +536,7 @@ pub(crate) fn flush_outbox(
                         OUTBOX_MAX_DELIVERY_ATTEMPTS,
                     )?;
                     write_runtime_log(
+                        config,
                         &p2p_log,
                         &format!(
                             "delivery_failed {} {}: {error} aggregate_state={state}",
@@ -563,50 +567,25 @@ pub(crate) fn resolve_delivery_targets(
     filter_delivery_targets(config, targets)
 }
 
-pub(crate) fn resolve_relay_targets(
-    config: &Config,
-    envelope: &WireEnvelope,
-    peers: &[PeerAddressRecord],
-) -> Vec<PeerAddressRecord> {
-    let targets = match &envelope.to_actor_id {
-        Some(actor_id) => peers
-            .iter()
-            .filter(|peer| &peer.actor_id == actor_id && peer.actor_id != envelope.from_actor_id)
-            .cloned()
-            .collect(),
-        None => peers
-            .iter()
-            .filter(|peer| peer.actor_id != envelope.from_actor_id)
-            .cloned()
-            .collect(),
-    };
-    filter_delivery_targets(config, targets)
-}
-
 pub(crate) fn relay_incoming_wire(
     config: &Config,
     paths: &DataPaths,
     store: &Store,
-    transport: &RuntimeTransport,
+    _transport: &RuntimeTransport,
     wire: &WireEnvelope,
 ) -> Result<()> {
     if !config.p2p.relay_enabled {
         return Ok(());
     }
-    let peers = store.list_peer_addresses()?;
-    let targets = resolve_relay_targets(config, wire, &peers);
-    let payload = serde_json::to_string(wire)?;
-    let relay_log = paths.logs_dir.join("relay.log");
-    for target in targets {
-        if let Some(delivery) =
-            transport.deliver(&target.multiaddr.parse::<Multiaddr>()?, &payload)?
-        {
-            write_runtime_log(
-                &relay_log,
-                &format!("relayed {} to {}", wire.msg_id, delivery.target),
-            )?;
-        }
+    store.save_inbox_wire(wire)?;
+    if store.inbox_message_processed(&wire.msg_id)? {
+        return Ok(());
     }
+    let relay_log = paths.logs_dir.join("relay.log");
+    let runtime = RuntimePipeline::new(store);
+    runtime.queue_raw_wire(wire)?;
+    runtime.mark_inbox_message_processed(&wire.msg_id)?;
+    write_runtime_log(config, &relay_log, &format!("queued relay {}", wire.msg_id))?;
     Ok(())
 }
 
@@ -1464,6 +1443,7 @@ pub(crate) fn process_completed_tasks(
         if config.openclaw.enabled {
             if !completion.bridge_response.raw_stdout.trim().is_empty() {
                 write_runtime_log(
+                    config,
                     &bridge_log,
                     &format!(
                         "task_id={} stdout={}",
@@ -1474,6 +1454,7 @@ pub(crate) fn process_completed_tasks(
             }
             if !completion.bridge_response.raw_stderr.trim().is_empty() {
                 write_runtime_log(
+                    config,
                     &bridge_log,
                     &format!(
                         "task_id={} stderr={}",
@@ -1515,6 +1496,7 @@ pub(crate) fn process_completed_tasks(
 
         // Persist artifact
         let persisted_artifact = persist_task_artifact(
+            config,
             &data_paths,
             &completion.task_id,
             &completion.bridge_response.output_payload,
@@ -3438,6 +3420,43 @@ mod tests {
             envelope.into_wire().expect("wire"),
         )
         .expect("duplicate should short-circuit");
+    }
+
+    #[test]
+    fn relay_incoming_wire_queues_raw_wire_once_for_retryable_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let config = Config::for_role(NodeRole::Relay, temp.path(), None);
+        let paths = DataPaths::from_root(temp.path());
+        paths.ensure_layout().expect("layout");
+        let transport = RuntimeTransport::local_mailbox();
+        let envelope = UnsignedEnvelope::new(
+            ActorId::generate(),
+            Some(ActorId::generate()),
+            ApprovalGranted {
+                scope_type: ApprovalScopeType::Project,
+                scope_id: "project_01".to_owned(),
+                approved_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .sign(&StoredKeypair::generate())
+        .expect("sign envelope");
+        let wire = envelope.into_wire().expect("wire");
+
+        relay_incoming_wire(&config, &paths, &store, &transport, &wire).expect("queue relay");
+        relay_incoming_wire(&config, &paths, &store, &transport, &wire)
+            .expect("duplicate relay should short-circuit");
+
+        assert!(
+            store
+                .inbox_message_processed(&wire.msg_id)
+                .expect("processed state"),
+            "relay inbox should be marked processed after queuing"
+        );
+        let queued = store.queued_outbox_messages(10).expect("queued outbox");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].msg_id, wire.msg_id.to_string());
+        assert_eq!(queued[0].msg_type, "ApprovalGranted");
     }
 
     #[test]

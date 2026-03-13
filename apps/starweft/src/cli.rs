@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use starweft_id::{ProjectId, TaskId};
 use starweft_protocol::{RoutedBody, StopScopeType, UnsignedEnvelope};
@@ -67,6 +67,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: RegistryCommands,
     },
+    Metrics(MetricsArgs),
     Logs(LogsArgs),
     Events(EventsArgs),
     Project {
@@ -536,10 +537,32 @@ pub(crate) struct StatusArgs {
     pub(crate) data_dir: Option<PathBuf>,
     #[arg(long)]
     pub(crate) json: bool,
+    #[arg(long, value_enum, conflicts_with = "watch")]
+    pub(crate) probe: Option<StatusProbeKind>,
     #[arg(long)]
     pub(crate) watch: bool,
     #[arg(long, default_value_t = 2)]
     pub(crate) interval_sec: u64,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum StatusProbeKind {
+    Liveness,
+    Readiness,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsArgs {
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = MetricsFormat::Prometheus)]
+    pub(crate) format: MetricsFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum MetricsFormat {
+    Prometheus,
+    Json,
 }
 
 #[derive(Debug, Args)]

@@ -484,6 +484,8 @@ async fn build_swarm(
                 request_response: request_response::cbor::Behaviour::new(protocols, config),
             })
         })?
+        // Keep idle connections open long enough for multi-step workflows.
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
     for address in listen_addresses {

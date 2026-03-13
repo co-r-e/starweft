@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use multiaddr::Multiaddr;
@@ -295,9 +296,10 @@ pub(crate) fn ensure_binary_exists(bin: &str) -> Result<()> {
     bail!("[E_OPENCLAW_NOT_FOUND] バイナリが見つかりません: {bin}");
 }
 
-pub(crate) fn write_runtime_log(path: &Path, line: &str) -> Result<()> {
+pub(crate) fn write_runtime_log(config: &Config, path: &Path, line: &str) -> Result<()> {
     use std::io::Write;
 
+    rotate_runtime_log_if_needed(config, path)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -311,7 +313,49 @@ pub(crate) fn write_runtime_log(path: &Path, line: &str) -> Result<()> {
     Ok(())
 }
 
+fn rotate_runtime_log_if_needed(config: &Config, path: &Path) -> Result<()> {
+    let max_bytes = config.logs.rotate_max_bytes;
+    if max_bytes == 0 || !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() < max_bytes {
+        return Ok(());
+    }
+
+    let max_archives = config.logs.max_archives;
+    if max_archives == 0 {
+        std::fs::write(path, "")?;
+        return Ok(());
+    }
+
+    let oldest = archived_log_path(path, max_archives);
+    if oldest.exists() {
+        std::fs::remove_file(&oldest)?;
+    }
+
+    for index in (1..max_archives).rev() {
+        let source = archived_log_path(path, index);
+        if source.exists() {
+            std::fs::rename(&source, archived_log_path(path, index + 1))?;
+        }
+    }
+
+    std::fs::rename(path, archived_log_path(path, 1))?;
+    Ok(())
+}
+
+fn archived_log_path(path: &Path, index: usize) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "log".to_owned());
+    path.with_file_name(format!("{name}.{index}"))
+}
+
 pub(crate) fn persist_task_artifact(
+    config: &Config,
     paths: &DataPaths,
     task_id: &TaskId,
     output_payload: &Value,
@@ -320,6 +364,7 @@ pub(crate) fn persist_task_artifact(
     let bytes = serde_json::to_vec_pretty(output_payload)?;
     std::fs::create_dir_all(&paths.artifacts_dir)?;
     std::fs::write(&artifact_path, &bytes)?;
+    prune_artifact_retention(config, &paths.artifacts_dir)?;
 
     Ok(ArtifactRef {
         artifact_id: starweft_id::ArtifactId::generate(),
@@ -331,14 +376,103 @@ pub(crate) fn persist_task_artifact(
     })
 }
 
+fn prune_artifact_retention(config: &Config, artifacts_dir: &Path) -> Result<()> {
+    let files = collect_files_recursive(artifacts_dir)?;
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    let mut timed: Vec<(PathBuf, SystemTime)> = files
+        .into_iter()
+        .map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (path, modified)
+        })
+        .collect();
+
+    let mut deleted = false;
+    if config.artifacts.max_age_sec > 0 {
+        let cutoff = SystemTime::now()
+            .checked_sub(StdDuration::from_secs(config.artifacts.max_age_sec))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        timed.retain(|(path, modified)| {
+            if *modified < cutoff {
+                let _ = std::fs::remove_file(path);
+                deleted = true;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    if config.artifacts.max_files > 0 && timed.len() > config.artifacts.max_files {
+        timed.sort_by_key(|(_, modified)| *modified);
+        let remove_count = timed.len().saturating_sub(config.artifacts.max_files);
+        for (path, _) in timed.iter().take(remove_count) {
+            let _ = std::fs::remove_file(path);
+            deleted = true;
+        }
+    }
+
+    if deleted {
+        remove_empty_directories(artifacts_dir)?;
+    }
+    Ok(())
+}
+
+fn collect_files_recursive(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(collect_files_recursive(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn remove_empty_directories(root: &Path) -> Result<()> {
+    remove_empty_directories_inner(root, true)
+}
+
+fn remove_empty_directories_inner(root: &Path, preserve_root: bool) -> Result<()> {
+    if !root.exists() || !root.is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            remove_empty_directories_inner(&path, false)?;
+        }
+    }
+
+    if !preserve_root && root.read_dir()?.next().is_none() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in &digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 pub(crate) fn resolve_peer_public_key(
@@ -504,6 +638,9 @@ pub(crate) fn cached_snapshot_is_usable(config: &Config, created_at: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, DataPaths, NodeRole};
+    use starweft_id::TaskId;
+    use tempfile::TempDir;
     use time::OffsetDateTime;
 
     #[test]
@@ -518,5 +655,60 @@ mod tests {
             )
             .expect("parse")
         );
+    }
+
+    #[test]
+    fn write_runtime_log_rotates_archives() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut config = Config::for_role(NodeRole::Worker, temp.path(), None);
+        config.logs.rotate_max_bytes = 32;
+        config.logs.max_archives = 2;
+        let path = temp.path().join("runtime.log");
+
+        write_runtime_log(&config, &path, "12345678901234567890123456789012").expect("first log");
+        write_runtime_log(&config, &path, "second-entry").expect("second log");
+        write_runtime_log(&config, &path, "third-entry").expect("third log");
+
+        assert!(path.exists(), "active log should exist");
+        assert!(temp.path().join("runtime.log.1").exists());
+        assert!(temp.path().join("runtime.log.2").exists());
+    }
+
+    #[test]
+    fn persist_task_artifact_prunes_old_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DataPaths::from_root(temp.path());
+        paths.ensure_layout().expect("layout");
+        let mut config = Config::for_role(NodeRole::Worker, temp.path(), None);
+        config.artifacts.max_files = 2;
+        config.artifacts.max_age_sec = 60 * 60;
+
+        persist_task_artifact(
+            &config,
+            &paths,
+            &TaskId::new("task_01".to_owned()).expect("task"),
+            &serde_json::json!({"n": 1}),
+        )
+        .expect("artifact 1");
+        std::thread::sleep(StdDuration::from_millis(10));
+        persist_task_artifact(
+            &config,
+            &paths,
+            &TaskId::new("task_02".to_owned()).expect("task"),
+            &serde_json::json!({"n": 2}),
+        )
+        .expect("artifact 2");
+        std::thread::sleep(StdDuration::from_millis(10));
+        persist_task_artifact(
+            &config,
+            &paths,
+            &TaskId::new("task_03".to_owned()).expect("task"),
+            &serde_json::json!({"n": 3}),
+        )
+        .expect("artifact 3");
+
+        assert!(!paths.artifacts_dir.join("task_01.json").exists());
+        assert!(paths.artifacts_dir.join("task_02.json").exists());
+        assert!(paths.artifacts_dir.join("task_03.json").exists());
     }
 }

@@ -9,7 +9,7 @@ use serde::Serialize;
 use starweft_protocol::{
     ApprovalApplied, Envelope, EvaluationIssued, ProjectCharter, PublishIntentProposed,
     PublishIntentSkipped, PublishResultRecorded, SnapshotResponse, StopAck, StopComplete,
-    StopOrder, TaskDelegated, TaskProgress, TaskResultSubmitted,
+    StopOrder, TaskDelegated, TaskProgress, TaskResultSubmitted, WireEnvelope,
 };
 use starweft_store::Store;
 
@@ -54,6 +54,11 @@ impl<'a> RuntimePipeline<'a> {
         T: Serialize,
     {
         self.store.queue_outbox(envelope)
+    }
+
+    /// Queues a pre-signed wire envelope for outbound delivery.
+    pub fn queue_raw_wire(&self, wire: &WireEnvelope) -> Result<()> {
+        self.store.queue_outbox_wire(wire)
     }
 
     /// Saves an incoming envelope to the inbox and returns `false` if already processed.

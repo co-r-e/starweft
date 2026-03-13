@@ -1097,6 +1097,31 @@ impl Store {
         Ok(())
     }
 
+    /// Queues an already-signed wire envelope in the outbox for delivery.
+    pub fn queue_outbox_wire(&self, wire: &WireEnvelope) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM outbox_deliveries WHERE msg_id = ?1",
+            [wire.msg_id.as_str()],
+        )?;
+        self.connection.execute(
+            r#"
+            INSERT OR REPLACE INTO outbox_messages (
+              msg_id, msg_type, queued_at, raw_json, delivery_state,
+              delivery_attempts, last_attempted_at, next_attempt_at, last_error
+            )
+            VALUES (?1, ?2, ?3, ?4, 'queued', 0, NULL, NULL, NULL)
+            "#,
+            params![
+                wire.msg_id.as_str(),
+                format!("{:?}", wire.msg_type),
+                format_time(OffsetDateTime::now_utc())?,
+                serde_json::to_string(wire)?,
+            ],
+        )?;
+
+        Ok(())
+    }
+
     /// Saves an incoming envelope to the inbox.
     pub fn save_inbox_message<T>(&self, envelope: &Envelope<T>) -> Result<()>
     where
@@ -1112,6 +1137,24 @@ impl Store {
                 format!("{:?}", envelope.msg_type),
                 format_time(OffsetDateTime::now_utc())?,
                 serde_json::to_string(envelope)?,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Saves an incoming wire envelope to the inbox.
+    pub fn save_inbox_wire(&self, wire: &WireEnvelope) -> Result<()> {
+        self.connection.execute(
+            r#"
+            INSERT OR IGNORE INTO inbox_messages (msg_id, msg_type, received_at, raw_json, processed)
+            VALUES (?1, ?2, ?3, ?4, 0)
+            "#,
+            params![
+                wire.msg_id.as_str(),
+                format!("{:?}", wire.msg_type),
+                format_time(OffsetDateTime::now_utc())?,
+                serde_json::to_string(wire)?,
             ],
         )?;
 

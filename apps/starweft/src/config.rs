@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     pub observation: ObservationSection,
     #[serde(default)]
+    pub logs: LogsSection,
+    #[serde(default)]
     pub artifacts: ArtifactsSection,
 }
 
@@ -321,9 +323,56 @@ impl Default for ObservationSection {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogsSection {
+    #[serde(default = "default_logs_rotate_max_bytes")]
+    pub rotate_max_bytes: u64,
+    #[serde(default = "default_logs_max_archives")]
+    pub max_archives: usize,
+}
+
+impl Default for LogsSection {
+    fn default() -> Self {
+        Self {
+            rotate_max_bytes: default_logs_rotate_max_bytes(),
+            max_archives: default_logs_max_archives(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArtifactsSection {
     pub dir: String,
+    #[serde(default = "default_artifacts_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_artifacts_max_age_sec")]
+    pub max_age_sec: u64,
+}
+
+impl Default for ArtifactsSection {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            max_files: default_artifacts_max_files(),
+            max_age_sec: default_artifacts_max_age_sec(),
+        }
+    }
+}
+
+fn default_logs_rotate_max_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_logs_max_archives() -> usize {
+    5
+}
+
+fn default_artifacts_max_files() -> usize {
+    256
+}
+
+fn default_artifacts_max_age_sec() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 impl Config {
@@ -361,8 +410,10 @@ impl Config {
             owner: OwnerSection::default(),
             worker: WorkerSection::default(),
             observation: ObservationSection::default(),
+            logs: LogsSection::default(),
             artifacts: ArtifactsSection {
                 dir: paths.artifacts_dir.display().to_string(),
+                ..ArtifactsSection::default()
             },
         }
     }
@@ -619,6 +670,9 @@ protocol_version = "starweft/0.1"
 schema_version = "starweft-store/1"
 bridge_capability_version = "openclaw.execution.v1"
 allow_legacy_protocols = false
+
+[artifacts]
+dir = "/tmp/starweft/artifacts"
 "#,
         )
         .expect("write config");
@@ -627,6 +681,11 @@ allow_legacy_protocols = false
         assert_eq!(
             config.compatibility.schema_version,
             starweft_store::STORE_SCHEMA_VERSION_LABEL
+        );
+        assert_eq!(config.artifacts.max_files, default_artifacts_max_files());
+        assert_eq!(
+            config.artifacts.max_age_sec,
+            default_artifacts_max_age_sec()
         );
     }
 

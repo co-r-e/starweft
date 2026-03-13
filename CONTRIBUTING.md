@@ -25,8 +25,7 @@ Feature requests are welcome. Please open an issue on GitHub Issues with:
 
 ### Requirements
 
-- **Rust 1.87+**
-- **SQLite3**
+- **Rust 1.88+**
 
 ### Build
 
@@ -66,6 +65,7 @@ cargo fmt --all
 4. **Commit** with a clear, descriptive commit message.
 5. **Push** your branch and open a pull request against `main`.
 6. In your PR description, explain what the change does and why it is needed.
+7. For release-facing changes, update `PRODUCTION_READINESS.md` and the relevant runbook/template if operational behaviour changed.
 
 ## Code Style
 

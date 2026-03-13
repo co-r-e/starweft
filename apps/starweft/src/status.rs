@@ -12,7 +12,9 @@ use starweft_protocol::SnapshotScopeType;
 use starweft_store::{ActorScopedStats, Store, TaskEventRecord};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
-use crate::cli::{EventsArgs, LogsArgs, SnapshotArgs, StatusArgs};
+use crate::cli::{
+    EventsArgs, LogsArgs, MetricsArgs, MetricsFormat, SnapshotArgs, StatusArgs, StatusProbeKind,
+};
 use crate::config::{Config, DataPaths, load_existing_config};
 use crate::helpers::{cached_snapshot_is_usable, parse_json_or_string, parse_log_timestamp};
 use crate::runtime::{build_transport, queue_snapshot_request};
@@ -40,8 +42,60 @@ pub(crate) struct StatusCompactSummary {
     pub(crate) project_retry: Option<String>,
 }
 
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StatusProbeReport {
+    pub(crate) ok: bool,
+    pub(crate) status: String,
+    pub(crate) reasons: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StatusProbeOutput {
+    pub(crate) probe: String,
+    pub(crate) role: String,
+    #[serde(flatten)]
+    pub(crate) report: StatusProbeReport,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StatusMetricsOutput {
+    pub(crate) role: String,
+    pub(crate) liveness: u8,
+    pub(crate) readiness: u8,
+    pub(crate) liveness_warning_count: u64,
+    pub(crate) readiness_warning_count: u64,
+    pub(crate) connected_peers: u64,
+    pub(crate) active_projects: u64,
+    pub(crate) running_tasks: u64,
+    pub(crate) queued_outbox: u64,
+    pub(crate) retry_waiting_outbox: u64,
+    pub(crate) dead_letter_outbox: u64,
+    pub(crate) inbox_unprocessed: u64,
+    pub(crate) stop_orders: u64,
+    pub(crate) snapshots: u64,
+    pub(crate) evaluations: u64,
+    pub(crate) artifacts: u64,
+    pub(crate) principal_visions: u64,
+    pub(crate) principal_projects: u64,
+    pub(crate) owned_projects: u64,
+    pub(crate) assigned_tasks: u64,
+    pub(crate) active_assigned_tasks: u64,
+    pub(crate) issued_tasks: u64,
+    pub(crate) stop_receipts: u64,
+    pub(crate) cached_project_snapshots: u64,
+    pub(crate) cached_task_snapshots: u64,
+    pub(crate) openclaw_enabled: u8,
+    pub(crate) worker_accept_join_offers: u8,
+    pub(crate) worker_max_active_tasks: u64,
+    pub(crate) owner_max_retry_attempts: u64,
+    pub(crate) owner_retry_cooldown_ms: u64,
+}
+
 #[derive(serde::Serialize, Clone, Debug)]
 pub(crate) struct StatusView {
+    pub(crate) liveness: StatusProbeReport,
+    pub(crate) readiness: StatusProbeReport,
     pub(crate) health_summary: String,
     pub(crate) compact_summary: StatusCompactSummary,
     pub(crate) role: String,
@@ -210,6 +264,308 @@ pub(crate) fn render_status_compact_summary_line(view: &StatusView) -> String {
         latest_stop_id,
         view.compact_summary.role_detail
     )
+}
+
+impl StatusProbeReport {
+    fn new(reasons: Vec<String>, warnings: Vec<String>) -> Self {
+        let ok = reasons.is_empty();
+        let status = if ok {
+            if warnings.is_empty() { "ok" } else { "warn" }
+        } else {
+            "fail"
+        };
+        Self {
+            ok,
+            status: status.to_owned(),
+            reasons,
+            warnings,
+        }
+    }
+}
+
+fn probe_kind_name(kind: StatusProbeKind) -> &'static str {
+    match kind {
+        StatusProbeKind::Liveness => "liveness",
+        StatusProbeKind::Readiness => "readiness",
+    }
+}
+
+pub(crate) fn evaluate_status_liveness(view: &StatusView) -> StatusProbeReport {
+    let mut reasons = Vec::new();
+    let mut warnings = Vec::new();
+
+    if view.actor_id == "uninitialized" || view.node_id == "uninitialized" {
+        reasons.push("local_identity_missing".to_owned());
+    }
+    if view.transport == "Libp2p" && view.transport_peer_id.is_none() {
+        reasons.push("libp2p_peer_id_missing".to_owned());
+    }
+    if view.listen_addresses == 0 {
+        reasons.push("listen_addresses_missing".to_owned());
+    }
+    if view.retry_waiting_outbox > 0 {
+        warnings.push(format!(
+            "retry_waiting_outbox={}",
+            view.retry_waiting_outbox
+        ));
+    }
+    if view.dead_letter_outbox > 0 {
+        warnings.push(format!("dead_letter_outbox={}", view.dead_letter_outbox));
+    }
+    if view.inbox_unprocessed > 0 {
+        warnings.push(format!("inbox_unprocessed={}", view.inbox_unprocessed));
+    }
+
+    StatusProbeReport::new(reasons, warnings)
+}
+
+pub(crate) fn evaluate_status_readiness(view: &StatusView) -> StatusProbeReport {
+    let liveness = evaluate_status_liveness(view);
+    let mut reasons = liveness.reasons.clone();
+    let mut warnings = liveness.warnings.clone();
+
+    if view.connected_peers == 0 {
+        warnings.push("connected_peers=0".to_owned());
+    }
+
+    if view.role == "worker" {
+        if !view.worker_accept_join_offers {
+            reasons.push("worker_accept_join_offers_disabled".to_owned());
+        }
+        if !view.openclaw_enabled {
+            reasons.push("openclaw_disabled".to_owned());
+        }
+        if view.worker_max_active_tasks > 0
+            && view.active_assigned_tasks >= view.worker_max_active_tasks
+        {
+            reasons.push(format!(
+                "worker_capacity_reached={}/{}",
+                view.active_assigned_tasks, view.worker_max_active_tasks
+            ));
+        }
+    }
+
+    StatusProbeReport::new(reasons, warnings)
+}
+
+pub(crate) fn status_probe_output(view: &StatusView, kind: StatusProbeKind) -> StatusProbeOutput {
+    let report = match kind {
+        StatusProbeKind::Liveness => view.liveness.clone(),
+        StatusProbeKind::Readiness => view.readiness.clone(),
+    };
+    StatusProbeOutput {
+        probe: probe_kind_name(kind).to_owned(),
+        role: view.role.clone(),
+        report,
+    }
+}
+
+pub(crate) fn render_status_probe_output(json: bool, output: &StatusProbeOutput) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(output)?);
+    }
+
+    let reasons = if output.report.reasons.is_empty() {
+        "none".to_owned()
+    } else {
+        output.report.reasons.join(",")
+    };
+    let warnings = if output.report.warnings.is_empty() {
+        "none".to_owned()
+    } else {
+        output.report.warnings.join(",")
+    };
+
+    Ok([
+        format!("probe: {}", output.probe),
+        format!("role: {}", output.role),
+        format!("ok: {}", output.report.ok),
+        format!("status: {}", output.report.status),
+        format!("reasons: {reasons}"),
+        format!("warnings: {warnings}"),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn status_metrics_output(view: &StatusView) -> StatusMetricsOutput {
+    StatusMetricsOutput {
+        role: view.role.clone(),
+        liveness: u8::from(view.liveness.ok),
+        readiness: u8::from(view.readiness.ok),
+        liveness_warning_count: view.liveness.warnings.len() as u64,
+        readiness_warning_count: view.readiness.warnings.len() as u64,
+        connected_peers: view.connected_peers,
+        active_projects: view.active_projects,
+        running_tasks: view.running_tasks,
+        queued_outbox: view.queued_outbox,
+        retry_waiting_outbox: view.retry_waiting_outbox,
+        dead_letter_outbox: view.dead_letter_outbox,
+        inbox_unprocessed: view.inbox_unprocessed,
+        stop_orders: view.stop_orders,
+        snapshots: view.snapshots,
+        evaluations: view.evaluations,
+        artifacts: view.artifacts,
+        principal_visions: view.principal_visions,
+        principal_projects: view.principal_projects,
+        owned_projects: view.owned_projects,
+        assigned_tasks: view.assigned_tasks,
+        active_assigned_tasks: view.active_assigned_tasks,
+        issued_tasks: view.issued_tasks,
+        stop_receipts: view.stop_receipts,
+        cached_project_snapshots: view.cached_project_snapshots,
+        cached_task_snapshots: view.cached_task_snapshots,
+        openclaw_enabled: u8::from(view.openclaw_enabled),
+        worker_accept_join_offers: u8::from(view.worker_accept_join_offers),
+        worker_max_active_tasks: view.worker_max_active_tasks,
+        owner_max_retry_attempts: view.owner_max_retry_attempts,
+        owner_retry_cooldown_ms: view.owner_retry_cooldown_ms,
+    }
+}
+
+type MetricAccessor = fn(&StatusMetricsOutput) -> u64;
+const PROMETHEUS_METRICS: &[(&str, &str, MetricAccessor)] = &[
+    (
+        "starweft_liveness",
+        "Node liveness probe result (1=ok,0=fail)",
+        |m| m.liveness as u64,
+    ),
+    (
+        "starweft_readiness",
+        "Node readiness probe result (1=ok,0=fail)",
+        |m| m.readiness as u64,
+    ),
+    (
+        "starweft_liveness_warning_count",
+        "Number of liveness warnings",
+        |m| m.liveness_warning_count,
+    ),
+    (
+        "starweft_readiness_warning_count",
+        "Number of readiness warnings",
+        |m| m.readiness_warning_count,
+    ),
+    ("starweft_connected_peers", "Connected peer count", |m| {
+        m.connected_peers
+    }),
+    ("starweft_active_projects", "Active project count", |m| {
+        m.active_projects
+    }),
+    ("starweft_running_tasks", "Running task count", |m| {
+        m.running_tasks
+    }),
+    (
+        "starweft_queued_outbox",
+        "Queued outbox message count",
+        |m| m.queued_outbox,
+    ),
+    (
+        "starweft_retry_waiting_outbox",
+        "Retry waiting outbox message count",
+        |m| m.retry_waiting_outbox,
+    ),
+    (
+        "starweft_dead_letter_outbox",
+        "Dead letter outbox message count",
+        |m| m.dead_letter_outbox,
+    ),
+    (
+        "starweft_inbox_unprocessed",
+        "Unprocessed inbox message count",
+        |m| m.inbox_unprocessed,
+    ),
+    ("starweft_stop_orders", "Stop order count", |m| {
+        m.stop_orders
+    }),
+    ("starweft_snapshots", "Snapshot count", |m| m.snapshots),
+    ("starweft_evaluations", "Evaluation count", |m| {
+        m.evaluations
+    }),
+    ("starweft_artifacts", "Artifact count", |m| m.artifacts),
+    (
+        "starweft_principal_visions",
+        "Principal scoped vision count",
+        |m| m.principal_visions,
+    ),
+    (
+        "starweft_principal_projects",
+        "Principal scoped project count",
+        |m| m.principal_projects,
+    ),
+    (
+        "starweft_owned_projects",
+        "Owner scoped project count",
+        |m| m.owned_projects,
+    ),
+    ("starweft_assigned_tasks", "Assigned task count", |m| {
+        m.assigned_tasks
+    }),
+    (
+        "starweft_active_assigned_tasks",
+        "Active assigned task count",
+        |m| m.active_assigned_tasks,
+    ),
+    ("starweft_issued_tasks", "Issued task count", |m| {
+        m.issued_tasks
+    }),
+    ("starweft_stop_receipts", "Stop receipt count", |m| {
+        m.stop_receipts
+    }),
+    (
+        "starweft_cached_project_snapshots",
+        "Cached project snapshot count",
+        |m| m.cached_project_snapshots,
+    ),
+    (
+        "starweft_cached_task_snapshots",
+        "Cached task snapshot count",
+        |m| m.cached_task_snapshots,
+    ),
+    (
+        "starweft_openclaw_enabled",
+        "OpenClaw bridge enabled flag (1=true,0=false)",
+        |m| m.openclaw_enabled as u64,
+    ),
+    (
+        "starweft_worker_accept_join_offers",
+        "Worker accepts join offers flag (1=true,0=false)",
+        |m| m.worker_accept_join_offers as u64,
+    ),
+    (
+        "starweft_worker_max_active_tasks",
+        "Worker max active task limit",
+        |m| m.worker_max_active_tasks,
+    ),
+    (
+        "starweft_owner_max_retry_attempts",
+        "Owner max retry attempts",
+        |m| m.owner_max_retry_attempts,
+    ),
+    (
+        "starweft_owner_retry_cooldown_ms",
+        "Owner retry cooldown in milliseconds",
+        |m| m.owner_retry_cooldown_ms,
+    ),
+];
+
+pub(crate) fn render_metrics_output(args: &MetricsArgs, view: &StatusView) -> Result<String> {
+    let metrics = status_metrics_output(view);
+    match args.format {
+        MetricsFormat::Json => Ok(serde_json::to_string_pretty(&metrics)?),
+        MetricsFormat::Prometheus => {
+            use std::fmt::Write;
+            let role = metrics.role.as_str();
+            let mut output = String::new();
+            for (i, (name, help, accessor)) in PROMETHEUS_METRICS.iter().enumerate() {
+                if i > 0 {
+                    output.push('\n');
+                }
+                writeln!(output, "# HELP {name} {help}")?;
+                writeln!(output, "# TYPE {name} gauge")?;
+                write!(output, r#"{name}{{role="{role}"}} {}"#, accessor(&metrics))?;
+            }
+            Ok(output)
+        }
+    }
 }
 
 pub(crate) fn prepend_snapshot_compact_summary(output: String) -> String {
@@ -501,6 +857,8 @@ pub(crate) fn render_status_output(args: &StatusArgs, view: &StatusView) -> Resu
     let mut lines = vec![
         view.health_summary.clone(),
         render_status_compact_summary_line(view),
+        format!("liveness: {}", view.liveness.status),
+        format!("readiness: {}", view.readiness.status),
         format!("role: {}", view.role),
         format!("actor_id: {}", view.actor_id),
         format!("node_id: {}", view.node_id),
@@ -721,10 +1079,24 @@ pub(crate) fn run_status(args: StatusArgs) -> Result<()> {
         }
     } else {
         let view = load_status_view(args.data_dir.as_ref())?;
+        if let Some(probe) = args.probe {
+            let output = status_probe_output(&view, probe);
+            println!("{}", render_status_probe_output(args.json, &output)?);
+            if !output.report.ok {
+                bail!("[E_STATUS_PROBE_FAILED] {} probe failed", output.probe);
+            }
+            return Ok(());
+        }
         let output = render_status_output(&args, &view)?;
         println!("{output}");
         Ok(())
     }
+}
+
+pub(crate) fn run_metrics(args: MetricsArgs) -> Result<()> {
+    let view = load_status_view(args.data_dir.as_ref())?;
+    println!("{}", render_metrics_output(&args, &view)?);
+    Ok(())
 }
 
 pub(crate) fn load_status_view(data_dir: Option<&PathBuf>) -> Result<StatusView> {
@@ -790,6 +1162,8 @@ pub(crate) fn load_status_view_with(
         .unwrap_or_else(ActorScopedStats::default);
 
     let mut view = StatusView {
+        liveness: StatusProbeReport::new(Vec::new(), Vec::new()),
+        readiness: StatusProbeReport::new(Vec::new(), Vec::new()),
         health_summary: String::new(),
         compact_summary: StatusCompactSummary {
             role: config.node.role.to_string(),
@@ -924,6 +1298,8 @@ pub(crate) fn load_status_view_with(
     view.health_summary = render_status_health_summary(&view);
     view.compact_summary.health = view.health_summary.clone();
     view.compact_summary.role_detail = render_status_role_detail(&view);
+    view.liveness = evaluate_status_liveness(&view);
+    view.readiness = evaluate_status_readiness(&view);
     Ok(view)
 }
 
@@ -1116,9 +1492,10 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn status_health_summary_is_role_specific() {
-        let worker = StatusView {
+    fn sample_worker_status_view() -> StatusView {
+        StatusView {
+            liveness: StatusProbeReport::new(Vec::new(), Vec::new()),
+            readiness: StatusProbeReport::new(Vec::new(), Vec::new()),
             health_summary: String::new(),
             compact_summary: StatusCompactSummary {
                 role: "worker".to_owned(),
@@ -1197,7 +1574,12 @@ mod tests {
             latest_project_failure_reason: None,
             latest_project_approval_state: None,
             latest_project_approval_updated_at: None,
-        };
+        }
+    }
+
+    #[test]
+    fn status_health_summary_is_role_specific() {
+        let worker = sample_worker_status_view();
 
         assert_eq!(
             render_status_health_summary(&worker),
@@ -1207,6 +1589,104 @@ mod tests {
             render_status_role_detail(&worker),
             "assigned_tasks=3 active_assigned_tasks=1 openclaw_enabled=true max_active_tasks=1"
         );
+    }
+
+    #[test]
+    fn status_liveness_fails_without_local_identity() {
+        let mut worker = sample_worker_status_view();
+        worker.actor_id = "uninitialized".to_owned();
+        worker.node_id = "uninitialized".to_owned();
+
+        assert_eq!(
+            evaluate_status_liveness(&worker),
+            StatusProbeReport {
+                ok: false,
+                status: "fail".to_owned(),
+                reasons: vec!["local_identity_missing".to_owned()],
+                warnings: vec!["retry_waiting_outbox=1".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn status_readiness_fails_when_worker_cannot_accept_work() {
+        let mut worker = sample_worker_status_view();
+        worker.openclaw_enabled = false;
+        worker.worker_accept_join_offers = false;
+
+        assert_eq!(
+            evaluate_status_readiness(&worker),
+            StatusProbeReport {
+                ok: false,
+                status: "fail".to_owned(),
+                reasons: vec![
+                    "worker_accept_join_offers_disabled".to_owned(),
+                    "openclaw_disabled".to_owned(),
+                    "worker_capacity_reached=1/1".to_owned(),
+                ],
+                warnings: vec!["retry_waiting_outbox=1".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn status_probe_output_renders_json() {
+        let mut worker = sample_worker_status_view();
+        worker.liveness = evaluate_status_liveness(&worker);
+        worker.readiness = evaluate_status_readiness(&worker);
+
+        let output = render_status_probe_output(
+            true,
+            &status_probe_output(&worker, StatusProbeKind::Readiness),
+        )
+        .expect("render probe json");
+        let parsed: Value = serde_json::from_str(&output).expect("parse probe json");
+
+        assert_eq!(parsed["probe"], "readiness");
+        assert_eq!(parsed["role"], "worker");
+        assert_eq!(parsed["ok"], false);
+    }
+
+    #[test]
+    fn metrics_output_renders_json() {
+        let mut worker = sample_worker_status_view();
+        worker.liveness = evaluate_status_liveness(&worker);
+        worker.readiness = evaluate_status_readiness(&worker);
+
+        let output = render_metrics_output(
+            &MetricsArgs {
+                data_dir: None,
+                format: MetricsFormat::Json,
+            },
+            &worker,
+        )
+        .expect("render metrics json");
+        let parsed: Value = serde_json::from_str(&output).expect("parse metrics json");
+
+        assert_eq!(parsed["role"], "worker");
+        assert_eq!(parsed["liveness"], 1);
+        assert_eq!(parsed["readiness"], 0);
+        assert_eq!(parsed["assigned_tasks"], 3);
+    }
+
+    #[test]
+    fn metrics_output_renders_prometheus() {
+        let mut worker = sample_worker_status_view();
+        worker.liveness = evaluate_status_liveness(&worker);
+        worker.readiness = evaluate_status_readiness(&worker);
+
+        let output = render_metrics_output(
+            &MetricsArgs {
+                data_dir: None,
+                format: MetricsFormat::Prometheus,
+            },
+            &worker,
+        )
+        .expect("render metrics prometheus");
+
+        assert!(output.contains(r#"starweft_liveness{role="worker"} 1"#));
+        assert!(output.contains(r#"starweft_readiness{role="worker"} 0"#));
+        assert!(output.contains(r#"starweft_assigned_tasks{role="worker"} 3"#));
     }
 
     #[test]

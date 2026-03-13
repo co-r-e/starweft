@@ -111,6 +111,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Registry { command } => match command {
             RegistryCommands::Serve(args) => registry::run_registry_serve(args),
         },
+        Commands::Metrics(args) => status::run_metrics(args),
         Commands::Logs(args) => status::run_logs(args),
         Commands::Events(args) => status::run_events(args),
         Commands::Vision { command } => match command {

@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
-use starweft_crypto::StoredKeypair;
+use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
+use starweft_crypto::{MessageSignature, StoredKeypair, verify_json, verifying_key_from_base64};
 use starweft_id::{ActorId, NodeId, StopId};
 use starweft_p2p::libp2p_peer_id_from_private_key;
 use starweft_protocol::{StopOrder, StopScopeType, UnsignedEnvelope};
@@ -18,6 +19,29 @@ use crate::helpers::{
     resolve_peer_public_key, resolve_stop_scope, restore_dir_from_bundle, restore_file_from_bundle,
     stop_key_exists,
 };
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct BackupManifestFileEntry {
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct BackupManifestPayload {
+    format: String,
+    created_at: OffsetDateTime,
+    source_data_dir: String,
+    signer_public_key: Option<String>,
+    files: Vec<BackupManifestFileEntry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct BackupManifest {
+    #[serde(flatten)]
+    payload: BackupManifestPayload,
+    signature: Option<MessageSignature>,
+}
 
 pub(crate) fn run_init(args: InitArgs) -> Result<()> {
     let paths = DataPaths::from_cli_arg(args.data_dir.as_ref())?;
@@ -88,11 +112,30 @@ pub(crate) fn create_backup_bundle(
     copy_dir_if_exists(&paths.logs_dir, &output.join("logs"))?;
     copy_dir_if_exists(&paths.cache_dir, &output.join("cache"))?;
 
-    let manifest = serde_json::json!({
-        "format": "starweft-local-backup/v1",
-        "created_at": OffsetDateTime::now_utc(),
-        "source_data_dir": config.node.data_dir,
-    });
+    let actor_key_path = configured_actor_key_path(&config, &paths)?;
+    if !actor_key_path.exists() {
+        bail!(
+            "[E_BACKUP_SIGNATURE_REQUIRED] backup には actor_key が必要です: {}",
+            actor_key_path.display()
+        );
+    }
+    let signer = read_keypair(&actor_key_path).with_context(|| {
+        format!(
+            "[E_BACKUP_SIGNATURE_REQUIRED] backup 用 actor_key を読み込めません: {}",
+            actor_key_path.display()
+        )
+    })?;
+    let payload = BackupManifestPayload {
+        format: "starweft-local-backup/v1".to_owned(),
+        created_at: OffsetDateTime::now_utc(),
+        source_data_dir: config.node.data_dir,
+        signer_public_key: Some(signer.public_key.clone()),
+        files: collect_backup_manifest_entries(&output)?,
+    };
+    let manifest = BackupManifest {
+        signature: Some(signer.sign_json(&payload)?),
+        payload,
+    };
     fs::write(
         output.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -114,6 +157,7 @@ pub(crate) fn restore_backup_bundle(
             input.display()
         );
     }
+    let manifest = load_and_verify_backup_manifest(&input)?;
 
     restore_file_from_bundle(
         &input.join("config.toml"),
@@ -154,7 +198,119 @@ pub(crate) fn restore_backup_bundle(
     restore_dir_from_bundle(&input.join("logs"), &paths.logs_dir, force, "logs")?;
     restore_dir_from_bundle(&input.join("cache"), &paths.cache_dir, force, "cache")?;
 
+    if manifest
+        .payload
+        .files
+        .iter()
+        .any(|entry| entry.path == "ledger/node.db")
+    {
+        Store::open(&paths.ledger_db)?;
+    }
+
     Ok((input, paths))
+}
+
+fn collect_backup_manifest_entries(root: &Path) -> Result<Vec<BackupManifestFileEntry>> {
+    let mut entries = Vec::new();
+    collect_backup_manifest_entries_inner(root, root, &mut entries)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn collect_backup_manifest_entries_inner(
+    root: &Path,
+    current: &Path,
+    entries: &mut Vec<BackupManifestFileEntry>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("manifest.json"))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_backup_manifest_entries_inner(root, &path, entries)?;
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        entries.push(BackupManifestFileEntry {
+            path: path
+                .strip_prefix(root)
+                .map_err(|error| anyhow!("failed to strip backup root: {error}"))?
+                .to_string_lossy()
+                .replace('\\', "/"),
+            sha256: sha256_hex(&bytes),
+            size_bytes: bytes.len() as u64,
+        });
+    }
+    Ok(())
+}
+
+fn load_and_verify_backup_manifest(input: &Path) -> Result<BackupManifest> {
+    let manifest_path = input.join("manifest.json");
+    if !manifest_path.exists() {
+        bail!(
+            "[E_BACKUP_MANIFEST_MISSING] manifest.json が見つかりません: {}",
+            manifest_path.display()
+        );
+    }
+
+    let manifest: BackupManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    if manifest.payload.format != "starweft-local-backup/v1" {
+        bail!(
+            "[E_BACKUP_MANIFEST_INVALID] unsupported backup format: {}",
+            manifest.payload.format
+        );
+    }
+    verify_backup_manifest(input, &manifest)?;
+    Ok(manifest)
+}
+
+fn verify_backup_manifest(input: &Path, manifest: &BackupManifest) -> Result<()> {
+    let signature = manifest
+        .signature
+        .as_ref()
+        .ok_or_else(|| anyhow!("[E_BACKUP_SIGNATURE_REQUIRED] manifest signature is missing"))?;
+    let public_key = manifest
+        .payload
+        .signer_public_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("[E_BACKUP_SIGNATURE_INVALID] signer_public_key is missing"))?;
+    verify_json(
+        &verifying_key_from_base64(public_key)?,
+        &manifest.payload,
+        signature,
+    )
+    .map_err(|error| anyhow!("[E_BACKUP_SIGNATURE_INVALID] {error}"))?;
+
+    for entry in &manifest.payload.files {
+        let path = input.join(&entry.path);
+        if !path.exists() {
+            bail!(
+                "[E_BACKUP_CHECKSUM_MISMATCH] backup entry is missing: {}",
+                path.display()
+            );
+        }
+        let bytes = fs::read(&path)?;
+        let digest = sha256_hex(&bytes);
+        if digest != entry.sha256 || bytes.len() as u64 != entry.size_bytes {
+            bail!(
+                "[E_BACKUP_CHECKSUM_MISMATCH] checksum mismatch for {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn run_repair_rebuild_projections(args: CommonDataDirArgs) -> Result<()> {
@@ -576,8 +732,14 @@ mod tests {
         config.save(&paths.config_toml).expect("save config");
         paths.ensure_layout().expect("layout");
 
-        fs::write(&paths.actor_key, "actor-key").expect("write actor key");
-        fs::write(&paths.stop_authority_key, "stop-key").expect("write stop key");
+        let actor_key = StoredKeypair::generate();
+        actor_key
+            .write_to_path(&paths.actor_key)
+            .expect("write actor key");
+        let stop_key = StoredKeypair::generate();
+        stop_key
+            .write_to_path(&paths.stop_authority_key)
+            .expect("write stop key");
         let store = Store::open(&paths.ledger_db).expect("store");
         store
             .upsert_local_identity(&LocalIdentityRecord {
@@ -585,7 +747,7 @@ mod tests {
                 node_id: NodeId::generate(),
                 actor_type: "worker".to_owned(),
                 display_name: "backup-source".to_owned(),
-                public_key: "public-key".to_owned(),
+                public_key: actor_key.public_key.clone(),
                 private_key_ref: paths.actor_key.display().to_string(),
                 created_at: OffsetDateTime::now_utc(),
             })
@@ -622,11 +784,11 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&restore_paths.actor_key).expect("restored actor key"),
-            "actor-key"
+            fs::read_to_string(&source_paths.actor_key).expect("source actor key")
         );
         assert_eq!(
             fs::read_to_string(&restore_paths.stop_authority_key).expect("restored stop key"),
-            "stop-key"
+            fs::read_to_string(&source_paths.stop_authority_key).expect("source stop key")
         );
         let restored_store = Store::open(&restore_paths.ledger_db).expect("restored store");
         let restored_identity = restored_store
@@ -634,7 +796,12 @@ mod tests {
             .expect("local identity")
             .expect("identity exists");
         assert_eq!(restored_identity.display_name, "backup-source");
-        assert_eq!(restored_identity.public_key, "public-key");
+        assert_eq!(
+            restored_identity.public_key,
+            StoredKeypair::read_from_path(&source_paths.actor_key)
+                .expect("source actor keypair")
+                .public_key
+        );
         assert_eq!(
             fs::read_to_string(
                 restore_paths
@@ -676,6 +843,91 @@ mod tests {
             .expect_err("db conflict should fail");
         assert!(error.to_string().contains("E_RESTORE_CONFLICT"));
         assert!(error.to_string().contains("node.db"));
+    }
+
+    #[test]
+    fn backup_manifest_contains_signature_and_checksums() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_root = temp.path().join("source");
+        write_backup_source(&source_root);
+        let backup_dir =
+            create_backup_bundle(Some(&source_root), &temp.path().join("backup"), false)
+                .expect("create backup");
+
+        let manifest: BackupManifest = serde_json::from_slice(
+            &fs::read(backup_dir.join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert!(manifest.signature.is_some(), "manifest should be signed");
+        assert!(
+            manifest
+                .payload
+                .files
+                .iter()
+                .any(|entry| entry.path == "config.toml"),
+            "config.toml entry should be present"
+        );
+        assert!(
+            manifest
+                .payload
+                .files
+                .iter()
+                .any(|entry| entry.path == "ledger/node.db"),
+            "ledger entry should be present"
+        );
+    }
+
+    #[test]
+    fn backup_restore_rejects_checksum_mismatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_root = temp.path().join("source");
+        write_backup_source(&source_root);
+        let backup_dir =
+            create_backup_bundle(Some(&source_root), &temp.path().join("backup"), false)
+                .expect("create backup");
+        fs::write(backup_dir.join("logs").join("runtime.log"), "tampered").expect("tamper log");
+
+        let restore_root = temp.path().join("restore");
+        let error = restore_backup_bundle(Some(&restore_root), &backup_dir, false)
+            .expect_err("restore should fail on checksum mismatch");
+        assert!(error.to_string().contains("E_BACKUP_CHECKSUM_MISMATCH"));
+    }
+
+    #[test]
+    fn backup_restore_rejects_missing_manifest_signature() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_root = temp.path().join("source");
+        write_backup_source(&source_root);
+        let backup_dir =
+            create_backup_bundle(Some(&source_root), &temp.path().join("backup"), false)
+                .expect("create backup");
+        let mut manifest: BackupManifest = serde_json::from_slice(
+            &fs::read(backup_dir.join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        manifest.signature = None;
+        fs::write(
+            backup_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let restore_root = temp.path().join("restore");
+        let error = restore_backup_bundle(Some(&restore_root), &backup_dir, false)
+            .expect_err("restore should fail without signature");
+        assert!(error.to_string().contains("E_BACKUP_SIGNATURE_REQUIRED"));
+    }
+
+    #[test]
+    fn backup_create_fails_when_actor_key_is_unreadable() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_root = temp.path().join("source");
+        let paths = write_backup_source(&source_root);
+        fs::write(&paths.actor_key, "not-json").expect("corrupt actor key");
+
+        let error = create_backup_bundle(Some(&source_root), &temp.path().join("backup"), false)
+            .expect_err("backup should fail");
+        assert!(error.to_string().contains("E_BACKUP_SIGNATURE_REQUIRED"));
     }
 
     #[test]
