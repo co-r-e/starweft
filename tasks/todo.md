@@ -119,17 +119,16 @@
 
 ---
 
-## Phase 6: 将来検討 (v0.2.0+)
+## Phase 6: v0.2.0 機能拡張 ✅
 
-- [ ] `config validate` サブコマンド
-- [ ] Windows ACL による強固なファイル保護（現在は readonly + hidden）
-- [ ] Windows 向けテスト (.bat スクリプト代替)
-- [ ] プラグインシステム（OpenClaw 以外の worker バックエンド）
-- [ ] パフォーマンスベンチマーク（1000+ タスク）
-- [ ] DB マイグレーション自動化（schema_version 変更時）
-- [ ] TUI ダッシュボード（`ratatui` ベース）
-- [ ] ARM64 / musl ターゲットのクロスコンパイル
-- [ ] `cargo-binstall` 対応
+- [x] `cargo-binstall` 対応 + GitHub Release へのアップロード
+- [x] ARM64 / musl ターゲットのクロスコンパイル (7ターゲット: x86_64/aarch64 Linux gnu+musl, macOS x86_64+aarch64, Windows)
+- [x] DB マイグレーション自動化（マイグレーション前自動バックアップ + schema_version/pending_migrations API）
+- [x] パフォーマンスベンチマーク（100/500/1000/2000 タスク: delegate, progress, result, snapshot, rebuild）
+- [x] Windows ACL による強固なファイル保護（icacls で現在ユーザーのみにアクセス制限）
+- [x] Windows 向けテスト（クロスプラットフォーム smoke テスト 9 件: init, config, identity, status, completions）
+- [x] TUI ダッシュボード（`ratatui` ベース: `starweft dashboard` コマンド）
+- [x] プラグインシステム（`TaskBackend` trait + `OpenClawBackend` デフォルト実装）
 
 ---
 
@@ -144,3 +143,11 @@
 | `23c2329` | Mark flaky relay E2E test as ignored |
 | `486512e` | Add liveness/readiness probes, metrics, relay forwarding, simplify codebase |
 | `e47541f` | Add operational docs, runbooks, deploy templates, and project tooling |
+| `615ce76` | Add config validate subcommand |
+| `7a3aa2b` | Add cargo-binstall support and ARM64/musl cross-compilation targets |
+| `9248526` | Add automatic pre-migration backup and schema version API |
+| `eebc6a9` | Add performance benchmarks for store operations (100-2000 tasks) |
+| `79fac72` | Add Windows ACL restriction via icacls |
+| `b67d9a6` | Add cross-platform smoke tests for basic CLI commands |
+| `dfc438d` | Add TUI dashboard with ratatui |
+| `514c21e` | Add TaskBackend trait for pluggable worker execution backends |
