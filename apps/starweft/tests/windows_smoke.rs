@@ -111,8 +111,11 @@ fn status_renders_without_error() {
     let (ok, _, _) = run(&["init", "--role", "worker", "--data-dir", &data_dir]);
     assert!(ok);
 
-    let (ok, stdout, _) = run(&["status", "--data-dir", &data_dir]);
-    assert!(ok, "status failed: {stdout}");
+    let (ok, _, _) = run(&["identity", "create", "--data-dir", &data_dir]);
+    assert!(ok);
+
+    let (ok, stdout, stderr) = run(&["status", "--data-dir", &data_dir]);
+    assert!(ok, "status failed: stdout={stdout} stderr={stderr}");
     assert!(stdout.contains("role: worker"));
 }
 
