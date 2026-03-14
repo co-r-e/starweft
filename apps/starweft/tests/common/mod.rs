@@ -115,6 +115,21 @@ pub fn reserve_tcp_port() -> u16 {
         .port()
 }
 
+pub fn wait_for_node_ready(data_dir: &Path, timeout: Duration) {
+    let ready_path = data_dir.join(".ready");
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if ready_path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "timed out waiting for node ready marker at {}",
+        ready_path.display()
+    );
+}
+
 pub fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

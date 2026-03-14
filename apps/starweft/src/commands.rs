@@ -1124,6 +1124,15 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source_root = temp.path().join("source");
         let paths = write_backup_source(&source_root);
+        // Clear read-only attribute so the overwrite succeeds on Windows.
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut perms = fs::metadata(&paths.actor_key)
+                .expect("actor key metadata")
+                .permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&paths.actor_key, perms).expect("clear readonly");
+        }
         fs::write(&paths.actor_key, "not-json").expect("corrupt actor key");
 
         let error = create_backup_bundle(Some(&source_root), &temp.path().join("backup"), false)

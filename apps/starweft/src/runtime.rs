@@ -248,6 +248,7 @@ pub(crate) fn run_node(args: RunArgs) -> Result<()> {
         ctrlc::set_handler(move || {
             shutdown.store(false, Ordering::SeqCst);
         })?;
+        let mut ready_written = false;
         while running.load(Ordering::SeqCst) {
             if next_registry_sync_deadline
                 .is_some_and(|deadline| OffsetDateTime::now_utc() >= deadline)
@@ -275,6 +276,10 @@ pub(crate) fn run_node(args: RunArgs) -> Result<()> {
                 &worker_runtime,
             ) {
                 eprintln!("{error:#}");
+            }
+            if !ready_written {
+                let _ = std::fs::write(paths.root.join(".ready"), "");
+                ready_written = true;
             }
             thread::sleep(Duration::from_millis(200));
         }

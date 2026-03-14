@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{
     parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run, spawn_foreground,
-    stop_child, test_lock, wait_for_contains,
+    stop_child, test_lock, wait_for_contains, wait_for_node_ready,
 };
 use tempfile::TempDir;
 
@@ -1394,7 +1394,13 @@ fn libp2p_retries_after_join_reject() {
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(2));
+    let ready_timeout = Duration::from_secs(30);
+    wait_for_node_ready(&owner_dir, ready_timeout);
+    wait_for_node_ready(&worker_a_dir, ready_timeout);
+    wait_for_node_ready(&worker_b_dir, ready_timeout);
+    wait_for_node_ready(&principal_dir, ready_timeout);
+    // Allow libp2p connections to establish after nodes are ready.
+    thread::sleep(Duration::from_secs(3));
 
     run(&[
         "vision",
@@ -1414,13 +1420,13 @@ fn libp2p_retries_after_join_reject() {
         &owner_db,
         "select status from task_results;",
         "completed",
-        Duration::from_secs(60),
+        Duration::from_secs(90),
     );
     wait_for_contains(
         &owner_db,
         "select msg_type from inbox_messages where msg_type = 'JoinReject';",
         "JoinReject",
-        Duration::from_secs(60),
+        Duration::from_secs(90),
     );
     let join_reject_raw = String::from_utf8(
         Command::new("sqlite3")

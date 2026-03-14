@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use common::{
     parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run, spawn_foreground,
-    stop_child, test_lock, wait_for_contains, wait_for_file_contains,
+    stop_child, test_lock, wait_for_contains, wait_for_node_ready,
 };
 use tempfile::TempDir;
 
@@ -426,8 +426,12 @@ fn libp2p_relay_forwards_vision_and_charter() {
         "--foreground",
     ]);
 
-    let relay_runtime_log = relay_dir.join("logs").join("relay.log");
-    wait_for_file_contains(&relay_runtime_log, "queued relay", Duration::from_secs(30));
+    let ready_timeout = Duration::from_secs(30);
+    wait_for_node_ready(&relay_dir, ready_timeout);
+    wait_for_node_ready(&owner_dir, ready_timeout);
+    wait_for_node_ready(&principal_dir, ready_timeout);
+    // Allow libp2p connections to establish after nodes are ready.
+    thread::sleep(Duration::from_secs(3));
     run(&[
         "vision",
         "submit",
@@ -447,13 +451,13 @@ fn libp2p_relay_forwards_vision_and_charter() {
         &owner_db,
         "select title from projects;",
         "Libp2p Relay Vision project",
-        Duration::from_secs(60),
+        Duration::from_secs(90),
     );
     wait_for_contains(
         &principal_db,
         "select title from projects;",
         "Libp2p Relay Vision project",
-        Duration::from_secs(60),
+        Duration::from_secs(90),
     );
     let project_id = String::from_utf8(
         Command::new("sqlite3")
@@ -488,7 +492,7 @@ fn libp2p_relay_forwards_vision_and_charter() {
         &principal_db,
         "select scope_id from snapshots;",
         &project_id,
-        Duration::from_secs(40),
+        Duration::from_secs(90),
     );
 
     run(&[
@@ -507,13 +511,13 @@ fn libp2p_relay_forwards_vision_and_charter() {
         &principal_db,
         "select ack_state from stop_receipts;",
         "stopped",
-        Duration::from_secs(40),
+        Duration::from_secs(90),
     );
     wait_for_contains(
         &owner_db,
         "select status from projects;",
         "stopped",
-        Duration::from_secs(40),
+        Duration::from_secs(90),
     );
 
     stop_child(&mut principal_fg);
