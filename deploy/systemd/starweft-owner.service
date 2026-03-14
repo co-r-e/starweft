@@ -1,0 +1,23 @@
+[Unit]
+Description=Starweft Owner
+After=network-online.target starweft-relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=starweft
+Group=starweft
+EnvironmentFile=-/etc/starweft/owner.env
+WorkingDirectory=/var/lib/starweft/owner
+ExecStart=/usr/local/bin/starweft run --data-dir /var/lib/starweft/owner --foreground
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/starweft/owner
+
+[Install]
+WantedBy=multi-user.target

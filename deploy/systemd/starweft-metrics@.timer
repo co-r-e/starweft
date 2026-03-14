@@ -1,0 +1,10 @@
+[Unit]
+Description=Starweft metrics collector timer (%i)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+Unit=starweft-metrics@%i.service
+
+[Install]
+WantedBy=timers.target

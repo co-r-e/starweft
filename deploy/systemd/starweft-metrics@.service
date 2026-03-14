@@ -1,0 +1,11 @@
+[Unit]
+Description=Starweft metrics collector (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=starweft
+Group=starweft
+EnvironmentFile=-/etc/starweft/%i.env
+ExecStart=/bin/sh -lc '/usr/local/bin/starweft metrics --data-dir /var/lib/starweft/%i --format prometheus > /var/lib/node_exporter/textfile_collector/starweft_%i.prom.tmp && mv /var/lib/node_exporter/textfile_collector/starweft_%i.prom.tmp /var/lib/node_exporter/textfile_collector/starweft_%i.prom'

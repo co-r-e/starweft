@@ -1,0 +1,23 @@
+[Unit]
+Description=Starweft Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=starweft
+Group=starweft
+EnvironmentFile=-/etc/starweft/relay.env
+WorkingDirectory=/var/lib/starweft/relay
+ExecStart=/usr/local/bin/starweft run --data-dir /var/lib/starweft/relay --foreground
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/starweft/relay
+
+[Install]
+WantedBy=multi-user.target
