@@ -3049,7 +3049,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starweft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3085,7 +3085,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3099,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-id"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-observation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-openclaw-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -3133,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-p2p"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libp2p",
@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -3160,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-stop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "starweft-id",
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rusqlite",

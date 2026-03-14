@@ -7,13 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-15
+
 ### Added
 
+- `starweft dashboard` — TUI ダッシュボード (ratatui) でリアルタイムノード監視
+  - ロール別詳細パネル (worker: キャパシティゲージ、owner: リトライ設定、principal: ビジョン/プロジェクト)
+  - Outbox dead-letter ハイライト、auto-refresh (デフォルト 1s)
+- `starweft config validate` — 設定ファイルの包括的バリデーション
+  - listen/seeds アドレス検証、identity キー存在確認、ロール固有チェック
+  - protocol/schema バージョン整合性、`--json` 出力対応
+- `starweft status --probe liveness|readiness` — ノードヘルスプローブ
+- `starweft metrics --format prometheus|json` — 監視向けメトリクス出力
+- `TaskBackend` trait — プラグイン可能な worker 実行バックエンド
+  - `OpenClawBackend` をデフォルト実装として提供
+- DB マイグレーション前自動バックアップ (`.pre-vN.bak`)
+- `Store::schema_version()` / `Store::pending_migrations()` API
+- パフォーマンスベンチマーク (100/500/1000/2000 タスク)
+- クロスプラットフォーム smoke テスト (9 件、Windows/macOS/Linux 共通)
+- `cargo-binstall` 対応 (`[package.metadata.binstall]`)
+- Relay ノードの wire envelope 転送 (`queue_raw_wire`, `save_inbox_wire`)
+- libp2p idle connection timeout (300s)
+- Operational docs: runbooks (topology, operations, backup-restore), セキュリティ運用ガイド
+- systemd service/timer テンプレート、bootstrap-node.sh スクリプト
 - Windows platform support (x86_64-pc-windows-msvc)
   - Default transport: libp2p TCP localhost (local mailbox is Unix-only)
   - Data directory: `%LOCALAPPDATA%\starweft`
   - Process management: Windows Job Objects for subprocess group termination
-  - File protection: read-only attribute for key files, hidden attribute for data directories
+  - File protection: read-only attribute + ACL restriction via icacls
 - Shell completion generation via `starweft completions <shell>` (bash, zsh, fish, powershell, elvish)
 - Global `-v`/`-q` flags for log level control (`-v`: debug, `-vv`: trace, `-q`: warn, `-qq`: error)
 - Registry hardening: mandatory auth on non-loopback binds, body size limits, read/write timeouts, rate limiting
@@ -25,16 +46,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- CI: added `windows-latest` to test/lint/release matrix (3-platform coverage)
+- CI: release matrix expanded to 7 targets (x86_64/aarch64 Linux gnu+musl, macOS x86_64+aarch64, Windows)
+- CI: release artifacts uploaded to GitHub Releases via softprops/action-gh-release
 - CI: serialized E2E tests with `--test-threads=1` to prevent resource conflicts
-- CLI about text updated to Japanese
-- `libc` dependency gated to `cfg(unix)`, `windows-sys` added for Windows APIs
+- Prometheus metrics output: table-driven rendering (replaced 24 repetitive function calls)
+- Artifact pruning: single-pass metadata collection, pre-allocated sort, kept-file exclusion
+- `sha256_hex`: reduced from 32 per-byte allocations to single pre-allocated write
+- E2E test utilities extracted to shared `tests/common/` module (9 functions deduplicated)
 - Log level resolution priority: `-v/-q` > `--log-level` > config.toml > `RUST_LOG` > default (info)
 
 ### Fixed
 
+- Relay forwarding: exclude original sender from delivery targets to prevent broadcast loops
+- Backup verification: validate signer_public_key against bundled actor_key (trust anchor)
+- Backup verification: reject bundles containing files not listed in manifest
+- Backup restore: path traversal prevention (reject absolute paths and `..` components)
+- Backup restore: identity mismatch check when restoring to existing node
+- Windows ACL: handle icacls failure with warning instead of silent ignore, distinguish file vs directory grants
+- Artifact pruning: exclude just-created file from deletion candidates to prevent mtime race
 - Key file overwrite on Windows (`--force`) no longer blocked by read-only attribute
 - `-v` and `-q` flags now conflict (previously `-v` silently won)
+
+### Security
+
+- Backup manifest now cross-validates signer identity against bundled key file
+- Backup restore rejects extra files not declared in manifest
+- Windows private files protected via icacls ACL (current user only) in addition to hidden attribute
 
 ## [0.1.0] - 2025-03-09
 
