@@ -77,6 +77,56 @@ pub struct BridgeProgressUpdate {
     pub message: String,
 }
 
+/// Trait for pluggable task execution backends.
+///
+/// Implementations receive a `BridgeTaskRequest` and return a `BridgeTaskResponse`.
+/// The default implementation (`OpenClawBackend`) spawns an external process, but
+/// custom backends can integrate HTTP APIs, WASM runtimes, or in-process executors.
+pub trait TaskBackend {
+    /// Execute a task and return the result.
+    fn execute(&self, request: &BridgeTaskRequest) -> Result<BridgeTaskResponse>;
+
+    /// Execute a task with cooperative cancellation support.
+    fn execute_with_cancel(
+        &self,
+        request: &BridgeTaskRequest,
+        cancel_flag: &AtomicBool,
+    ) -> Result<BridgeTaskResponse>;
+
+    /// Human-readable name for this backend (used in logs and status).
+    fn name(&self) -> &str;
+
+    /// Capability version string advertised to peers.
+    fn capability_version(&self) -> &str;
+}
+
+/// The default backend that spawns an external OpenClaw-compatible process.
+pub struct OpenClawBackend {
+    pub attachment: OpenClawAttachment,
+}
+
+impl TaskBackend for OpenClawBackend {
+    fn execute(&self, request: &BridgeTaskRequest) -> Result<BridgeTaskResponse> {
+        execute_task_inner(&self.attachment, request, None)
+    }
+
+    fn execute_with_cancel(
+        &self,
+        request: &BridgeTaskRequest,
+        cancel_flag: &AtomicBool,
+    ) -> Result<BridgeTaskResponse> {
+        execute_task_inner(&self.attachment, request, Some(cancel_flag))
+    }
+
+    fn name(&self) -> &str {
+        "openclaw"
+    }
+
+    fn capability_version(&self) -> &str {
+        "openclaw.execution.v1"
+    }
+}
+
 /// Executes a task by spawning the configured external process.
 pub fn execute_task(
     attachment: &OpenClawAttachment,
