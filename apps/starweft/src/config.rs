@@ -582,8 +582,7 @@ fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_private_permissions(path: &Path, _mode: u32) -> Result<()> {
-    // On Windows, ensure files/directories are not world-readable.
-    // Mark files as hidden to reduce accidental exposure.
+    // On Windows, restrict ACL to current user + mark hidden.
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -597,6 +596,21 @@ fn set_private_permissions(path: &Path, _mode: u32) -> Result<()> {
             if attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_HIDDEN == 0) {
                 let _ = SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN);
             }
+        }
+        // Use icacls to restrict access to the current user only.
+        // icacls <path> /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"
+        if let Ok(username) = std::env::var("USERNAME") {
+            let path_str = path.to_string_lossy();
+            let _ = std::process::Command::new("icacls")
+                .args([
+                    path_str.as_ref(),
+                    "/inheritance:r",
+                    "/grant:r",
+                    &format!("{username}:(OI)(CI)F"),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
     let _ = path;
