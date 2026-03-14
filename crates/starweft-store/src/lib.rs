@@ -865,10 +865,7 @@ impl Store {
                 connection
                     .backup(DatabaseName::Main, &backup_path, None)
                     .with_context(|| {
-                        format!(
-                            "pre-migration backup failed: {}",
-                            backup_path.display()
-                        )
+                        format!("pre-migration backup failed: {}", backup_path.display())
                     })?;
             }
         }

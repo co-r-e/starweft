@@ -10,7 +10,7 @@ use serde_json::json;
 use starweft_crypto::StoredKeypair;
 use starweft_id::{ActorId, ProjectId, TaskId, VisionId};
 use starweft_protocol::{
-    ParticipantPolicy, EvaluationPolicy, ProjectCharter, TaskDelegated, TaskExecutionStatus,
+    EvaluationPolicy, ParticipantPolicy, ProjectCharter, TaskDelegated, TaskExecutionStatus,
     TaskProgress, TaskResultSubmitted, UnsignedEnvelope,
 };
 use starweft_store::Store;

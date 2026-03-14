@@ -554,7 +554,8 @@ pub(crate) fn render_metrics_output(args: &MetricsArgs, view: &StatusView) -> Re
         MetricsFormat::Prometheus => {
             use std::fmt::Write;
             let role = metrics.role.as_str();
-            let mut output = String::new();
+            // ~100 bytes per metric (HELP + TYPE + value lines) * 29 metrics
+            let mut output = String::with_capacity(PROMETHEUS_METRICS.len() * 100);
             for (i, (name, help, accessor)) in PROMETHEUS_METRICS.iter().enumerate() {
                 if i > 0 {
                     output.push('\n');

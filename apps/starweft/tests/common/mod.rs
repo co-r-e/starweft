@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -19,7 +21,13 @@ pub fn starweft_bin() -> PathBuf {
     current
         .parent()
         .and_then(Path::parent)
-        .map(|dir| dir.join("starweft"))
+        .map(|dir| {
+            dir.join(if cfg!(windows) {
+                "starweft.exe"
+            } else {
+                "starweft"
+            })
+        })
         .filter(|path| path.exists())
         .unwrap_or_else(|| panic!("starweft binary not found from {}", current.display()))
 }

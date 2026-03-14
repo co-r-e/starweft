@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use sha2::{Digest, Sha256};
 use starweft_crypto::{MessageSignature, StoredKeypair, verify_json, verifying_key_from_base64};
 use starweft_id::{ActorId, NodeId, StopId};
 use starweft_p2p::libp2p_peer_id_from_private_key;
@@ -17,7 +16,7 @@ use crate::helpers::{
     configured_actor_key_path, configured_stop_key_path, copy_dir_if_exists, copy_file_if_exists,
     ensure_binary_exists, extract_peer_suffix, parse_multiaddr, read_keypair, remove_path,
     resolve_peer_public_key, resolve_stop_scope, restore_dir_from_bundle, restore_file_from_bundle,
-    stop_key_exists,
+    sha256_hex, stop_key_exists,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -305,12 +304,6 @@ fn verify_backup_manifest(input: &Path, manifest: &BackupManifest) -> Result<()>
     }
 
     Ok(())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn run_repair_rebuild_projections(args: CommonDataDirArgs) -> Result<()> {

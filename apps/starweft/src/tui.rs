@@ -201,6 +201,11 @@ fn draw_role_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
     }
 }
 
+fn role_table<'a>(title: &'a str, rows: Vec<Row<'a>>) -> Table<'a> {
+    Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
+        .block(Block::default().borders(Borders::ALL).title(title))
+}
+
 fn draw_worker_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
     let cols =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
@@ -212,9 +217,7 @@ fn draw_worker_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
         kv_row("accept_joins", view.worker_accept_join_offers),
         kv_row("openclaw", view.openclaw_enabled),
     ];
-    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
-        .block(Block::default().borders(Borders::ALL).title(" Worker "));
-    frame.render_widget(table, cols[0]);
+    frame.render_widget(role_table(" Worker ", rows), cols[0]);
 
     let capacity = if view.worker_max_active_tasks > 0 {
         (view.active_assigned_tasks as f64 / view.worker_max_active_tasks as f64).min(1.0)
@@ -246,9 +249,7 @@ fn draw_owner_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
         kv_row("max_retry", view.owner_max_retry_attempts),
         kv_row("retry_cooldown_ms", view.owner_retry_cooldown_ms),
     ];
-    let table = Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
-        .block(Block::default().borders(Borders::ALL).title(" Owner "));
-    frame.render_widget(table, area);
+    frame.render_widget(role_table(" Owner ", rows), area);
 }
 
 fn draw_principal_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
@@ -257,9 +258,7 @@ fn draw_principal_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
         kv_row("projects", view.principal_projects),
         kv_row("stop_receipts", view.stop_receipts),
     ];
-    let table = Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
-        .block(Block::default().borders(Borders::ALL).title(" Principal "));
-    frame.render_widget(table, area);
+    frame.render_widget(role_table(" Principal ", rows), area);
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect) {

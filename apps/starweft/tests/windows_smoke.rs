@@ -1,27 +1,12 @@
 //! Windows-compatible smoke tests for basic CLI commands.
 //! These run on all platforms (no Unix-only shell scripts).
 
-use std::path::PathBuf;
+mod common;
+
 use std::process::Command;
 
+use common::starweft_bin;
 use tempfile::TempDir;
-
-fn starweft_bin() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_starweft")
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-    {
-        return path;
-    }
-
-    let current = std::env::current_exe().expect("current test executable");
-    current
-        .parent()
-        .and_then(std::path::Path::parent)
-        .map(|dir| dir.join(if cfg!(windows) { "starweft.exe" } else { "starweft" }))
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| panic!("starweft binary not found from {}", current.display()))
-}
 
 fn run(args: &[&str]) -> (bool, String, String) {
     let output = Command::new(starweft_bin())
