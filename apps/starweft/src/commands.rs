@@ -158,6 +158,21 @@ pub(crate) fn restore_backup_bundle(
     }
     let manifest = load_and_verify_backup_manifest(&input)?;
 
+    // If the restore target already has an identity, verify the backup was
+    // created by the same actor. This prevents restoring a foreign backup
+    // into an existing node without --force.
+    if let Some(signer_key) = &manifest.payload.signer_public_key {
+        if paths.actor_key.exists() {
+            let existing_keypair = read_keypair(&paths.actor_key)
+                .context("[E_BACKUP_IDENTITY_MISMATCH] リストア先の actor_key を読み込めません")?;
+            if existing_keypair.public_key != *signer_key && !force {
+                bail!(
+                    "[E_BACKUP_IDENTITY_MISMATCH] バックアップの署名者とリストア先の identity が一致しません。別ノードのバックアップを復元するには --force を使用してください"
+                );
+            }
+        }
+    }
+
     restore_file_from_bundle(
         &input.join("config.toml"),
         &paths.config_toml,
@@ -273,24 +288,43 @@ fn verify_backup_manifest(input: &Path, manifest: &BackupManifest) -> Result<()>
         .signature
         .as_ref()
         .ok_or_else(|| anyhow!("[E_BACKUP_SIGNATURE_REQUIRED] manifest signature is missing"))?;
-    let public_key = manifest
+    let manifest_public_key = manifest
         .payload
         .signer_public_key
         .as_deref()
         .ok_or_else(|| anyhow!("[E_BACKUP_SIGNATURE_INVALID] signer_public_key is missing"))?;
+
+    // Trust anchor: verify the manifest's signer_public_key against the bundled
+    // actor key file. This prevents an attacker from replacing both the manifest
+    // and the signer_public_key field, since they would also need to replace the
+    // actor_key file — which is itself checksummed in the manifest.
+    let bundled_actor_key = input.join("identity").join("actor_key");
+    if bundled_actor_key.exists() {
+        let bundled_keypair = StoredKeypair::read_from_path(&bundled_actor_key)
+            .context("[E_BACKUP_SIGNATURE_INVALID] バンドル内の actor_key を読み込めません")?;
+        if bundled_keypair.public_key != manifest_public_key {
+            bail!(
+                "[E_BACKUP_SIGNATURE_INVALID] manifest の signer_public_key がバンドル内の actor_key と一致しません"
+            );
+        }
+    }
+
+    // Verify the signature itself.
     verify_json(
-        &verifying_key_from_base64(public_key)?,
+        &verifying_key_from_base64(manifest_public_key)?,
         &manifest.payload,
         signature,
     )
     .map_err(|error| anyhow!("[E_BACKUP_SIGNATURE_INVALID] {error}"))?;
 
+    // Verify each listed file's checksum.
     for entry in &manifest.payload.files {
-        let path = input.join(&entry.path);
+        let entry_path = normalized_manifest_path(&entry.path)?;
+        let path = input.join(&entry_path);
         if !path.exists() {
             bail!(
                 "[E_BACKUP_CHECKSUM_MISMATCH] backup entry is missing: {}",
-                path.display()
+                entry.path
             );
         }
         let bytes = fs::read(&path)?;
@@ -298,12 +332,43 @@ fn verify_backup_manifest(input: &Path, manifest: &BackupManifest) -> Result<()>
         if digest != entry.sha256 || bytes.len() as u64 != entry.size_bytes {
             bail!(
                 "[E_BACKUP_CHECKSUM_MISMATCH] checksum mismatch for {}",
-                path.display()
+                entry.path
+            );
+        }
+    }
+
+    // Verify no extra files exist beyond what the manifest declares.
+    // This prevents an attacker from injecting unverified files into the bundle.
+    let manifest_paths: std::collections::BTreeSet<String> = manifest
+        .payload
+        .files
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    let actual_entries = collect_backup_manifest_entries(input)?;
+    for actual in &actual_entries {
+        if !manifest_paths.contains(&actual.path) {
+            bail!(
+                "[E_BACKUP_MANIFEST_INVALID] バンドルに manifest 外のファイルが含まれています: {}",
+                actual.path
             );
         }
     }
 
     Ok(())
+}
+
+/// Validates that a manifest path is relative and contains no parent traversal.
+fn normalized_manifest_path(raw: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(raw);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("[E_BACKUP_MANIFEST_INVALID] invalid path in manifest: {raw}");
+    }
+    Ok(path)
 }
 
 pub(crate) fn run_repair_rebuild_projections(args: CommonDataDirArgs) -> Result<()> {
