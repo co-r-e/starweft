@@ -41,5 +41,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
 ] }
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/starweft-v{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dev-dependencies]
 tempfile = "3.18.0"

@@ -60,14 +60,30 @@ jobs:
         run: cargo audit
 
   release:
-    name: Release Artifact (${{ matrix.os }})
+    name: Release (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [ci, security]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -75,11 +91,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88.0"
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release -p starweft
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross for aarch64-musl
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --locked
+
+      - name: Build release binary (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release -p starweft --target ${{ matrix.target }}
+
+      - name: Build release binary (cargo)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release -p starweft --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Package artifact (Unix)
         if: runner.os != 'Windows'
@@ -87,9 +123,9 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
-          ARCHIVE="starweft-${VERSION}-${RUNNER_OS}.tar.gz"
+          ARCHIVE="starweft-${VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p dist
-          tar -czf "dist/${ARCHIVE}" -C target/release starweft
+          tar -czf "dist/${ARCHIVE}" -C "target/${{ matrix.target }}/release" starweft
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "dist/${ARCHIVE}" > "dist/${ARCHIVE}.sha256"
           else
@@ -101,14 +137,19 @@ jobs:
         shell: pwsh
         run: |
           $VERSION = $env:GITHUB_REF_NAME
-          $ARCHIVE = "starweft-${VERSION}-Windows.zip"
+          $ARCHIVE = "starweft-${VERSION}-${{ matrix.target }}.zip"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target/release/starweft.exe -DestinationPath "dist/${ARCHIVE}"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/starweft.exe" -DestinationPath "dist/${ARCHIVE}"
           $hash = (Get-FileHash "dist/${ARCHIVE}" -Algorithm SHA256).Hash.ToLower()
           "$hash  ${ARCHIVE}" | Out-File -Encoding ascii "dist/${ARCHIVE}.sha256"
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: starweft-${{ github.ref_name }}-${{ matrix.os }}
+          name: starweft-${{ github.ref_name }}-${{ matrix.target }}
           path: dist/*
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
