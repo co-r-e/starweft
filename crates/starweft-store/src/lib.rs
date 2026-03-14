@@ -856,9 +856,37 @@ impl Store {
 
         let connection =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+
+        // Auto-backup before migration if schema version is behind.
+        let current = schema_user_version(&connection)?;
+        if current > 0 && current < STORE_SCHEMA_VERSION {
+            let backup_path = path.with_extension(format!("pre-v{STORE_SCHEMA_VERSION}.bak"));
+            if !backup_path.exists() {
+                connection
+                    .backup(DatabaseName::Main, &backup_path, None)
+                    .with_context(|| {
+                        format!(
+                            "pre-migration backup failed: {}",
+                            backup_path.display()
+                        )
+                    })?;
+            }
+        }
+
         migrate_connection(&connection)?;
 
         Ok(Self { connection })
+    }
+
+    /// Returns the current schema version stored in the database.
+    pub fn schema_version(&self) -> Result<i32> {
+        schema_user_version(&self.connection)
+    }
+
+    /// Returns the number of pending migrations (0 means up-to-date).
+    pub fn pending_migrations(&self) -> Result<i32> {
+        let current = schema_user_version(&self.connection)?;
+        Ok((STORE_SCHEMA_VERSION - current).max(0))
     }
 
     /// Creates a consistent SQLite backup snapshot of the main database.
