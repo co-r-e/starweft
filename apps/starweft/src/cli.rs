@@ -390,6 +390,7 @@ pub(crate) struct OpenClawAttachArgs {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommands {
     Show(ConfigShowArgs),
+    Validate(ConfigValidateArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -399,6 +400,14 @@ pub(crate) enum RegistryCommands {
 
 #[derive(Debug, Args)]
 pub(crate) struct ConfigShowArgs {
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConfigValidateArgs {
     #[arg(long)]
     pub(crate) data_dir: Option<PathBuf>,
     #[arg(long)]

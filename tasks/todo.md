@@ -94,8 +94,11 @@
 - [x] 監査実施: ユーザー向けコマンド層は `[E_*]` プレフィック付き一貫
 - [x] 内部エラーチェーンは英語で問題なし（`.context()` 経由）
 
-### 4-4. `config validate` サブコマンド
-- [ ] v0.1.x で対応予定（設定ファイルは load 時に検証済み）
+### 4-4. `config validate` サブコマンド ✅
+- [x] `config validate` サブコマンド実装（TOML パース、listen/seeds アドレス、identity キー、ロール固有検証、バージョン整合性）
+- [x] `--json` フラグで JSON 出力対応
+- [x] errors / warnings 分離出力、exit code 連動
+- [x] テスト 3 件追加
 
 ---
 
@@ -139,3 +142,5 @@
 | `9639f4d` | Add Windows platform support |
 | `17f2fd8` | Add shell completions, verbose/quiet flags, and crates.io metadata |
 | `23c2329` | Mark flaky relay E2E test as ignored |
+| `486512e` | Add liveness/readiness probes, metrics, relay forwarding, simplify codebase |
+| `e47541f` | Add operational docs, runbooks, deploy templates, and project tooling |

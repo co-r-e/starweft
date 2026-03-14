@@ -641,6 +641,149 @@ pub(crate) fn run_config_show(args: ConfigShowArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let (config, paths) = match load_existing_config(args.data_dir.as_ref()) {
+        Ok(pair) => pair,
+        Err(error) => {
+            errors.push(format!("config_load: {error:#}"));
+            return print_validation_result(args.json, &errors, &warnings);
+        }
+    };
+
+    // listen アドレスのパース検証
+    for addr in &config.node.listen {
+        if addr.starts_with("/unix/") {
+            // Unix ソケットパスは multiaddr パーサーでは検証しない
+        } else if let Err(error) = parse_multiaddr(addr) {
+            errors.push(format!("node.listen: {error}"));
+        }
+    }
+
+    // data_dir の存在確認
+    if !paths.root.exists() {
+        warnings.push(format!(
+            "node.data_dir: ディレクトリが存在しません: {}",
+            paths.root.display()
+        ));
+    }
+
+    // identity キーファイルの存在確認
+    match configured_actor_key_path(&config, &paths) {
+        Ok(actor_key) if !actor_key.exists() => {
+            warnings.push(format!(
+                "identity.actor_key: キーファイルが存在しません: {}",
+                actor_key.display()
+            ));
+        }
+        Err(error) => {
+            errors.push(format!("identity.actor_key_path: {error}"));
+        }
+        _ => {}
+    }
+
+    // worker ロール固有の検証
+    if config.node.role == NodeRole::Worker {
+        if config.openclaw.enabled {
+            if let Err(error) = ensure_binary_exists(&config.openclaw.bin) {
+                warnings.push(format!("openclaw.bin: {error}"));
+            }
+        }
+        if !config.worker.accept_join_offers {
+            warnings.push(
+                "worker.accept_join_offers: false — ノードはタスクを受け付けません".to_owned(),
+            );
+        }
+    }
+
+    // owner ロール固有の検証
+    if config.node.role == NodeRole::Owner && config.owner.max_retry_attempts == 0 {
+        warnings.push("owner.max_retry_attempts: 0 — タスク失敗時にリトライされません".to_owned());
+    }
+
+    // principal ロール固有: stop_authority_key 確認
+    if config.node.role == NodeRole::Principal && !stop_key_exists(&config, &paths) {
+        warnings.push(
+            "identity.stop_authority_key: キーファイルが存在しません — stop 発行には必要です"
+                .to_owned(),
+        );
+    }
+
+    // protocol/schema バージョンの整合性
+    if config.compatibility.protocol_version != "starweft/0.1" {
+        warnings.push(format!(
+            "compatibility.protocol_version: 想定外の値 '{}' — 接続先ノードと一致していますか？",
+            config.compatibility.protocol_version
+        ));
+    }
+    if config.compatibility.schema_version != starweft_store::STORE_SCHEMA_VERSION_LABEL {
+        warnings.push(format!(
+            "compatibility.schema_version: 想定外の値 '{}' — 現在のバージョンは '{}'",
+            config.compatibility.schema_version,
+            starweft_store::STORE_SCHEMA_VERSION_LABEL
+        ));
+    }
+
+    // discovery seeds の multiaddr 検証
+    for seed in &config.discovery.seeds {
+        if seed.starts_with("/unix/") {
+            // Unix ソケットパスは multiaddr パーサーでは検証しない
+        } else if let Err(error) = parse_multiaddr(seed) {
+            errors.push(format!("discovery.seeds: {error}"));
+        }
+    }
+
+    // observation planner が openclaw 系なのに bin 未設定
+    if matches!(
+        config.observation.planner,
+        config::PlanningStrategyKind::Openclaw | config::PlanningStrategyKind::OpenclawWorker
+    ) && config.observation.planner_bin.is_none()
+        && !config.openclaw.enabled
+    {
+        warnings.push(
+            "observation.planner: openclaw 系ストラテジーですが planner_bin 未設定かつ openclaw.enabled=false"
+                .to_owned(),
+        );
+    }
+
+    print_validation_result(args.json, &errors, &warnings)
+}
+
+fn print_validation_result(json: bool, errors: &[String], warnings: &[String]) -> Result<()> {
+    let ok = errors.is_empty();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": ok,
+                "errors": errors,
+                "warnings": warnings,
+            }))?
+        );
+    } else if ok && warnings.is_empty() {
+        println!("config: ok");
+    } else {
+        if ok {
+            println!("config: ok (warnings あり)");
+        } else {
+            println!("config: invalid");
+        }
+        for error in errors {
+            println!("  error: {error}");
+        }
+        for warning in warnings {
+            println!("  warning: {warning}");
+        }
+    }
+    if ok {
+        Ok(())
+    } else {
+        bail!("[E_CONFIG_INVALID] 設定ファイルに問題があります")
+    }
+}
+
 pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     if config.node.role != NodeRole::Principal {
@@ -969,5 +1112,69 @@ mod tests {
         );
         assert_eq!(messages[0].delivery_attempts, 1);
         assert_eq!(messages[0].last_error.as_deref(), Some("network down"));
+    }
+
+    #[test]
+    fn config_validate_succeeds_for_valid_config() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().to_path_buf();
+
+        super::run_init(crate::cli::InitArgs {
+            role: NodeRole::Worker,
+            data_dir: Some(data_dir.clone()),
+            listen: Vec::new(),
+            display_name: None,
+            no_identity: false,
+            force: false,
+        })
+        .expect("init");
+
+        super::run_identity_create(crate::cli::IdentityCreateArgs {
+            data_dir: Some(data_dir.clone()),
+            principal: false,
+            force: false,
+        })
+        .expect("identity create");
+
+        let result = super::run_config_validate(crate::cli::ConfigValidateArgs {
+            data_dir: Some(data_dir),
+            json: false,
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_validate_json_output_includes_warnings() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().to_path_buf();
+
+        super::run_init(crate::cli::InitArgs {
+            role: NodeRole::Worker,
+            data_dir: Some(data_dir.clone()),
+            listen: Vec::new(),
+            display_name: None,
+            no_identity: true,
+            force: false,
+        })
+        .expect("init");
+
+        // ok は true だが warnings あり (actor_key が存在しない)
+        let result = super::run_config_validate(crate::cli::ConfigValidateArgs {
+            data_dir: Some(data_dir),
+            json: true,
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_validate_reports_error_for_missing_config() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().to_path_buf();
+
+        let result = super::run_config_validate(crate::cli::ConfigValidateArgs {
+            data_dir: Some(data_dir),
+            json: false,
+        });
+        assert!(result.is_err());
     }
 }

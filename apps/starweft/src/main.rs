@@ -107,6 +107,7 @@ fn run(cli: Cli) -> Result<()> {
         },
         Commands::Config { command } => match command {
             ConfigCommands::Show(args) => commands::run_config_show(args),
+            ConfigCommands::Validate(args) => commands::run_config_validate(args),
         },
         Commands::Registry { command } => match command {
             RegistryCommands::Serve(args) => registry::run_registry_serve(args),
