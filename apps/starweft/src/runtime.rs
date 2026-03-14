@@ -556,7 +556,7 @@ pub(crate) fn resolve_delivery_targets(
     envelope: &WireEnvelope,
     peers: &[PeerAddressRecord],
 ) -> Vec<PeerAddressRecord> {
-    let targets = match &envelope.to_actor_id {
+    let mut targets = match &envelope.to_actor_id {
         Some(actor_id) => peers
             .iter()
             .filter(|peer| &peer.actor_id == actor_id)
@@ -564,6 +564,10 @@ pub(crate) fn resolve_delivery_targets(
             .collect(),
         None => peers.to_vec(),
     };
+    // Relay nodes must not send messages back to the original sender.
+    if config.node.role == NodeRole::Relay {
+        targets.retain(|peer| peer.actor_id != envelope.from_actor_id);
+    }
     filter_delivery_targets(config, targets)
 }
 

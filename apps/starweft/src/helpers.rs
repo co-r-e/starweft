@@ -364,7 +364,7 @@ pub(crate) fn persist_task_artifact(
     let bytes = serde_json::to_vec_pretty(output_payload)?;
     std::fs::create_dir_all(&paths.artifacts_dir)?;
     std::fs::write(&artifact_path, &bytes)?;
-    prune_artifact_retention(config, &paths.artifacts_dir)?;
+    prune_artifact_retention(config, &paths.artifacts_dir, Some(&artifact_path))?;
 
     Ok(ArtifactRef {
         artifact_id: starweft_id::ArtifactId::generate(),
@@ -376,14 +376,21 @@ pub(crate) fn persist_task_artifact(
     })
 }
 
-fn prune_artifact_retention(config: &Config, artifacts_dir: &Path) -> Result<()> {
+fn prune_artifact_retention(
+    config: &Config,
+    artifacts_dir: &Path,
+    keep: Option<&Path>,
+) -> Result<()> {
     let files = collect_files_recursive(artifacts_dir)?;
-    if files.is_empty() {
+    let total_count = files.len();
+    if total_count == 0 {
         return Ok(());
     }
 
+    // Collect metadata for all files except the one we just created.
     let mut timed: Vec<(PathBuf, SystemTime)> = files
         .into_iter()
+        .filter(|path| keep.is_none_or(|k| k != path))
         .map(|path| {
             let modified = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
@@ -408,9 +415,12 @@ fn prune_artifact_retention(config: &Config, artifacts_dir: &Path) -> Result<()>
         });
     }
 
-    if config.artifacts.max_files > 0 && timed.len() > config.artifacts.max_files {
+    // Use total file count (including kept file) for the max_files check,
+    // but only delete from the candidate list (excluding kept file).
+    let effective_count = timed.len() + usize::from(keep.is_some());
+    if config.artifacts.max_files > 0 && effective_count > config.artifacts.max_files {
         timed.sort_by_key(|(_, modified)| *modified);
-        let remove_count = timed.len().saturating_sub(config.artifacts.max_files);
+        let remove_count = effective_count.saturating_sub(config.artifacts.max_files);
         for (path, _) in timed.iter().take(remove_count) {
             let _ = std::fs::remove_file(path);
             deleted = true;

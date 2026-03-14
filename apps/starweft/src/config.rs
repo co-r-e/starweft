@@ -598,19 +598,31 @@ fn set_private_permissions(path: &Path, _mode: u32) -> Result<()> {
             }
         }
         // Use icacls to restrict access to the current user only.
-        // icacls <path> /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"
         if let Ok(username) = std::env::var("USERNAME") {
             let path_str = path.to_string_lossy();
-            let _ = std::process::Command::new("icacls")
-                .args([
-                    path_str.as_ref(),
-                    "/inheritance:r",
-                    "/grant:r",
-                    &format!("{username}:(OI)(CI)F"),
-                ])
+            let grant = if path.is_dir() {
+                format!("{username}:(OI)(CI)F")
+            } else {
+                format!("{username}:F")
+            };
+            let status = std::process::Command::new("icacls")
+                .args([path_str.as_ref(), "/inheritance:r", "/grant:r", &grant])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
+            match status {
+                Ok(s) if !s.success() => {
+                    tracing::warn!(
+                        "icacls failed for {}: exit code {:?}",
+                        path.display(),
+                        s.code()
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!("icacls not available for {}: {error}", path.display());
+                }
+                _ => {}
+            }
         }
     }
     let _ = path;
