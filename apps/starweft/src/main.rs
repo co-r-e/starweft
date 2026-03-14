@@ -9,6 +9,7 @@ mod publish;
 mod registry;
 mod runtime;
 mod status;
+mod tui;
 mod vision;
 mod wait;
 mod watch;
@@ -133,6 +134,7 @@ fn run(cli: Cli) -> Result<()> {
             TaskCommands::Approve(args) => project::run_task_approve(args),
         },
         Commands::Wait(args) => wait::run_wait(args),
+        Commands::Dashboard(args) => tui::run_dashboard(args),
         Commands::Completions { shell } => {
             clap_complete::generate(
                 shell,

@@ -87,6 +87,8 @@ pub(crate) enum Commands {
     Stop(StopArgs),
     Status(StatusArgs),
     Wait(WaitArgs),
+    /// TUI ダッシュボード (リアルタイムステータス表示)
+    Dashboard(DashboardArgs),
     /// シェル補完スクリプトを生成
     Completions {
         /// 対象シェル (bash, zsh, fish, powershell, elvish)
@@ -716,4 +718,13 @@ pub(crate) struct TaskApproveArgs {
     pub(crate) interval_ms: u64,
     #[arg(long)]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DashboardArgs {
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+    /// リフレッシュ間隔(ミリ秒)
+    #[arg(long, default_value_t = 1000)]
+    pub(crate) interval_ms: u64,
 }

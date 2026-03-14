@@ -13,10 +13,12 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 clap_complete = "4.5"
+crossterm = "0.28"
 ctrlc = "3.4.5"
 dirs.workspace = true
 hmac.workspace = true
 multiaddr.workspace = true
+ratatui = "0.29"
 rand_core.workspace = true
 reqwest = { version = "0.12.15", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
