@@ -8,6 +8,10 @@ description = "SQLite-backed persistent storage layer for starweft"
 repository.workspace = true
 homepage.workspace = true
 
+[[bench]]
+name = "store_bench"
+harness = false
+
 [dependencies]
 anyhow.workspace = true
 rusqlite.workspace = true
