@@ -3,21 +3,21 @@
 
 const { execFileSync } = require("child_process");
 const path = require("path");
-const fs = require("fs");
 
+// Binary naming: Unix uses "starweft-bin", Windows uses "starweft.exe".
+// See also npm/install.js where the binary is placed.
 const ext = process.platform === "win32" ? ".exe" : "-bin";
 const bin = path.join(__dirname, `starweft${ext}`);
-
-if (!fs.existsSync(bin)) {
-  console.error(
-    "starweft binary not found. Run 'npm rebuild starweft' or reinstall the package."
-  );
-  process.exit(1);
-}
 
 try {
   execFileSync(bin, process.argv.slice(2), { stdio: "inherit" });
 } catch (err) {
+  if (err.code === "ENOENT") {
+    console.error(
+      "starweft binary not found. Run 'npm rebuild starweft' or reinstall the package."
+    );
+    process.exit(1);
+  }
   if (err.status !== undefined) {
     process.exit(err.status);
   }

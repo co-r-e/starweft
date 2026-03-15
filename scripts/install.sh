@@ -6,6 +6,16 @@ set -eu
 REPO="co-r-e/starweft"
 INSTALL_DIR="${STARWEFT_INSTALL_DIR:-/usr/local/bin}"
 
+# Detect download tool once at startup
+if command -v curl >/dev/null 2>&1; then
+  FETCH="curl"
+elif command -v wget >/dev/null 2>&1; then
+  FETCH="wget"
+else
+  echo "Error: curl or wget is required" >&2
+  exit 1
+fi
+
 detect_platform() {
   os="$(uname -s)"
   arch="$(uname -m)"
@@ -26,23 +36,20 @@ detect_platform() {
 }
 
 get_latest_version() {
-  if command -v curl >/dev/null 2>&1; then
+  if [ "$FETCH" = "curl" ]; then
     curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
   else
-    echo "Error: curl or wget is required" >&2
-    exit 1
+    wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
   fi
 }
 
 download() {
   url="$1"
   dest="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$dest" "$url"
+  if [ "$FETCH" = "curl" ]; then
+    curl -fsSL --connect-timeout 30 --max-time 300 -o "$dest" "$url"
   else
-    wget -qO "$dest" "$url"
+    wget -qO "$dest" --timeout=30 "$url"
   fi
 }
 
@@ -73,8 +80,8 @@ main() {
   elif command -v shasum >/dev/null 2>&1; then
     actual_hash="$(shasum -a 256 "${tmpdir}/${archive}" | awk '{print $1}')"
   else
-    echo "Warning: no sha256 tool found, skipping verification" >&2
-    actual_hash="$expected_hash"
+    echo "Error: sha256sum or shasum is required for checksum verification" >&2
+    exit 1
   fi
   if [ "$actual_hash" != "$expected_hash" ]; then
     echo "Error: checksum mismatch" >&2
