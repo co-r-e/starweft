@@ -1,0 +1,38 @@
+{
+  "name": "starweft",
+  "version": "0.3.0",
+  "description": "Distributed multi-agent task coordination CLI for OpenClaw",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/co-r-e/starweft.git"
+  },
+  "homepage": "https://co-r-e.github.io/starweft-docs/",
+  "bin": {
+    "starweft": "bin/starweft"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "install.js"
+  ],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "keywords": [
+    "starweft",
+    "openclaw",
+    "p2p",
+    "multi-agent",
+    "distributed",
+    "cli"
+  ]
+}

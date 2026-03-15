@@ -287,11 +287,29 @@ cargo test
 
 リリースバイナリ（Linux / macOS / Windows）は [GitHub Releases](https://github.com/co-r-e/starweft/releases) からダウンロードできます。
 
+### curl (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/co-r-e/starweft/main/scripts/install.sh | sh
+```
+
 ### Homebrew (macOS / Linux)
 
 ```bash
 brew tap co-r-e/oss
 brew install starweft
+```
+
+### npm
+
+```bash
+npm install -g starweft
+```
+
+### cargo install
+
+```bash
+cargo install starweft
 ```
 
 ### ソースからビルド
