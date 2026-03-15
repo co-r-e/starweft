@@ -290,7 +290,7 @@ cargo test
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew tap co-r-e/tap
+brew tap co-r-e/oss
 brew install starweft
 ```
 
