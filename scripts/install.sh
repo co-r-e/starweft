@@ -67,16 +67,24 @@ main() {
   download "$sha_url" "${tmpdir}/${archive}.sha256"
 
   echo "Verifying checksum..."
-  cd "$tmpdir"
+  expected_hash="$(awk '{print $1}' "${tmpdir}/${archive}.sha256")"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -c "${archive}.sha256"
+    actual_hash="$(sha256sum "${tmpdir}/${archive}" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 -c "${archive}.sha256"
+    actual_hash="$(shasum -a 256 "${tmpdir}/${archive}" | awk '{print $1}')"
   else
     echo "Warning: no sha256 tool found, skipping verification" >&2
+    actual_hash="$expected_hash"
+  fi
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    echo "Error: checksum mismatch" >&2
+    echo "  expected: $expected_hash" >&2
+    echo "  actual:   $actual_hash" >&2
+    exit 1
   fi
 
   echo "Extracting..."
+  cd "$tmpdir"
   tar xzf "$archive"
 
   echo "Installing to ${INSTALL_DIR}..."

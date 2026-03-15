@@ -81,9 +81,10 @@ async function main() {
     execSync(`tar xzf "${archivePath}" -C "${tmpDir}"`, { stdio: "inherit" });
   }
 
-  const binaryName = isWindows ? "starweft.exe" : "starweft";
-  const src = path.join(tmpDir, binaryName);
-  const dest = path.join(binDir, binaryName);
+  const extractedName = isWindows ? "starweft.exe" : "starweft";
+  const installedName = isWindows ? "starweft.exe" : "starweft-bin";
+  const src = path.join(tmpDir, extractedName);
+  const dest = path.join(binDir, installedName);
 
   fs.mkdirSync(binDir, { recursive: true });
   fs.copyFileSync(src, dest);

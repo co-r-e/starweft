@@ -3,9 +3,17 @@
 
 const { execFileSync } = require("child_process");
 const path = require("path");
+const fs = require("fs");
 
-const ext = process.platform === "win32" ? ".exe" : "";
+const ext = process.platform === "win32" ? ".exe" : "-bin";
 const bin = path.join(__dirname, `starweft${ext}`);
+
+if (!fs.existsSync(bin)) {
+  console.error(
+    "starweft binary not found. Run 'npm rebuild starweft' or reinstall the package."
+  );
+  process.exit(1);
+}
 
 try {
   execFileSync(bin, process.argv.slice(2), { stdio: "inherit" });
