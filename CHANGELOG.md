@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-15
+
+### Added
+
+- **mDNS ローカルディスカバリ** — LAN 内のノードを自動発見し、`peer add` なしでクラスタ形成が可能に
+  - `discovery.mdns = true` で有効化（libp2p transport 時デフォルト有効）
+  - mDNS ピアはセッション限り（再起動で再発見）
+  - Ed25519 署名検証は引き続き必須（mDNS は transport 層のみ）
+  - サービス名: `_starweft._udp.local.`
+- Homebrew Formula (`Formula/starweft.rb`) + CI 自動更新ジョブ
+
+### Changed
+
+- E2E テスト安定化: 全テストから blind `thread::sleep` を排除し、`wait_for_node_ready` / `wait_for_contains` による決定的タイミングに置換
+- `StarweftBehaviour` に `Toggle<mdns::Behaviour>` フィールド追加
+- `Libp2pTransport::new()` に `mdns_enabled` パラメータ追加
+- `DiscoverySection` に `mdns: bool` 設定フィールド追加
+
 ## [0.2.0] - 2026-03-15
 
 ### Added

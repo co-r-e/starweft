@@ -72,6 +72,8 @@ pub struct IdentitySection {
 pub struct DiscoverySection {
     pub seeds: Vec<String>,
     pub auto_discovery: bool,
+    #[serde(default)]
+    pub mdns: bool,
     pub registry_url: Option<String>,
     pub registry_ttl_sec: u64,
     pub registry_heartbeat_sec: u64,
@@ -395,6 +397,7 @@ impl Config {
             discovery: DiscoverySection {
                 seeds: Vec::new(),
                 auto_discovery: true,
+                mdns: P2pTransportKind::default() == P2pTransportKind::Libp2p,
                 registry_url: None,
                 registry_ttl_sec: 300,
                 registry_heartbeat_sec: 60,

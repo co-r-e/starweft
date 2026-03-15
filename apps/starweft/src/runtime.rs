@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use multiaddr::Multiaddr;
 use serde_json::Value;
 use starweft_crypto::{StoredKeypair, verifying_key_from_base64};
-use starweft_id::{ActorId, ProjectId, StopId, TaskId};
+use starweft_id::{ActorId, NodeId, ProjectId, StopId, TaskId};
 use starweft_observation::{PlannedTaskSpec, estimate_task_duration_sec};
 use starweft_openclaw_bridge::{
     BridgeTaskRequest, BridgeTaskResponse, OpenClawAttachment, execute_task_with_cancel_flag,
@@ -325,6 +325,7 @@ pub(crate) fn run_node_once(
     task_completion_queue: &TaskCompletionQueue<'_>,
     worker_runtime: &WorkerRuntimeState,
 ) -> Result<RunTick> {
+    process_mdns_discoveries(config, paths, store, topology, transport, actor_key)?;
     process_local_inbox(&InboxProcessingContext {
         config,
         paths,
@@ -363,7 +364,11 @@ pub(crate) fn build_transport(
             let actor_key_path =
                 configured_actor_key_path(config, &DataPaths::from_config(config)?)?;
             let actor_key = read_keypair(&actor_key_path)?;
-            RuntimeTransport::libp2p(topology, actor_key.secret_key_bytes()?)
+            RuntimeTransport::libp2p(
+                topology,
+                actor_key.secret_key_bytes()?,
+                config.discovery.mdns,
+            )
         }
     }
 }
@@ -2074,6 +2079,59 @@ pub(crate) fn handle_worker_join_offer(
 
     runtime.mark_inbox_message_processed(&envelope.msg_id)?;
 
+    Ok(())
+}
+
+fn process_mdns_discoveries(
+    config: &Config,
+    paths: &DataPaths,
+    store: &Store,
+    topology: &RuntimeTopology,
+    transport: &RuntimeTransport,
+    actor_key: Option<&StoredKeypair>,
+) -> Result<()> {
+    let peers = transport.discovered_peers();
+    if peers.is_empty() {
+        return Ok(());
+    }
+    let Some(actor_key) = actor_key else {
+        return Ok(());
+    };
+    let Some(identity) = store.local_identity()? else {
+        return Ok(());
+    };
+    let listen_addresses = local_listen_addresses(topology, transport);
+    let stop_public_key = local_stop_public_key_helper(config, paths);
+    let capabilities = local_advertised_capabilities(config);
+    let runtime = RuntimePipeline::new(store);
+    for peer in peers {
+        let prefix = &peer.peer_id[..16.min(peer.peer_id.len())];
+        let actor_id = ActorId::new(format!("mdns_{prefix}"))?;
+        let node_id = NodeId::new(format!("mdns_{prefix}"))?;
+        for address in &peer.addresses {
+            let full_addr = format!("{}/p2p/{}", address, peer.peer_id);
+            store.add_peer_address(&PeerAddressRecord {
+                actor_id: actor_id.clone(),
+                node_id: node_id.clone(),
+                multiaddr: full_addr,
+                last_seen_at: Some(OffsetDateTime::now_utc()),
+            })?;
+        }
+        let query = UnsignedEnvelope::new(
+            identity.actor_id.clone(),
+            Some(actor_id),
+            CapabilityQuery {
+                node_id: identity.node_id.clone(),
+                public_key: identity.public_key.clone(),
+                stop_public_key: stop_public_key.clone(),
+                capabilities: capabilities.clone(),
+                listen_addresses: listen_addresses.clone(),
+                requested_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .sign(actor_key)?;
+        runtime.queue_outgoing(&query)?;
+    }
     Ok(())
 }
 

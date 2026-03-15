@@ -264,7 +264,7 @@ fn libp2p_three_node_workflow_and_stop() {
         worker_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(2));
+    wait_for_node_ready(&worker_dir, Duration::from_secs(30));
     let mut owner_fg = spawn_foreground(&[
         "run",
         "--data-dir",
@@ -284,7 +284,7 @@ fn libp2p_three_node_workflow_and_stop() {
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(1));
+    wait_for_node_ready(&principal_dir, Duration::from_secs(30));
 
     run(&[
         "vision",
@@ -562,7 +562,10 @@ fn libp2p_worker_plans_vision_via_openclaw() {
         "--foreground",
     ]);
 
-    thread::sleep(Duration::from_secs(2));
+    let ready_timeout = Duration::from_secs(30);
+    wait_for_node_ready(&owner_dir, ready_timeout);
+    wait_for_node_ready(&worker_dir, ready_timeout);
+    wait_for_node_ready(&principal_dir, ready_timeout);
     let owner_db = owner_dir.join("ledger").join("node.db");
     wait_for_contains(
         &owner_db,
@@ -833,7 +836,7 @@ fn libp2p_owner_queries_capabilities_from_running_worker() {
         worker_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(2));
+    wait_for_node_ready(&worker_dir, Duration::from_secs(30));
     let mut owner_fg = spawn_foreground(&[
         "run",
         "--data-dir",
@@ -1035,7 +1038,7 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
         worker_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(2));
+    wait_for_node_ready(&worker_dir, Duration::from_secs(30));
     let mut owner_fg = spawn_foreground(&[
         "run",
         "--data-dir",
@@ -1058,7 +1061,7 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(1));
+    wait_for_node_ready(&principal_dir, Duration::from_secs(30));
     run(&[
         "vision",
         "submit",
@@ -1399,8 +1402,14 @@ fn libp2p_retries_after_join_reject() {
     wait_for_node_ready(&worker_a_dir, ready_timeout);
     wait_for_node_ready(&worker_b_dir, ready_timeout);
     wait_for_node_ready(&principal_dir, ready_timeout);
-    // Allow libp2p connections to establish after nodes are ready.
-    thread::sleep(Duration::from_secs(3));
+    // Wait for libp2p connections to establish after nodes are ready.
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.execution.v1",
+        Duration::from_secs(30),
+    );
 
     run(&[
         "vision",
@@ -1622,7 +1631,7 @@ fn libp2p_worker_executes_via_openclaw_bridge() {
         worker_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(2));
+    wait_for_node_ready(&worker_dir, Duration::from_secs(30));
     let mut owner_fg = spawn_foreground(&[
         "run",
         "--data-dir",
@@ -1642,7 +1651,7 @@ fn libp2p_worker_executes_via_openclaw_bridge() {
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(1));
+    wait_for_node_ready(&principal_dir, Duration::from_secs(30));
 
     run(&[
         "vision",
@@ -1899,7 +1908,19 @@ fn libp2p_retries_after_failed_task_result() {
         principal_dir.to_str().expect("path"),
         "--foreground",
     ]);
-    thread::sleep(Duration::from_secs(2));
+    let ready_timeout = Duration::from_secs(30);
+    wait_for_node_ready(&owner_dir, ready_timeout);
+    wait_for_node_ready(&worker_a_dir, ready_timeout);
+    wait_for_node_ready(&worker_b_dir, ready_timeout);
+    wait_for_node_ready(&principal_dir, ready_timeout);
+    // Wait for libp2p connections to establish after nodes are ready.
+    let owner_db = owner_dir.join("ledger").join("node.db");
+    wait_for_contains(
+        &owner_db,
+        "select capabilities_json from peer_keys;",
+        "openclaw.execution.v1",
+        Duration::from_secs(30),
+    );
 
     run(&[
         "vision",

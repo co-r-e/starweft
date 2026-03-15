@@ -4,7 +4,6 @@
 mod common;
 
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
 
 use common::{
@@ -159,7 +158,10 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
         "--foreground",
     ]);
 
-    thread::sleep(Duration::from_secs(2));
+    let ready_timeout = Duration::from_secs(30);
+    wait_for_node_ready(&relay_dir, ready_timeout);
+    wait_for_node_ready(&owner_dir, ready_timeout);
+    wait_for_node_ready(&principal_dir, ready_timeout);
     run(&[
         "vision",
         "submit",
@@ -430,8 +432,6 @@ fn libp2p_relay_forwards_vision_and_charter() {
     wait_for_node_ready(&relay_dir, ready_timeout);
     wait_for_node_ready(&owner_dir, ready_timeout);
     wait_for_node_ready(&principal_dir, ready_timeout);
-    // Allow libp2p connections to establish after nodes are ready.
-    thread::sleep(Duration::from_secs(3));
     run(&[
         "vision",
         "submit",

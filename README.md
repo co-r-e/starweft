@@ -185,6 +185,21 @@ worker が join を受けると OpenClaw 実行が始まり、owner に progress
 - listen / peer add に `/ip4/.../tcp/.../p2p/<peer_id>` を使用
 - Noise 暗号化 + Yamux 多重化
 
+### mDNS ローカルディスカバリ (v0.3.0)
+
+libp2p transport 使用時、mDNS で LAN 内のノードを自動発見できます。
+
+```toml
+[discovery]
+mdns = true  # libp2p transport 時のデフォルト
+```
+
+- `peer add` なしで同一 LAN 上のノードが自動接続
+- 発見後、CapabilityQuery/CapabilityAdvertisement で自動的にピア情報を交換
+- mDNS ピアはセッション限り（ノード再起動で再発見）
+- Ed25519 署名検証は引き続き有効（mDNS は transport 層のアドレス発見のみ）
+- **セキュリティ注意**: mDNS は非認証です。LAN 上の任意デバイスがアナウンス可能ですが、メッセージ層の Ed25519 署名が防御線として機能します
+
 ## GitHub publish
 
 GitHub へ投稿する場合は、次のいずれかを設定します。
@@ -272,11 +287,22 @@ cargo test
 
 リリースバイナリ（Linux / macOS / Windows）は [GitHub Releases](https://github.com/co-r-e/starweft/releases) からダウンロードできます。
 
-ソースからビルドする場合:
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap co-r-e/tap
+brew install starweft
+```
+
+### ソースからビルド
 
 ```bash
 cargo install --path apps/starweft
 ```
+
+## ドキュメント
+
+詳細なドキュメントは [https://co-r-e.github.io/starweft-docs/](https://co-r-e.github.io/starweft-docs/) を参照してください。
 
 ## ライセンス
 

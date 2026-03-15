@@ -7,6 +7,7 @@
 use anyhow::{Result, anyhow, bail};
 use libp2p::futures::StreamExt;
 use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use multiaddr::Protocol;
@@ -19,6 +20,15 @@ use std::thread;
 use std::time::Duration;
 
 const MAX_INBOX_CAPACITY: usize = 10_000;
+
+/// A peer discovered via mDNS on the local network.
+#[derive(Clone, Debug)]
+pub struct DiscoveredPeer {
+    /// The peer's libp2p peer ID string.
+    pub peer_id: String,
+    /// Multiaddrs where the peer can be reached.
+    pub addresses: Vec<Multiaddr>,
+}
 
 /// A remote peer's multiaddr endpoint used for dialing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -148,8 +158,16 @@ impl RuntimeTransport {
     }
 
     /// Creates a libp2p transport from the given topology and Ed25519 private key.
-    pub fn libp2p(topology: &RuntimeTopology, private_key: [u8; 32]) -> Result<Self> {
-        Ok(Self::Libp2p(Libp2pTransport::new(topology, private_key)?))
+    pub fn libp2p(
+        topology: &RuntimeTopology,
+        private_key: [u8; 32],
+        mdns_enabled: bool,
+    ) -> Result<Self> {
+        Ok(Self::Libp2p(Libp2pTransport::new(
+            topology,
+            private_key,
+            mdns_enabled,
+        )?))
     }
 
     /// Returns the libp2p peer ID if using the libp2p transport.
@@ -157,6 +175,14 @@ impl RuntimeTransport {
         match self {
             Self::LocalMailbox(_) => None,
             Self::Libp2p(driver) => Some(driver.peer_id()),
+        }
+    }
+
+    /// Drains peers discovered via mDNS since the last call.
+    pub fn discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        match self {
+            Self::LocalMailbox(_) => Vec::new(),
+            Self::Libp2p(driver) => driver.discovered_peers(),
         }
     }
 
@@ -312,6 +338,8 @@ pub struct EnvelopeAck {
 pub struct StarweftBehaviour {
     /// CBOR-encoded request-response sub-behaviour.
     pub request_response: request_response::cbor::Behaviour<String, EnvelopeAck>,
+    /// Optional mDNS sub-behaviour for local network peer discovery.
+    pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
 }
 
 enum Libp2pCommand {
@@ -322,6 +350,9 @@ enum Libp2pCommand {
         multiaddr: Multiaddr,
         payload: String,
         reply_tx: Sender<Result<Option<DeliveryReport>>>,
+    },
+    DrainDiscoveredPeers {
+        reply_tx: Sender<Vec<DiscoveredPeer>>,
     },
     Shutdown,
 }
@@ -341,7 +372,11 @@ pub struct Libp2pTransport {
 
 impl Libp2pTransport {
     /// Creates a new libp2p transport, spawning a background worker thread.
-    pub fn new(topology: &RuntimeTopology, private_key: [u8; 32]) -> Result<Self> {
+    pub fn new(
+        topology: &RuntimeTopology,
+        private_key: [u8; 32],
+        mdns_enabled: bool,
+    ) -> Result<Self> {
         let listen_addresses = topology
             .listen_addresses
             .iter()
@@ -382,8 +417,13 @@ impl Libp2pTransport {
             };
 
             let result = runtime.block_on(async move {
-                let (mut swarm, announced) =
-                    build_swarm(listen_addresses, expected_listens, private_key).await?;
+                let (mut swarm, announced) = build_swarm(
+                    listen_addresses,
+                    expected_listens,
+                    private_key,
+                    mdns_enabled,
+                )
+                .await?;
                 let peer_id = swarm.local_peer_id().to_string();
                 init_tx
                     .send(Ok(Libp2pInit {
@@ -416,6 +456,19 @@ impl Libp2pTransport {
     /// Returns the announced listen addresses.
     pub fn listen_addresses(&self) -> &[Multiaddr] {
         &self.listen_addresses
+    }
+
+    /// Drains peers discovered via mDNS since the last call.
+    pub fn discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .command_tx
+            .send(Libp2pCommand::DrainDiscoveredPeers { reply_tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.recv().unwrap_or_default()
     }
 }
 
@@ -466,6 +519,7 @@ async fn build_swarm(
     listen_addresses: Vec<Multiaddr>,
     expected_listens: usize,
     private_key: [u8; 32],
+    mdns_enabled: bool,
 ) -> Result<(Swarm<StarweftBehaviour>, Vec<Multiaddr>)> {
     let identity = libp2p::identity::Keypair::ed25519_from_bytes(private_key)
         .map_err(|error| anyhow!("failed to decode libp2p identity: {error}"))?;
@@ -476,12 +530,21 @@ async fn build_swarm(
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
-        .with_behaviour(|_| {
+        .with_behaviour(|key| {
             let protocols =
                 std::iter::once((StreamProtocol::new("/starweft/0.1"), ProtocolSupport::Full));
             let config = request_response::Config::default();
+            let mdns = if mdns_enabled {
+                Some(libp2p::mdns::tokio::Behaviour::new(
+                    libp2p::mdns::Config::default(),
+                    key.public().to_peer_id(),
+                )?)
+            } else {
+                None
+            };
             Ok(StarweftBehaviour {
                 request_response: request_response::cbor::Behaviour::new(protocols, config),
+                mdns: mdns.into(),
             })
         })?
         // Keep idle connections open long enough for multi-step workflows.
@@ -510,6 +573,8 @@ async fn libp2p_event_loop(
 ) -> Result<()> {
     let mut inbox = Vec::new();
     let mut pending = HashMap::new();
+    let mut discovered_peers: Vec<DiscoveredPeer> = Vec::new();
+    let mut mdns_seen_peers = HashSet::new();
     let seed_targets = parse_seed_targets(&seed_peers);
     let mut connected_seed_peers = HashSet::new();
     let mut pending_seed_dials = HashSet::new();
@@ -535,6 +600,10 @@ async fn libp2p_event_loop(
                         swarm.add_peer_address(peer_id, multiaddr.clone());
                         let request_id = swarm.behaviour_mut().request_response.send_request(&peer_id, payload);
                         pending.insert(request_id, (reply_tx, multiaddr));
+                    }
+                    Libp2pCommand::DrainDiscoveredPeers { reply_tx } => {
+                        let drained = std::mem::take(&mut discovered_peers);
+                        let _ = reply_tx.send(drained);
                     }
                     Libp2pCommand::Shutdown => break,
                 }
@@ -608,6 +677,37 @@ async fn libp2p_event_loop(
                         request_response::Event::InboundFailure { error, .. }
                     )) => {
                         tracing::warn!("libp2p inbound failure: {error}");
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::Mdns(
+                        libp2p::mdns::Event::Discovered(peers)
+                    )) => {
+                        let mut batch = HashSet::new();
+                        for (peer_id, address) in &peers {
+                            swarm.add_peer_address(*peer_id, address.clone());
+                            batch.insert(*peer_id);
+                        }
+                        for peer_id in batch {
+                            if !mdns_seen_peers.insert(peer_id) {
+                                continue;
+                            }
+                            let addresses: Vec<Multiaddr> = peers
+                                .iter()
+                                .filter(|(pid, _)| *pid == peer_id)
+                                .map(|(_, addr)| addr.clone())
+                                .collect();
+                            tracing::info!("mDNS discovered peer {peer_id} at {addresses:?}");
+                            discovered_peers.push(DiscoveredPeer {
+                                peer_id: peer_id.to_string(),
+                                addresses,
+                            });
+                        }
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::Mdns(
+                        libp2p::mdns::Event::Expired(peers)
+                    )) => {
+                        for (peer_id, address) in peers {
+                            tracing::debug!("mDNS expired peer {peer_id} at {address}");
+                        }
                     }
                     other => {
                         tracing::debug!("libp2p swarm event: {other:?}");
@@ -690,7 +790,7 @@ mod tests {
             std::iter::empty::<String>(),
         )
         .expect("topology");
-        let transport = Libp2pTransport::new(&topology, [7; 32]).expect("transport");
+        let transport = Libp2pTransport::new(&topology, [7; 32], false).expect("transport");
         assert!(!transport.peer_id().is_empty());
         assert!(!transport.listen_addresses().is_empty());
     }
@@ -707,8 +807,8 @@ mod tests {
             std::iter::empty::<String>(),
         )
         .expect("topology b");
-        let transport_a = Libp2pTransport::new(&topology_a, [11; 32]).expect("transport a");
-        let transport_b = Libp2pTransport::new(&topology_b, [12; 32]).expect("transport b");
+        let transport_a = Libp2pTransport::new(&topology_a, [11; 32], false).expect("transport a");
+        let transport_b = Libp2pTransport::new(&topology_b, [12; 32], false).expect("transport b");
 
         let mut target = transport_b.listen_addresses()[0].clone();
         target.push(Protocol::P2p(
@@ -755,8 +855,31 @@ mod tests {
         )
         .expect("topology");
 
-        let error = Libp2pTransport::new(&topology, [21; 32]).expect_err("seed should fail");
+        let error = Libp2pTransport::new(&topology, [21; 32], false).expect_err("seed should fail");
         assert!(error.to_string().contains("/p2p/<peer-id>"));
+    }
+
+    #[test]
+    fn mdns_toggle_off_produces_disabled_behaviour() {
+        let topology = RuntimeTopology::validate(
+            ["/ip4/127.0.0.1/tcp/0".to_owned()],
+            std::iter::empty::<String>(),
+        )
+        .expect("topology");
+        let transport = Libp2pTransport::new(&topology, [30; 32], false).expect("transport");
+        assert!(transport.discovered_peers().is_empty());
+    }
+
+    #[test]
+    fn build_swarm_with_mdns_enabled() {
+        let topology = RuntimeTopology::validate(
+            ["/ip4/127.0.0.1/tcp/0".to_owned()],
+            std::iter::empty::<String>(),
+        )
+        .expect("topology");
+        let transport = Libp2pTransport::new(&topology, [31; 32], true).expect("transport");
+        assert!(!transport.peer_id().is_empty());
+        assert!(transport.discovered_peers().is_empty());
     }
 
     #[test]
