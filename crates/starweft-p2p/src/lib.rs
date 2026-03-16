@@ -20,6 +20,34 @@ use std::thread;
 use std::time::Duration;
 
 const MAX_INBOX_CAPACITY: usize = 10_000;
+const STARWEFT_PROTOCOL_ID: &str = "/starweft/0.1";
+
+/// Circuit Relay v2 operating mode.
+#[derive(Clone, Copy, Debug)]
+pub enum RelayMode {
+    /// No relay functionality.
+    Disabled,
+    /// Act as a relay server for other peers.
+    Server {
+        max_reservations: u32,
+        max_circuits_per_peer: u32,
+        reservation_duration: Duration,
+    },
+    /// Act as a relay client (request relay reservations when behind NAT).
+    Client,
+}
+
+/// NAT reachability status as reported by AutoNAT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NatStatus {
+    /// Reachability has not yet been determined.
+    Unknown,
+    /// The node is directly reachable from the public internet.
+    Public,
+    /// The node is behind a NAT and requires relay or hole-punching.
+    Private,
+}
 
 /// A peer discovered via mDNS on the local network.
 #[derive(Clone, Debug)]
@@ -162,11 +190,15 @@ impl RuntimeTransport {
         topology: &RuntimeTopology,
         private_key: [u8; 32],
         mdns_enabled: bool,
+        nat_traversal_enabled: bool,
+        relay_mode: RelayMode,
     ) -> Result<Self> {
         Ok(Self::Libp2p(Libp2pTransport::new(
             topology,
             private_key,
             mdns_enabled,
+            nat_traversal_enabled,
+            relay_mode,
         )?))
     }
 
@@ -195,6 +227,22 @@ impl RuntimeTransport {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+        }
+    }
+
+    /// Returns the current NAT reachability status.
+    pub fn nat_status(&self) -> NatStatus {
+        match self {
+            Self::LocalMailbox(_) => NatStatus::Public,
+            Self::Libp2p(driver) => driver.nat_status(),
+        }
+    }
+
+    /// Returns externally observed addresses (from Identify, UPnP, or relay reservations).
+    pub fn external_addresses(&self) -> Vec<Multiaddr> {
+        match self {
+            Self::LocalMailbox(_) => Vec::new(),
+            Self::Libp2p(driver) => driver.external_addresses(),
         }
     }
 }
@@ -340,6 +388,18 @@ pub struct StarweftBehaviour {
     pub request_response: request_response::cbor::Behaviour<String, EnvelopeAck>,
     /// Optional mDNS sub-behaviour for local network peer discovery.
     pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
+    /// Optional Identify protocol for exchanging peer metadata.
+    pub identify: Toggle<libp2p::identify::Behaviour>,
+    /// Optional AutoNAT behaviour for determining NAT reachability.
+    pub autonat: Toggle<libp2p::autonat::Behaviour>,
+    /// Optional UPnP behaviour for automatic port mapping.
+    pub upnp: Toggle<libp2p::upnp::tokio::Behaviour>,
+    /// Optional Circuit Relay v2 server behaviour.
+    pub relay_server: Toggle<libp2p::relay::Behaviour>,
+    /// Optional Circuit Relay v2 client behaviour.
+    pub relay_client: Toggle<libp2p::relay::client::Behaviour>,
+    /// Optional DCUtR (Direct Connection Upgrade through Relay) behaviour.
+    pub dcutr: Toggle<libp2p::dcutr::Behaviour>,
 }
 
 enum Libp2pCommand {
@@ -353,6 +413,12 @@ enum Libp2pCommand {
     },
     DrainDiscoveredPeers {
         reply_tx: Sender<Vec<DiscoveredPeer>>,
+    },
+    QueryNatStatus {
+        reply_tx: Sender<NatStatus>,
+    },
+    QueryExternalAddresses {
+        reply_tx: Sender<Vec<Multiaddr>>,
     },
     Shutdown,
 }
@@ -376,6 +442,8 @@ impl Libp2pTransport {
         topology: &RuntimeTopology,
         private_key: [u8; 32],
         mdns_enabled: bool,
+        nat_traversal_enabled: bool,
+        relay_mode: RelayMode,
     ) -> Result<Self> {
         let listen_addresses = topology
             .listen_addresses
@@ -417,12 +485,15 @@ impl Libp2pTransport {
             };
 
             let result = runtime.block_on(async move {
-                let (mut swarm, announced) = build_swarm(
+                let is_relay_client = matches!(relay_mode, RelayMode::Client);
+                let (mut swarm, announced) = build_swarm(SwarmConfig {
                     listen_addresses,
                     expected_listens,
                     private_key,
                     mdns_enabled,
-                )
+                    nat_traversal_enabled,
+                    relay_mode,
+                })
                 .await?;
                 let peer_id = swarm.local_peer_id().to_string();
                 init_tx
@@ -431,7 +502,7 @@ impl Libp2pTransport {
                         listen_addresses: announced,
                     }))
                     .map_err(|_| anyhow!("init channel closed"))?;
-                libp2p_event_loop(&mut swarm, command_rx, seed_peers).await
+                libp2p_event_loop(&mut swarm, command_rx, seed_peers, is_relay_client).await
             });
 
             if let Err(error) = result {
@@ -464,6 +535,32 @@ impl Libp2pTransport {
         if self
             .command_tx
             .send(Libp2pCommand::DrainDiscoveredPeers { reply_tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.recv().unwrap_or_default()
+    }
+
+    /// Returns the current NAT reachability status.
+    pub fn nat_status(&self) -> NatStatus {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .command_tx
+            .send(Libp2pCommand::QueryNatStatus { reply_tx })
+            .is_err()
+        {
+            return NatStatus::Unknown;
+        }
+        reply_rx.recv().unwrap_or(NatStatus::Unknown)
+    }
+
+    /// Returns externally observed addresses.
+    pub fn external_addresses(&self) -> Vec<Multiaddr> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .command_tx
+            .send(Libp2pCommand::QueryExternalAddresses { reply_tx })
             .is_err()
         {
             return Vec::new();
@@ -515,48 +612,147 @@ impl Drop for Libp2pTransport {
     }
 }
 
-async fn build_swarm(
+fn build_behaviour(
+    key: &libp2p::identity::Keypair,
+    mdns_enabled: bool,
+    nat_traversal_enabled: bool,
+    relay_mode: &RelayMode,
+    relay_client: Option<libp2p::relay::client::Behaviour>,
+) -> std::result::Result<StarweftBehaviour, Box<dyn std::error::Error + Send + Sync>> {
+    let protocols = std::iter::once((
+        StreamProtocol::new(STARWEFT_PROTOCOL_ID),
+        ProtocolSupport::Full,
+    ));
+    let config = request_response::Config::default();
+    let mdns = if mdns_enabled {
+        Some(libp2p::mdns::tokio::Behaviour::new(
+            libp2p::mdns::Config::default(),
+            key.public().to_peer_id(),
+        )?)
+    } else {
+        None
+    };
+    let identify = if nat_traversal_enabled {
+        Some(libp2p::identify::Behaviour::new(
+            libp2p::identify::Config::new(STARWEFT_PROTOCOL_ID.to_owned(), key.public()),
+        ))
+    } else {
+        None
+    };
+    let autonat = if nat_traversal_enabled {
+        Some(libp2p::autonat::Behaviour::new(
+            key.public().to_peer_id(),
+            libp2p::autonat::Config::default(),
+        ))
+    } else {
+        None
+    };
+    let upnp = if nat_traversal_enabled {
+        Some(libp2p::upnp::tokio::Behaviour::default())
+    } else {
+        None
+    };
+    let relay_server_behaviour = match relay_mode {
+        RelayMode::Server {
+            max_reservations,
+            max_circuits_per_peer,
+            reservation_duration,
+        } => {
+            let relay_config = libp2p::relay::Config {
+                max_reservations: *max_reservations as usize,
+                max_circuits_per_peer: *max_circuits_per_peer as usize,
+                reservation_duration: *reservation_duration,
+                ..Default::default()
+            };
+            Some(libp2p::relay::Behaviour::new(
+                key.public().to_peer_id(),
+                relay_config,
+            ))
+        }
+        _ => None,
+    };
+    let dcutr = if relay_client.is_some() {
+        Some(libp2p::dcutr::Behaviour::new(key.public().to_peer_id()))
+    } else {
+        None
+    };
+    Ok(StarweftBehaviour {
+        request_response: request_response::cbor::Behaviour::new(protocols, config),
+        mdns: mdns.into(),
+        identify: identify.into(),
+        autonat: autonat.into(),
+        upnp: upnp.into(),
+        relay_server: relay_server_behaviour.into(),
+        relay_client: relay_client.into(),
+        dcutr: dcutr.into(),
+    })
+}
+
+struct SwarmConfig {
     listen_addresses: Vec<Multiaddr>,
     expected_listens: usize,
     private_key: [u8; 32],
     mdns_enabled: bool,
-) -> Result<(Swarm<StarweftBehaviour>, Vec<Multiaddr>)> {
-    let identity = libp2p::identity::Keypair::ed25519_from_bytes(private_key)
-        .map_err(|error| anyhow!("failed to decode libp2p identity: {error}"))?;
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
-        .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default().nodelay(true),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )?
-        .with_behaviour(|key| {
-            let protocols =
-                std::iter::once((StreamProtocol::new("/starweft/0.1"), ProtocolSupport::Full));
-            let config = request_response::Config::default();
-            let mdns = if mdns_enabled {
-                Some(libp2p::mdns::tokio::Behaviour::new(
-                    libp2p::mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )?)
-            } else {
-                None
-            };
-            Ok(StarweftBehaviour {
-                request_response: request_response::cbor::Behaviour::new(protocols, config),
-                mdns: mdns.into(),
-            })
-        })?
-        // Keep idle connections open long enough for multi-step workflows.
-        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
-        .build();
+    nat_traversal_enabled: bool,
+    relay_mode: RelayMode,
+}
 
-    for address in listen_addresses {
+async fn build_swarm(config: SwarmConfig) -> Result<(Swarm<StarweftBehaviour>, Vec<Multiaddr>)> {
+    let identity = libp2p::identity::Keypair::ed25519_from_bytes(config.private_key)
+        .map_err(|error| anyhow!("failed to decode libp2p identity: {error}"))?;
+
+    let use_relay_client = matches!(config.relay_mode, RelayMode::Client);
+
+    // Two branches are required because `with_relay_client()` changes the SwarmBuilder type,
+    // making the `with_behaviour` closure accept a different number of arguments.
+    // This is a libp2p builder type-system constraint and cannot be unified.
+    let mdns_enabled = config.mdns_enabled;
+    let nat_traversal_enabled = config.nat_traversal_enabled;
+    let relay_mode = config.relay_mode;
+
+    let mut swarm = if use_relay_client {
+        libp2p::SwarmBuilder::with_existing_identity(identity)
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_dns()?
+            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
+            .with_behaviour(|key, relay_client| {
+                build_behaviour(
+                    key,
+                    mdns_enabled,
+                    nat_traversal_enabled,
+                    &relay_mode,
+                    Some(relay_client),
+                )
+            })?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+            .build()
+    } else {
+        libp2p::SwarmBuilder::with_existing_identity(identity)
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_dns()?
+            .with_behaviour(|key| {
+                build_behaviour(key, mdns_enabled, nat_traversal_enabled, &relay_mode, None)
+            })?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+            .build()
+    };
+
+    for address in config.listen_addresses {
         swarm.listen_on(address)?;
     }
 
     let mut announced = Vec::new();
-    while announced.len() < expected_listens {
+    while announced.len() < config.expected_listens {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => announced.push(address),
             other => tracing::debug!("libp2p init swarm event: {other:?}"),
@@ -570,6 +766,7 @@ async fn libp2p_event_loop(
     swarm: &mut Swarm<StarweftBehaviour>,
     mut command_rx: tokio::sync::mpsc::UnboundedReceiver<Libp2pCommand>,
     seed_peers: Vec<PeerEndpoint>,
+    use_relay_client: bool,
 ) -> Result<()> {
     let mut inbox = Vec::new();
     let mut pending = HashMap::new();
@@ -579,6 +776,8 @@ async fn libp2p_event_loop(
     let mut connected_seed_peers = HashSet::new();
     let mut pending_seed_dials = HashSet::new();
     let mut redial_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut nat_status = NatStatus::Unknown;
+    let mut relay_reservation_attempted = HashSet::new();
 
     dial_seed_peers(
         swarm,
@@ -604,6 +803,13 @@ async fn libp2p_event_loop(
                     Libp2pCommand::DrainDiscoveredPeers { reply_tx } => {
                         let drained = std::mem::take(&mut discovered_peers);
                         let _ = reply_tx.send(drained);
+                    }
+                    Libp2pCommand::QueryNatStatus { reply_tx } => {
+                        let _ = reply_tx.send(nat_status);
+                    }
+                    Libp2pCommand::QueryExternalAddresses { reply_tx } => {
+                        let addrs = swarm.external_addresses().cloned().collect();
+                        let _ = reply_tx.send(addrs);
                     }
                     Libp2pCommand::Shutdown => break,
                 }
@@ -709,6 +915,86 @@ async fn libp2p_event_loop(
                             tracing::debug!("mDNS expired peer {peer_id} at {address}");
                         }
                     }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id, info, .. }
+                    )) => {
+                        tracing::debug!(
+                            "identify received from {peer_id}: {} observed at {:?}",
+                            info.protocol_version,
+                            info.observed_addr
+                        );
+                        swarm.add_external_address(info.observed_addr);
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::Identify(_)) => {}
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::Autonat(event)) => {
+                        use libp2p::autonat;
+                        match event {
+                            autonat::Event::StatusChanged { old, new } => {
+                                nat_status = match new {
+                                    autonat::NatStatus::Public(_) => NatStatus::Public,
+                                    autonat::NatStatus::Private => NatStatus::Private,
+                                    autonat::NatStatus::Unknown => NatStatus::Unknown,
+                                };
+                                tracing::info!("AutoNAT status changed: {old:?} → {new:?}");
+                                // When behind NAT with relay client, listen on relay circuits
+                                if nat_status == NatStatus::Private && use_relay_client {
+                                    for (peer_id, addr) in &seed_targets {
+                                        if relay_reservation_attempted.contains(peer_id) {
+                                            continue;
+                                        }
+                                        relay_reservation_attempted.insert(*peer_id);
+                                        let relay_addr = addr.clone()
+                                            .with(Protocol::P2pCircuit);
+                                        if let Err(error) = swarm.listen_on(relay_addr.clone()) {
+                                            tracing::debug!("relay listen on {relay_addr} failed: {error}");
+                                        } else {
+                                            tracing::info!("requesting relay reservation via {peer_id}");
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                tracing::debug!("autonat event: {event:?}");
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::Upnp(event)) => {
+                        use libp2p::upnp;
+                        match event {
+                            upnp::Event::NewExternalAddr(addr) => {
+                                tracing::info!("UPnP mapped external address: {addr}");
+                                swarm.add_external_address(addr);
+                            }
+                            upnp::Event::GatewayNotFound => {
+                                tracing::debug!("UPnP gateway not found");
+                            }
+                            upnp::Event::NonRoutableGateway => {
+                                tracing::debug!("UPnP gateway is non-routable");
+                            }
+                            upnp::Event::ExpiredExternalAddr(addr) => {
+                                tracing::debug!("UPnP mapping expired: {addr}");
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::RelayServer(event)) => {
+                        tracing::debug!("relay server event: {event:?}");
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::RelayClient(
+                        libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id, .. }
+                    )) => {
+                        tracing::info!("relay reservation accepted by {relay_peer_id}");
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::RelayClient(event)) => {
+                        tracing::debug!("relay client event: {event:?}");
+                    }
+                    SwarmEvent::Behaviour(StarweftBehaviourEvent::Dcutr(
+                        libp2p::dcutr::Event { remote_peer_id, result }
+                    )) => {
+                        match result {
+                            Ok(_) => tracing::info!("DCUtR direct connection upgraded with {remote_peer_id}"),
+                            Err(error) => tracing::debug!("DCUtR upgrade failed with {remote_peer_id}: {error}"),
+                        }
+                    }
                     other => {
                         tracing::debug!("libp2p swarm event: {other:?}");
                     }
@@ -790,7 +1076,8 @@ mod tests {
             std::iter::empty::<String>(),
         )
         .expect("topology");
-        let transport = Libp2pTransport::new(&topology, [7; 32], false).expect("transport");
+        let transport = Libp2pTransport::new(&topology, [7; 32], false, false, RelayMode::Disabled)
+            .expect("transport");
         assert!(!transport.peer_id().is_empty());
         assert!(!transport.listen_addresses().is_empty());
     }
@@ -807,8 +1094,12 @@ mod tests {
             std::iter::empty::<String>(),
         )
         .expect("topology b");
-        let transport_a = Libp2pTransport::new(&topology_a, [11; 32], false).expect("transport a");
-        let transport_b = Libp2pTransport::new(&topology_b, [12; 32], false).expect("transport b");
+        let transport_a =
+            Libp2pTransport::new(&topology_a, [11; 32], false, false, RelayMode::Disabled)
+                .expect("transport a");
+        let transport_b =
+            Libp2pTransport::new(&topology_b, [12; 32], false, false, RelayMode::Disabled)
+                .expect("transport b");
 
         let mut target = transport_b.listen_addresses()[0].clone();
         target.push(Protocol::P2p(
@@ -855,7 +1146,8 @@ mod tests {
         )
         .expect("topology");
 
-        let error = Libp2pTransport::new(&topology, [21; 32], false).expect_err("seed should fail");
+        let error = Libp2pTransport::new(&topology, [21; 32], false, false, RelayMode::Disabled)
+            .expect_err("seed should fail");
         assert!(error.to_string().contains("/p2p/<peer-id>"));
     }
 
@@ -866,7 +1158,9 @@ mod tests {
             std::iter::empty::<String>(),
         )
         .expect("topology");
-        let transport = Libp2pTransport::new(&topology, [30; 32], false).expect("transport");
+        let transport =
+            Libp2pTransport::new(&topology, [30; 32], false, false, RelayMode::Disabled)
+                .expect("transport");
         assert!(transport.discovered_peers().is_empty());
     }
 
@@ -877,9 +1171,32 @@ mod tests {
             std::iter::empty::<String>(),
         )
         .expect("topology");
-        let transport = Libp2pTransport::new(&topology, [31; 32], true).expect("transport");
+        let transport = Libp2pTransport::new(&topology, [31; 32], true, false, RelayMode::Disabled)
+            .expect("transport");
         assert!(!transport.peer_id().is_empty());
         assert!(transport.discovered_peers().is_empty());
+    }
+
+    #[test]
+    fn nat_status_serialize_deserialize_roundtrip() {
+        for status in [NatStatus::Unknown, NatStatus::Public, NatStatus::Private] {
+            let json = serde_json::to_string(&status).expect("serialize");
+            let parsed: NatStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(status, parsed);
+        }
+    }
+
+    #[test]
+    fn build_swarm_with_nat_traversal_enabled() {
+        let topology = RuntimeTopology::validate(
+            ["/ip4/127.0.0.1/tcp/0".to_owned()],
+            std::iter::empty::<String>(),
+        )
+        .expect("topology");
+        let transport = Libp2pTransport::new(&topology, [32; 32], false, true, RelayMode::Disabled)
+            .expect("transport");
+        assert!(!transport.peer_id().is_empty());
+        assert_eq!(transport.nat_status(), NatStatus::Unknown);
     }
 
     #[test]

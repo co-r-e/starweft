@@ -36,6 +36,8 @@ pub struct Config {
     #[serde(default)]
     pub p2p: P2pSection,
     #[serde(default)]
+    pub relay: RelaySection,
+    #[serde(default)]
     pub ledger: LedgerSection,
     #[serde(default)]
     pub openclaw: OpenClawSection,
@@ -74,6 +76,8 @@ pub struct DiscoverySection {
     pub auto_discovery: bool,
     #[serde(default)]
     pub mdns: bool,
+    #[serde(default)]
+    pub dns_seeds: Vec<String>,
     pub registry_url: Option<String>,
     pub registry_ttl_sec: u64,
     pub registry_heartbeat_sec: u64,
@@ -87,6 +91,8 @@ pub struct P2pSection {
     pub relay_enabled: bool,
     pub direct_preferred: bool,
     pub max_peers: u16,
+    #[serde(default = "default_true")]
+    pub nat_traversal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -110,6 +116,10 @@ impl Default for P2pTransportKind {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for P2pSection {
     fn default() -> Self {
         Self {
@@ -117,8 +127,41 @@ impl Default for P2pSection {
             relay_enabled: true,
             direct_preferred: true,
             max_peers: 128,
+            nat_traversal: true,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelaySection {
+    #[serde(default = "default_relay_max_reservations")]
+    pub max_reservations: u32,
+    #[serde(default = "default_relay_max_circuits_per_peer")]
+    pub max_circuits_per_peer: u32,
+    #[serde(default = "default_relay_reservation_duration_sec")]
+    pub reservation_duration_sec: u64,
+}
+
+impl Default for RelaySection {
+    fn default() -> Self {
+        Self {
+            max_reservations: default_relay_max_reservations(),
+            max_circuits_per_peer: default_relay_max_circuits_per_peer(),
+            reservation_duration_sec: default_relay_reservation_duration_sec(),
+        }
+    }
+}
+
+fn default_relay_max_reservations() -> u32 {
+    128
+}
+
+fn default_relay_max_circuits_per_peer() -> u32 {
+    4
+}
+
+fn default_relay_reservation_duration_sec() -> u64 {
+    3600
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -289,6 +332,12 @@ pub struct ObservationSection {
     pub planner_timeout_sec: u64,
     pub planner_capability_version: String,
     pub planner_fallback_to_heuristic: bool,
+    pub evaluator_bin: Option<String>,
+    pub evaluator_working_dir: Option<String>,
+    #[serde(default = "default_evaluator_timeout_sec")]
+    pub evaluator_timeout_sec: u64,
+    #[serde(default = "default_true")]
+    pub evaluator_fallback_to_heuristic: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -305,6 +354,11 @@ pub enum PlanningStrategyKind {
 pub enum EvaluationStrategyKind {
     #[default]
     Heuristic,
+    Openclaw,
+}
+
+fn default_evaluator_timeout_sec() -> u64 {
+    120
 }
 
 impl Default for ObservationSection {
@@ -321,6 +375,10 @@ impl Default for ObservationSection {
             planner_timeout_sec: 120,
             planner_capability_version: "openclaw.plan.v1".to_owned(),
             planner_fallback_to_heuristic: true,
+            evaluator_bin: None,
+            evaluator_working_dir: None,
+            evaluator_timeout_sec: default_evaluator_timeout_sec(),
+            evaluator_fallback_to_heuristic: true,
         }
     }
 }
@@ -398,6 +456,7 @@ impl Config {
                 seeds: Vec::new(),
                 auto_discovery: true,
                 mdns: P2pTransportKind::default() == P2pTransportKind::Libp2p,
+                dns_seeds: Vec::new(),
                 registry_url: None,
                 registry_ttl_sec: 300,
                 registry_heartbeat_sec: 60,
@@ -405,6 +464,7 @@ impl Config {
                 registry_shared_secret_env: None,
             },
             p2p: P2pSection::default(),
+            relay: RelaySection::default(),
             ledger: LedgerSection {
                 path: paths.ledger_db.display().to_string(),
             },

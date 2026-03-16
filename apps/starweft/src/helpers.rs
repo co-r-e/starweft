@@ -584,22 +584,27 @@ pub(crate) fn local_listen_addresses(
     topology: &starweft_p2p::RuntimeTopology,
     transport: &starweft_p2p::RuntimeTransport,
 ) -> Vec<String> {
-    let mut listen_addresses = topology
+    let is_libp2p = matches!(transport.kind(), starweft_p2p::TransportKind::Libp2p);
+    let peer_id_hint = transport.peer_id_hint();
+    let with_peer_suffix = |addr_str: String| -> String {
+        if is_libp2p && !addr_str.contains("/p2p/") {
+            peer_id_hint
+                .map(|pid| format!("{addr_str}/p2p/{pid}"))
+                .unwrap_or(addr_str)
+        } else {
+            addr_str
+        }
+    };
+
+    let mut listen_addresses: Vec<String> = topology
         .listen_addresses
         .iter()
-        .map(|address| {
-            if matches!(transport.kind(), starweft_p2p::TransportKind::Libp2p)
-                && !address.raw.contains("/p2p/")
-            {
-                transport
-                    .peer_id_hint()
-                    .map(|peer_id| format!("{}/p2p/{peer_id}", address.raw))
-                    .unwrap_or_else(|| address.raw.clone())
-            } else {
-                address.raw.clone()
-            }
-        })
-        .collect::<Vec<_>>();
+        .map(|address| with_peer_suffix(address.raw.clone()))
+        .collect();
+    // Merge externally observed addresses (Identify, UPnP, relay reservations)
+    for addr in transport.external_addresses() {
+        listen_addresses.push(with_peer_suffix(addr.to_string()));
+    }
     listen_addresses.sort();
     listen_addresses.dedup();
     listen_addresses

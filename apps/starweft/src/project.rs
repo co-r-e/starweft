@@ -16,8 +16,8 @@ use crate::helpers::{
     parse_rfc3339_arg, read_keypair, submission_is_approved, timestamp_at_or_after,
 };
 use crate::runtime::{
-    RemoteApprovalOutput, RemoteApprovalParams, dispatch_next_task_offer, queue_remote_approval,
-    queue_retry_task, select_next_worker_actor_id,
+    OwnerContext, RemoteApprovalOutput, RemoteApprovalParams, dispatch_next_task_offer,
+    queue_remote_approval, queue_retry_task, select_next_worker_actor_id,
 };
 use crate::wait::{
     ProjectWaitCondition, TaskWaitCondition, WaitOutput, WaitTarget,
@@ -126,6 +126,8 @@ pub(crate) struct TaskListItem {
     pub(crate) approval_updated_at: Option<String>,
     pub(crate) updated_at: String,
     pub(crate) child_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) depends_on: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -393,6 +395,13 @@ pub(crate) fn approve_execution_scope(
     }
     store.save_vision(&vision)?;
 
+    let owner_ctx = OwnerContext {
+        store,
+        actor_key,
+        owner_actor_id: &local_identity.actor_id,
+        project_id,
+    };
+
     let mut resumed_task_ids = Vec::new();
     for task in store.list_task_snapshots_for_project(project_id)? {
         if target_task_id.is_some_and(|target| target != &task.task_id) {
@@ -402,16 +411,7 @@ pub(crate) fn approve_execution_scope(
             && task.result_summary.as_deref()
                 == Some("unauthorized execution without required human approval")
         {
-            resumed_task_ids.push(
-                queue_retry_task(
-                    store,
-                    actor_key,
-                    &local_identity.actor_id,
-                    project_id,
-                    &task.task_id,
-                )?
-                .to_string(),
-            );
+            resumed_task_ids.push(queue_retry_task(&owner_ctx, &task.task_id)?.to_string());
         }
     }
 
@@ -426,13 +426,7 @@ pub(crate) fn approve_execution_scope(
         &[],
     )?;
     let dispatched = if let Some(worker_actor_id) = next_worker_actor_id.clone() {
-        dispatch_next_task_offer(
-            store,
-            actor_key,
-            &local_identity.actor_id,
-            project_id,
-            worker_actor_id,
-        )?
+        dispatch_next_task_offer(&owner_ctx, worker_actor_id)?
     } else {
         false
     };
@@ -592,6 +586,7 @@ pub(crate) fn load_task_list_items(
     for project_id in project_ids {
         let snapshots = store.list_task_snapshots_for_project(&project_id)?;
         let child_counts = compute_child_counts(&snapshots);
+        let dep_map = store.all_task_dependencies_for_project(&project_id)?;
         for snapshot in snapshots {
             let task_id = snapshot.task_id.to_string();
             let project_id = snapshot.project_id.to_string();
@@ -600,6 +595,7 @@ pub(crate) fn load_task_list_items(
                 .get(task_id.as_str())
                 .copied()
                 .unwrap_or_default();
+            let depends_on = dep_map.get(&task_id).cloned().unwrap_or_default();
             let item = TaskListItem {
                 task_id,
                 project_id,
@@ -618,6 +614,7 @@ pub(crate) fn load_task_list_items(
                 approval_updated_at: snapshot.approval.updated_at,
                 updated_at: snapshot.updated_at,
                 child_count,
+                depends_on,
             };
             if task_item_matches_filters(&item, filters)? {
                 items.push(item);
@@ -721,6 +718,7 @@ pub(crate) fn build_task_tree_output(
                 approval_updated_at: snapshot.approval.updated_at,
                 updated_at: snapshot.updated_at,
                 child_count,
+                depends_on: Vec::new(),
             }
         })
         .collect();
@@ -1125,7 +1123,7 @@ fn resolve_task_approval_owner_actor_id(
 mod tests {
     use super::*;
     use crate::helpers::submission_is_approved;
-    use crate::runtime::{dispatch_next_task_offer, queue_owner_planned_task};
+    use crate::runtime::{OwnerContext, dispatch_next_task_offer, queue_owner_planned_task};
     use starweft_crypto::StoredKeypair;
     use starweft_id::{ActorId, NodeId, ProjectId, VisionId};
     use starweft_protocol::UnsignedEnvelope;
@@ -1196,6 +1194,7 @@ mod tests {
             approval_updated_at: None,
             updated_at: "2026-03-10T12:00:00Z".to_owned(),
             child_count: 1,
+            depends_on: Vec::new(),
         };
         let filters = TaskListFilters {
             project_id: None,
@@ -1236,6 +1235,7 @@ mod tests {
                 approval_updated_at: Some("2026-03-10T12:00:00Z".to_owned()),
                 updated_at: "2026-03-10T12:00:00Z".to_owned(),
                 child_count: 2,
+                depends_on: Vec::new(),
             },
             TaskListItem {
                 task_id: "task_child".to_owned(),
@@ -1255,6 +1255,7 @@ mod tests {
                 approval_updated_at: Some("2026-03-10T12:00:00Z".to_owned()),
                 updated_at: "2026-03-10T11:59:00Z".to_owned(),
                 child_count: 1,
+                depends_on: Vec::new(),
             },
             TaskListItem {
                 task_id: "task_leaf".to_owned(),
@@ -1274,6 +1275,7 @@ mod tests {
                 approval_updated_at: Some("2026-03-10T12:00:00Z".to_owned()),
                 updated_at: "2026-03-10T11:58:00Z".to_owned(),
                 child_count: 0,
+                depends_on: Vec::new(),
             },
         ];
 
@@ -1371,11 +1373,15 @@ mod tests {
             })
             .expect("peer identity");
 
+        let owner_ctx = OwnerContext {
+            store: &store,
+            actor_key: &owner_key,
+            owner_actor_id: &owner_actor,
+            project_id: &project_id,
+        };
+
         let blocked_task_id = queue_owner_planned_task(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
+            &owner_ctx,
             starweft_observation::PlannedTaskSpec {
                 title: "approval-blocked".to_owned(),
                 description: "approval-blocked".to_owned(),
@@ -1384,19 +1390,15 @@ mod tests {
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
                 rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
             },
             None,
+            Vec::new(),
         )
         .expect("queue task");
 
-        let dispatched = dispatch_next_task_offer(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
-            worker_actor.clone(),
-        )
-        .expect("dispatch blocked");
+        let dispatched =
+            dispatch_next_task_offer(&owner_ctx, worker_actor.clone()).expect("dispatch blocked");
         assert!(!dispatched);
         let blocked_snapshot = store
             .task_snapshot(&blocked_task_id)
@@ -1524,11 +1526,15 @@ mod tests {
             })
             .expect("peer identity");
 
+        let owner_ctx = OwnerContext {
+            store: &store,
+            actor_key: &owner_key,
+            owner_actor_id: &owner_actor,
+            project_id: &project_id,
+        };
+
         let task_a = queue_owner_planned_task(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
+            &owner_ctx,
             starweft_observation::PlannedTaskSpec {
                 title: "blocked-a".to_owned(),
                 description: "blocked-a".to_owned(),
@@ -1537,15 +1543,14 @@ mod tests {
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
                 rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
             },
             None,
+            Vec::new(),
         )
         .expect("task a");
         let task_b = queue_owner_planned_task(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
+            &owner_ctx,
             starweft_observation::PlannedTaskSpec {
                 title: "blocked-b".to_owned(),
                 description: "blocked-b".to_owned(),
@@ -1554,18 +1559,14 @@ mod tests {
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
                 rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
             },
             None,
+            Vec::new(),
         )
         .expect("task b");
-        let dispatched = dispatch_next_task_offer(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
-            owner_actor.clone(),
-        )
-        .expect("dispatch");
+        let dispatched =
+            dispatch_next_task_offer(&owner_ctx, owner_actor.clone()).expect("dispatch");
         assert!(!dispatched);
 
         let local_identity = store

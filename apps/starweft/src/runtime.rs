@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -16,7 +16,7 @@ use starweft_observation::{PlannedTaskSpec, estimate_task_duration_sec};
 use starweft_openclaw_bridge::{
     BridgeTaskRequest, BridgeTaskResponse, OpenClawAttachment, execute_task_with_cancel_flag,
 };
-use starweft_p2p::{RuntimeTopology, RuntimeTransport, TransportDriver};
+use starweft_p2p::{RelayMode, RuntimeTopology, RuntimeTransport, TransportDriver};
 use starweft_protocol::{
     ApprovalApplied, ApprovalGranted, ApprovalScopeType, CapabilityAdvertisement, CapabilityQuery,
     Envelope, EvaluationIssued, EvaluationPolicy, JoinAccept, JoinOffer, JoinReject, MsgType,
@@ -364,10 +364,25 @@ pub(crate) fn build_transport(
             let actor_key_path =
                 configured_actor_key_path(config, &DataPaths::from_config(config)?)?;
             let actor_key = read_keypair(&actor_key_path)?;
+            let relay_mode = if config.node.role == NodeRole::Relay && config.p2p.relay_enabled {
+                RelayMode::Server {
+                    max_reservations: config.relay.max_reservations,
+                    max_circuits_per_peer: config.relay.max_circuits_per_peer,
+                    reservation_duration: Duration::from_secs(
+                        config.relay.reservation_duration_sec,
+                    ),
+                }
+            } else if config.p2p.relay_enabled && config.p2p.nat_traversal {
+                RelayMode::Client
+            } else {
+                RelayMode::Disabled
+            };
             RuntimeTransport::libp2p(
                 topology,
                 actor_key.secret_key_bytes()?,
                 config.discovery.mdns,
+                config.p2p.nat_traversal,
+                relay_mode,
             )
         }
     }
@@ -682,6 +697,13 @@ pub(crate) struct IncomingWireContext<'a> {
     pub(crate) actor_key: Option<&'a StoredKeypair>,
     pub(crate) task_completion_tx: &'a mpsc::Sender<TaskCompletion>,
     pub(crate) worker_runtime: &'a WorkerRuntimeState,
+}
+
+pub(crate) struct OwnerContext<'a> {
+    pub(crate) store: &'a Store,
+    pub(crate) actor_key: &'a StoredKeypair,
+    pub(crate) owner_actor_id: &'a ActorId,
+    pub(crate) project_id: &'a ProjectId,
 }
 
 pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvelope) -> Result<()> {
@@ -1084,19 +1106,33 @@ pub(crate) fn derive_planned_tasks(
 }
 
 pub(crate) fn queue_owner_planned_task(
-    store: &Store,
-    actor_key: &StoredKeypair,
-    owner_actor_id: &ActorId,
-    project_id: &ProjectId,
+    ctx: &OwnerContext<'_>,
     task_spec: PlannedTaskSpec,
     parent_task_id: Option<TaskId>,
+    depends_on: Vec<TaskId>,
 ) -> Result<TaskId> {
-    let task_id = TaskId::generate();
+    queue_owner_planned_task_with_id(
+        ctx,
+        task_spec,
+        parent_task_id,
+        depends_on,
+        TaskId::generate(),
+    )
+}
+
+fn queue_owner_planned_task_with_id(
+    ctx: &OwnerContext<'_>,
+    task_spec: PlannedTaskSpec,
+    parent_task_id: Option<TaskId>,
+    depends_on: Vec<TaskId>,
+    task_id: TaskId,
+) -> Result<TaskId> {
     let task = UnsignedEnvelope::new(
-        owner_actor_id.clone(),
-        Some(owner_actor_id.clone()),
+        ctx.owner_actor_id.clone(),
+        Some(ctx.owner_actor_id.clone()),
         TaskDelegated {
             parent_task_id,
+            depends_on,
             title: task_spec.title,
             description: task_spec.description,
             objective: task_spec.objective,
@@ -1105,28 +1141,20 @@ pub(crate) fn queue_owner_planned_task(
             expected_output_schema: task_spec.expected_output_schema,
         },
     )
-    .with_project_id(project_id.clone())
+    .with_project_id(ctx.project_id.clone())
     .with_task_id(task_id.clone())
-    .sign(actor_key)?;
-    RuntimePipeline::new(store).record_local_task_delegated(&task)?;
+    .sign(ctx.actor_key)?;
+    RuntimePipeline::new(ctx.store).record_local_task_delegated(&task)?;
     Ok(task_id)
 }
 
-pub(crate) fn queue_retry_task(
-    store: &Store,
-    actor_key: &StoredKeypair,
-    owner_actor_id: &ActorId,
-    project_id: &ProjectId,
-    failed_task_id: &TaskId,
-) -> Result<TaskId> {
-    let blueprint = store
+pub(crate) fn queue_retry_task(ctx: &OwnerContext<'_>, failed_task_id: &TaskId) -> Result<TaskId> {
+    let blueprint = ctx
+        .store
         .task_blueprint(failed_task_id)?
         .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] retry 元 task blueprint が見つかりません"))?;
     queue_owner_planned_task(
-        store,
-        actor_key,
-        owner_actor_id,
-        project_id,
+        ctx,
         PlannedTaskSpec {
             title: blueprint.title,
             description: blueprint.description,
@@ -1135,31 +1163,98 @@ pub(crate) fn queue_retry_task(
             input_payload: blueprint.input_payload,
             expected_output_schema: blueprint.expected_output_schema,
             rationale: "retry cloned from failed task blueprint".to_owned(),
+            depends_on_indices: Vec::new(),
         },
         Some(failed_task_id.clone()),
+        Vec::new(),
     )
 }
 
 pub(crate) fn materialize_planner_child_tasks(
-    store: &Store,
-    actor_key: &StoredKeypair,
-    owner_actor_id: &ActorId,
-    project_id: &ProjectId,
+    ctx: &OwnerContext<'_>,
     planner_task_id: &TaskId,
     task_specs: Vec<PlannedTaskSpec>,
 ) -> Result<()> {
-    if store.task_child_count(planner_task_id)? > 0 {
+    if ctx.store.task_child_count(planner_task_id)? > 0 {
         return Ok(());
     }
-    for task_spec in task_specs {
-        queue_owner_planned_task(
-            store,
-            actor_key,
-            owner_actor_id,
-            project_id,
+    // Two-pass: pre-generate all TaskIds, then create tasks with resolved depends_on
+    let task_ids: Vec<TaskId> = (0..task_specs.len()).map(|_| TaskId::generate()).collect();
+    for (i, task_spec) in task_specs.into_iter().enumerate() {
+        let depends_on = resolve_dependency_indices(&task_spec, i, &task_ids);
+        queue_owner_planned_task_with_id(
+            ctx,
             task_spec,
             Some(planner_task_id.clone()),
+            depends_on,
+            task_ids[i].clone(),
         )?;
+    }
+    Ok(())
+}
+
+fn resolve_dependency_indices(
+    spec: &PlannedTaskSpec,
+    task_index: usize,
+    task_ids: &[TaskId],
+) -> Vec<TaskId> {
+    let num_tasks = task_ids.len();
+    spec.depends_on_indices
+        .iter()
+        .filter_map(|&dep_index| {
+            if dep_index >= num_tasks {
+                tracing::warn!(
+                    "depends_on_indices に範囲外のインデックス {} が含まれています (タスク数: {}, タスク: {})",
+                    dep_index, num_tasks, task_index
+                );
+                return None;
+            }
+            if dep_index == task_index {
+                tracing::warn!(
+                    "depends_on_indices に自己参照インデックス {} が含まれています (タスク: {})",
+                    dep_index, task_index
+                );
+                return None;
+            }
+            task_ids.get(dep_index).cloned()
+        })
+        .collect()
+}
+
+fn cascade_dependency_failure(ctx: &OwnerContext<'_>, failed_task_id: &TaskId) -> Result<()> {
+    let runtime = RuntimePipeline::new(ctx.store);
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    queue.push_back(failed_task_id.clone());
+    visited.insert(failed_task_id.clone());
+
+    while let Some(current_failed_id) = queue.pop_front() {
+        let dependents = ctx.store.task_dependents(&current_failed_id)?;
+        for dep_id in dependents {
+            if !visited.insert(dep_id.clone()) {
+                continue;
+            }
+            let status = ctx.store.task_status(&dep_id)?;
+            if status == Some(starweft_protocol::TaskStatus::Queued) {
+                let result = UnsignedEnvelope::new(
+                    ctx.owner_actor_id.clone(),
+                    Some(ctx.owner_actor_id.clone()),
+                    TaskResultSubmitted {
+                        status: TaskExecutionStatus::Failed,
+                        summary: format!("dependency failed: {current_failed_id}"),
+                        output_payload: serde_json::json!(null),
+                        artifact_refs: Vec::new(),
+                        started_at: time::OffsetDateTime::now_utc(),
+                        finished_at: time::OffsetDateTime::now_utc(),
+                    },
+                )
+                .with_project_id(ctx.project_id.clone())
+                .with_task_id(dep_id.clone())
+                .sign(ctx.actor_key)?;
+                runtime.ingest_task_result_submitted(&result)?;
+                queue.push_back(dep_id);
+            }
+        }
     }
     Ok(())
 }
@@ -1266,14 +1361,25 @@ pub(crate) fn handle_owner_vision(
             &config.compatibility.bridge_capability_version,
         )?
     };
-    for task_spec in initial_tasks {
-        queue_owner_planned_task(
-            store,
-            actor_key,
-            &local_identity.actor_id,
-            &project_id,
+    let owner_ctx = OwnerContext {
+        store,
+        actor_key,
+        owner_actor_id: &local_identity.actor_id,
+        project_id: &project_id,
+    };
+
+    // Pre-generate TaskIds for initial tasks to resolve dependency indices
+    let task_ids: Vec<TaskId> = (0..initial_tasks.len())
+        .map(|_| TaskId::generate())
+        .collect();
+    for (i, task_spec) in initial_tasks.into_iter().enumerate() {
+        let depends_on = resolve_dependency_indices(&task_spec, i, &task_ids);
+        queue_owner_planned_task_with_id(
+            &owner_ctx,
             task_spec,
             None,
+            depends_on,
+            task_ids[i].clone(),
         )?;
     }
 
@@ -1284,13 +1390,7 @@ pub(crate) fn handle_owner_vision(
         &envelope.from_actor_id,
         &[],
     )? {
-        dispatch_next_task_offer(
-            store,
-            actor_key,
-            &local_identity.actor_id,
-            &project_id,
-            worker_actor_id,
-        )?;
+        dispatch_next_task_offer(&owner_ctx, worker_actor_id)?;
     }
 
     store.mark_inbox_message_processed(&envelope.msg_id)?;
@@ -1784,6 +1884,13 @@ pub(crate) fn handle_owner_task_result(
         .as_ref()
         .is_some_and(|task| decision::is_planner_task(config, task));
 
+    let owner_ctx = OwnerContext {
+        store,
+        actor_key,
+        owner_actor_id: &local_identity.actor_id,
+        project_id: &project_id,
+    };
+
     if matches!(
         envelope.body.status,
         TaskExecutionStatus::Failed | TaskExecutionStatus::Stopped
@@ -1805,21 +1912,9 @@ pub(crate) fn handle_owner_task_result(
                 )?;
                 runtime.ingest_evaluation_issued(&evaluation)?;
                 runtime.queue_outgoing(&evaluation)?;
-                queue_retry_task(
-                    store,
-                    actor_key,
-                    &local_identity.actor_id,
-                    &project_id,
-                    &task_id,
-                )?;
+                queue_retry_task(&owner_ctx, &task_id)?;
                 apply_owner_retry_cooldown(config);
-                dispatch_next_task_offer(
-                    store,
-                    actor_key,
-                    &local_identity.actor_id,
-                    &project_id,
-                    envelope.from_actor_id.clone(),
-                )?;
+                dispatch_next_task_offer(&owner_ctx, envelope.from_actor_id.clone())?;
                 return Ok(());
             }
             FailureAction::RetryDifferentWorker { .. } => {
@@ -1846,21 +1941,9 @@ pub(crate) fn handle_owner_task_result(
                     )?;
                     runtime.ingest_evaluation_issued(&evaluation)?;
                     runtime.queue_outgoing(&evaluation)?;
-                    queue_retry_task(
-                        store,
-                        actor_key,
-                        &local_identity.actor_id,
-                        &project_id,
-                        &task_id,
-                    )?;
+                    queue_retry_task(&owner_ctx, &task_id)?;
                     apply_owner_retry_cooldown(config);
-                    dispatch_next_task_offer(
-                        store,
-                        actor_key,
-                        &local_identity.actor_id,
-                        &project_id,
-                        next_worker_actor_id,
-                    )?;
+                    dispatch_next_task_offer(&owner_ctx, next_worker_actor_id)?;
                     return Ok(());
                 }
                 failure_action = FailureAction::NoRetry {
@@ -1889,13 +1972,14 @@ pub(crate) fn handle_owner_task_result(
                 anyhow!("[E_TASK_NOT_FOUND] planner task blueprint が見つかりません")
             })?;
             materialize_planner_child_tasks(
-                store,
-                actor_key,
-                &local_identity.actor_id,
-                &project_id,
+                &owner_ctx,
                 &task_id,
                 decision::fallback_tasks_for_worker_planner(config, planner_task)?,
             )?;
+        }
+        // Cascade failure to dependent tasks when no retry is possible
+        if matches!(failure_action, FailureAction::NoRetry { .. }) {
+            cascade_dependency_failure(&owner_ctx, &task_id)?;
         }
         if matches!(envelope.body.status, TaskExecutionStatus::Failed)
             && store
@@ -1912,13 +1996,7 @@ pub(crate) fn handle_owner_task_result(
                 &principal_actor_id,
                 &[],
             )? {
-                dispatch_next_task_offer(
-                    store,
-                    actor_key,
-                    &local_identity.actor_id,
-                    &project_id,
-                    next_worker_actor_id,
-                )?;
+                dispatch_next_task_offer(&owner_ctx, next_worker_actor_id)?;
             }
         }
         return Ok(());
@@ -1941,10 +2019,7 @@ pub(crate) fn handle_owner_task_result(
             .as_ref()
             .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] planner task blueprint が見つかりません"))?;
         materialize_planner_child_tasks(
-            store,
-            actor_key,
-            &local_identity.actor_id,
-            &project_id,
+            &owner_ctx,
             &task_id,
             decision::planned_tasks_from_worker_result(
                 config,
@@ -1968,13 +2043,7 @@ pub(crate) fn handle_owner_task_result(
             &principal_actor_id,
             &[],
         )? {
-            dispatch_next_task_offer(
-                store,
-                actor_key,
-                &local_identity.actor_id,
-                &project_id,
-                next_worker_actor_id,
-            )?;
+            dispatch_next_task_offer(&owner_ctx, next_worker_actor_id)?;
         }
     }
     Ok(())
@@ -2523,13 +2592,13 @@ pub(crate) fn handle_owner_join_reject(
         &[envelope.from_actor_id.clone()],
     )? {
         apply_owner_retry_cooldown(config);
-        dispatch_next_task_offer(
+        let owner_ctx = OwnerContext {
             store,
             actor_key,
-            &local_identity.actor_id,
-            &project_id,
-            next_worker_actor_id,
-        )?;
+            owner_actor_id: &local_identity.actor_id,
+            project_id: &project_id,
+        };
+        dispatch_next_task_offer(&owner_ctx, next_worker_actor_id)?;
     }
 
     runtime.mark_inbox_message_processed(&envelope.msg_id)?;
@@ -2538,16 +2607,14 @@ pub(crate) fn handle_owner_join_reject(
 }
 
 pub(crate) fn dispatch_next_task_offer(
-    store: &Store,
-    actor_key: &StoredKeypair,
-    owner_actor_id: &ActorId,
-    project_id: &starweft_id::ProjectId,
+    ctx: &OwnerContext<'_>,
     worker_actor_id: ActorId,
 ) -> Result<bool> {
-    let constraints = project_vision_constraints_or_default(store, project_id)?;
+    let constraints = project_vision_constraints_or_default(ctx.store, ctx.project_id)?;
     if budget_mode_is_minimal(&constraints)
-        && store
-            .project_snapshot(project_id)?
+        && ctx
+            .store
+            .project_snapshot(ctx.project_id)?
             .map(|snapshot| {
                 snapshot.task_counts.accepted
                     + snapshot.task_counts.running
@@ -2560,19 +2627,23 @@ pub(crate) fn dispatch_next_task_offer(
     }
 
     loop {
-        let Some(task_id) = store.next_queued_task_for_actor(project_id, owner_actor_id)? else {
+        let Some(task_id) = ctx
+            .store
+            .next_queued_task_for_actor(ctx.project_id, ctx.owner_actor_id)?
+        else {
             return Ok(false);
         };
-        let task_blueprint = store
+        let task_blueprint = ctx
+            .store
             .task_blueprint(&task_id)?
             .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task blueprint が見つかりません"))?;
 
         if let Some((policy_code, summary)) = policy_blocking_reason(&constraints) {
             record_owner_policy_blocked_task_result(&PolicyBlockedTaskParams {
-                store,
-                actor_key,
-                owner_actor_id,
-                project_id,
+                store: ctx.store,
+                actor_key: ctx.actor_key,
+                owner_actor_id: ctx.owner_actor_id,
+                project_id: ctx.project_id,
                 task_id: &task_id,
                 required_capability: &task_blueprint.required_capability,
                 constraints: &constraints,
@@ -2582,9 +2653,9 @@ pub(crate) fn dispatch_next_task_offer(
             continue;
         }
 
-        let runtime = RuntimePipeline::new(store);
+        let runtime = RuntimePipeline::new(ctx.store);
         let join_offer = UnsignedEnvelope::new(
-            owner_actor_id.clone(),
+            ctx.owner_actor_id.clone(),
             Some(worker_actor_id.clone()),
             JoinOffer {
                 required_capabilities: vec![task_blueprint.required_capability.clone()],
@@ -2592,9 +2663,9 @@ pub(crate) fn dispatch_next_task_offer(
                 expected_duration_sec: estimate_task_duration_sec(&task_blueprint.objective),
             },
         )
-        .with_project_id(project_id.clone())
-        .sign(actor_key)?;
-        store.append_task_event(&join_offer)?;
+        .with_project_id(ctx.project_id.clone())
+        .sign(ctx.actor_key)?;
+        ctx.store.append_task_event(&join_offer)?;
         runtime.queue_outgoing(&join_offer)?;
         return Ok(true);
     }
@@ -3034,6 +3105,7 @@ mod tests {
             Some(actor_id.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "busy".to_owned(),
                 description: "busy".to_owned(),
                 objective: "busy".to_owned(),
@@ -3100,6 +3172,7 @@ mod tests {
             Some(owner_actor.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "planner".to_owned(),
                 description: "planner".to_owned(),
                 objective: "planner".to_owned(),
@@ -3218,11 +3291,15 @@ mod tests {
             .apply_project_charter(&charter)
             .expect("apply charter");
 
+        let owner_ctx = OwnerContext {
+            store: &store,
+            actor_key: &owner_key,
+            owner_actor_id: &owner_actor,
+            project_id: &project_id,
+        };
+
         let task_id = queue_owner_planned_task(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
+            &owner_ctx,
             starweft_observation::PlannedTaskSpec {
                 title: "blocked".to_owned(),
                 description: "blocked".to_owned(),
@@ -3231,14 +3308,14 @@ mod tests {
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
                 rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
             },
             None,
+            Vec::new(),
         )
         .expect("queue task");
 
-        let dispatched =
-            dispatch_next_task_offer(&store, &owner_key, &owner_actor, &project_id, worker_actor)
-                .expect("dispatch");
+        let dispatched = dispatch_next_task_offer(&owner_ctx, worker_actor).expect("dispatch");
         assert!(!dispatched);
 
         let snapshot = store
@@ -3315,6 +3392,7 @@ mod tests {
             Some(worker_actor.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "running".to_owned(),
                 description: "running".to_owned(),
                 objective: "running".to_owned(),
@@ -3347,11 +3425,15 @@ mod tests {
             .apply_task_progress(&active_progress)
             .expect("apply progress");
 
+        let owner_ctx = OwnerContext {
+            store: &store,
+            actor_key: &owner_key,
+            owner_actor_id: &owner_actor,
+            project_id: &project_id,
+        };
+
         let queued_task_id = queue_owner_planned_task(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
+            &owner_ctx,
             starweft_observation::PlannedTaskSpec {
                 title: "queued".to_owned(),
                 description: "queued".to_owned(),
@@ -3360,14 +3442,14 @@ mod tests {
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
                 rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
             },
             None,
+            Vec::new(),
         )
         .expect("queue task");
 
-        let dispatched =
-            dispatch_next_task_offer(&store, &owner_key, &owner_actor, &project_id, worker_actor)
-                .expect("dispatch");
+        let dispatched = dispatch_next_task_offer(&owner_ctx, worker_actor).expect("dispatch");
         assert!(!dispatched);
 
         let snapshot = store
@@ -3932,11 +4014,15 @@ mod tests {
             })
             .expect("peer identity");
 
+        let owner_ctx = OwnerContext {
+            store: &store,
+            actor_key: &owner_key,
+            owner_actor_id: &owner_actor,
+            project_id: &project_id,
+        };
+
         let blocked_task_id = queue_owner_planned_task(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
+            &owner_ctx,
             starweft_observation::PlannedTaskSpec {
                 title: "remote-blocked".to_owned(),
                 description: "remote-blocked".to_owned(),
@@ -3945,18 +4031,14 @@ mod tests {
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
                 rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
             },
             None,
+            Vec::new(),
         )
         .expect("queue task");
-        let dispatched = dispatch_next_task_offer(
-            &store,
-            &owner_key,
-            &owner_actor,
-            &project_id,
-            owner_actor.clone(),
-        )
-        .expect("dispatch");
+        let dispatched =
+            dispatch_next_task_offer(&owner_ctx, owner_actor.clone()).expect("dispatch");
         assert!(!dispatched);
         assert_eq!(
             store

@@ -33,8 +33,8 @@ const ACTIVE_TASK_STATUSES_SQL: &str = "('queued', 'accepted', 'running', 'stopp
 /// SQL fragment for terminal task statuses
 const TERMINAL_TASK_STATUSES_SQL: &str = "('completed', 'failed', 'stopped')";
 
-pub const STORE_SCHEMA_VERSION: i32 = 4;
-pub const STORE_SCHEMA_VERSION_LABEL: &str = "starweft-store/4";
+pub const STORE_SCHEMA_VERSION: i32 = 5;
+pub const STORE_SCHEMA_VERSION_LABEL: &str = "starweft-store/5";
 
 const SCHEMA_V1: &str = r#"
 
@@ -1463,6 +1463,19 @@ impl Store {
             ],
         )?;
 
+        // Persist task dependencies
+        if !envelope.body.depends_on.is_empty() {
+            if self.would_create_dependency_cycle(task_id, &envelope.body.depends_on)? {
+                bail!("dependency cycle detected for task_id={task_id}");
+            }
+            for dep_id in &envelope.body.depends_on {
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id, project_id) VALUES (?1, ?2, ?3)",
+                    params![task_id.as_str(), dep_id.as_str(), project_id.as_str()],
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -2198,6 +2211,7 @@ impl Store {
     }
 
     /// Returns the next queued task assigned to a specific actor.
+    /// Only returns tasks whose dependencies are all completed.
     pub fn next_queued_task_for_actor(
         &self,
         project_id: &ProjectId,
@@ -2205,10 +2219,15 @@ impl Store {
     ) -> Result<Option<TaskId>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT task_id
-            FROM tasks
-            WHERE project_id = ?1 AND assignee_actor_id = ?2 AND status = 'queued'
-            ORDER BY CASE WHEN parent_task_id IS NOT NULL THEN 0 ELSE 1 END, created_at ASC, task_id ASC
+            SELECT t.task_id
+            FROM tasks t
+            WHERE t.project_id = ?1 AND t.assignee_actor_id = ?2 AND t.status = 'queued'
+              AND NOT EXISTS (
+                SELECT 1 FROM task_dependencies d
+                LEFT JOIN tasks dep ON dep.task_id = d.depends_on_task_id
+                WHERE d.task_id = t.task_id AND (dep.status IS NULL OR dep.status != 'completed')
+              )
+            ORDER BY CASE WHEN t.parent_task_id IS NOT NULL THEN 0 ELSE 1 END, t.created_at ASC, t.task_id ASC
             LIMIT 1
             "#,
         )?;
@@ -2472,6 +2491,27 @@ impl Store {
     }
 
     /// Builds a task snapshot from the current projection state.
+    /// Returns just the status of a task without loading the full snapshot.
+    pub fn task_status(&self, task_id: &TaskId) -> Result<Option<starweft_protocol::TaskStatus>> {
+        self.connection
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                [task_id.as_str()],
+                |row| {
+                    let status_str: String = row.get(0)?;
+                    starweft_protocol::TaskStatus::from_str(&status_str).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn task_snapshot(&self, task_id: &TaskId) -> Result<Option<TaskSnapshot>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -3294,6 +3334,7 @@ impl Store {
                 "DELETE FROM stop_receipts",
                 "DELETE FROM snapshots",
                 "DELETE FROM publish_events",
+                "DELETE FROM task_dependencies",
             ] {
                 self.connection.execute(statement, [])?;
             }
@@ -4400,6 +4441,21 @@ fn apply_migration(connection: &Connection, version: i32) -> Result<()> {
             )?;
             Ok(())
         }
+        5 => {
+            connection.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS task_dependencies (
+                  task_id TEXT NOT NULL,
+                  depends_on_task_id TEXT NOT NULL,
+                  project_id TEXT NOT NULL,
+                  PRIMARY KEY (task_id, depends_on_task_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_deps_depends_on
+                  ON task_dependencies(depends_on_task_id);
+                "#,
+            )?;
+            Ok(())
+        }
         _ => bail!("[E_SCHEMA_VERSION] unknown schema migration target: {version}"),
     }
 }
@@ -4670,6 +4726,108 @@ fn compute_retry_depth(task_id: &str, parent_map: &HashMap<String, Option<String
 }
 
 impl Store {
+    /// Checks whether adding the given dependency edges would create a cycle in the task dependency graph.
+    pub fn would_create_dependency_cycle(
+        &self,
+        task_id: &TaskId,
+        depends_on: &[TaskId],
+    ) -> Result<bool> {
+        for dep_id in depends_on {
+            if dep_id == task_id {
+                return Ok(true);
+            }
+        }
+        // BFS: from each dep_id, walk backward through its own dependencies to see if task_id
+        // is reachable. If dep_id can already reach task_id via existing edges, adding
+        // task_id -> dep_id would create a cycle.
+        let mut statement = self
+            .connection
+            .prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1")?;
+        for dep_id in depends_on {
+            let mut queue = vec![dep_id.clone()];
+            let mut visited = HashSet::new();
+            while let Some(current) = queue.pop() {
+                if current == *task_id {
+                    return Ok(true);
+                }
+                if !visited.insert(current.clone()) {
+                    continue;
+                }
+                let dependencies: Vec<TaskId> = statement
+                    .query_map([current.as_str()], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?
+                    .into_iter()
+                    .map(|s| TaskId::new(s).context("invalid task ID in task_dependencies table"))
+                    .collect::<Result<Vec<TaskId>>>()?;
+                queue.extend(dependencies);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns the task IDs that a task depends on.
+    pub fn task_dependency_ids(&self, task_id: &TaskId) -> Result<Vec<TaskId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1")?;
+        let ids = statement
+            .query_map([task_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .map(|s| TaskId::new(s).context("invalid task ID in task_dependencies table"))
+            .collect::<Result<Vec<TaskId>>>()?;
+        Ok(ids)
+    }
+
+    /// Returns true if all dependencies of the given task are completed.
+    pub fn task_dependencies_satisfied(&self, task_id: &TaskId) -> Result<bool> {
+        let satisfied: bool = self.connection.query_row(
+            r#"
+            SELECT NOT EXISTS (
+                SELECT 1 FROM task_dependencies d
+                LEFT JOIN tasks dep ON dep.task_id = d.depends_on_task_id
+                WHERE d.task_id = ?1 AND (dep.status IS NULL OR dep.status != 'completed')
+            )
+            "#,
+            [task_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(satisfied)
+    }
+
+    /// Returns the task IDs that depend on the given task.
+    pub fn task_dependents(&self, task_id: &TaskId) -> Result<Vec<TaskId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT task_id FROM task_dependencies WHERE depends_on_task_id = ?1")?;
+        let ids = statement
+            .query_map([task_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .map(|s| TaskId::new(s).context("invalid task ID in task_dependencies table"))
+            .collect::<Result<Vec<TaskId>>>()?;
+        Ok(ids)
+    }
+
+    /// Returns all task dependencies for a project as a map of task_id → Vec<depends_on_task_id>.
+    pub fn all_task_dependencies_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, depends_on_task_id FROM task_dependencies WHERE project_id = ?1",
+        )?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        let rows = statement.query_map([project_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (task_id, dep_id) = row?;
+            map.entry(task_id).or_default().push(dep_id);
+        }
+        Ok(map)
+    }
+
     fn would_create_task_cycle(&self, task_id: &TaskId, parent_task_id: &TaskId) -> Result<bool> {
         if task_id == parent_task_id {
             return Ok(true);
@@ -5013,6 +5171,7 @@ mod tests {
             Some(worker_actor_id.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "Task".to_owned(),
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
@@ -5895,6 +6054,7 @@ mod tests {
             Some(worker_actor_id),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "Recovered Task".to_owned(),
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
@@ -5942,6 +6102,7 @@ mod tests {
             Some(worker_actor_id.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "Task".to_owned(),
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
@@ -6025,6 +6186,7 @@ mod tests {
             Some(worker_actor_id),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "Artifact Task".to_owned(),
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
@@ -6130,6 +6292,7 @@ mod tests {
             Some(worker_actor_id),
             TaskDelegated {
                 parent_task_id: Some(task_id.clone()),
+                depends_on: Vec::new(),
                 title: "Cycle".to_owned(),
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),

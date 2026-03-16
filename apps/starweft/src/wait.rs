@@ -665,6 +665,7 @@ mod tests {
             Some(worker_actor_id.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "Task".to_owned(),
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),

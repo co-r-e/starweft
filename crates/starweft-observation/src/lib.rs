@@ -95,6 +95,9 @@ pub struct PlannedTaskSpec {
     pub expected_output_schema: Value,
     /// Explanation of why this task was derived.
     pub rationale: String,
+    /// Indices of other tasks in the plan that this task depends on.
+    #[serde(default)]
+    pub depends_on_indices: Vec<usize>,
 }
 
 /// Decomposes a vision's raw text into a set of planned task specifications.
@@ -124,9 +127,12 @@ pub fn derive_task_plan(
     }
 
     let limit = configured_max.min(candidates.len()).max(2);
-    candidates
+    let selected: Vec<CandidateSegment> = candidates.into_iter().take(limit).collect();
+
+    // Build specs with phase-order dependencies
+    let phases: Vec<Phase> = selected.iter().map(|c| c.phase).collect();
+    let mut specs: Vec<PlannedTaskSpec> = selected
         .into_iter()
-        .take(limit)
         .enumerate()
         .map(|(index, candidate)| {
             build_task_spec(
@@ -137,7 +143,16 @@ pub fn derive_task_plan(
                 candidate,
             )
         })
-        .collect()
+        .collect();
+
+    // Each task depends on all tasks from prior phases
+    for i in 0..specs.len() {
+        let current_phase = phases[i];
+        let deps: Vec<usize> = (0..i).filter(|&j| phases[j] < current_phase).collect();
+        specs[i].depends_on_indices = deps;
+    }
+
+    specs
 }
 
 /// Estimates the expected duration in seconds for a task based on objective complexity.
@@ -442,7 +457,7 @@ fn fallback_phases(
         },
     ];
 
-    phases
+    let mut specs: Vec<PlannedTaskSpec> = phases
         .into_iter()
         .enumerate()
         .map(|(index, candidate)| {
@@ -454,7 +469,12 @@ fn fallback_phases(
                 candidate,
             )
         })
-        .collect()
+        .collect();
+    // Chain phases: discovery → implementation → validation
+    for (i, spec) in specs.iter_mut().enumerate().skip(1) {
+        spec.depends_on_indices = vec![i - 1];
+    }
+    specs
 }
 
 fn bootstrap_task(
@@ -511,6 +531,7 @@ fn build_task_spec(
             }
         }),
         rationale: candidate.rationale,
+        depends_on_indices: Vec::new(),
     }
 }
 

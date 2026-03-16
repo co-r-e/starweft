@@ -128,6 +128,7 @@ pub fn planner_task_spec(
         input_payload: planner_request_payload(config, &context),
         expected_output_schema: planner_output_schema(),
         rationale: "distributed openclaw planner".to_owned(),
+        depends_on_indices: Vec::new(),
     }
 }
 
@@ -149,6 +150,36 @@ pub fn build_task_evaluation(
             retry_attempt,
             failure_action,
         ),
+        EvaluationStrategyKind::Openclaw => {
+            match OpenClawEvaluationEngine.build_task_evaluation(
+                config,
+                local_identity,
+                actor_key,
+                store,
+                envelope,
+                retry_attempt,
+                failure_action,
+            ) {
+                Ok(result) => Ok(result),
+                Err(error) if config.observation.evaluator_fallback_to_heuristic => {
+                    tracing::warn!(
+                        "OpenClaw evaluator failed, falling back to heuristic: {error:#}"
+                    );
+                    HeuristicEvaluationEngine.build_task_evaluation(
+                        local_identity,
+                        actor_key,
+                        store,
+                        envelope,
+                        retry_attempt,
+                        failure_action,
+                    )
+                    .with_context(|| format!(
+                        "openclaw evaluator failed and heuristic fallback also failed: {error}"
+                    ))
+                }
+                Err(error) => Err(error),
+            }
+        }
     }
 }
 
@@ -300,6 +331,117 @@ impl EvaluationEngine for HeuristicEvaluationEngine {
     }
 }
 
+struct OpenClawEvaluationEngine;
+
+impl OpenClawEvaluationEngine {
+    #[allow(clippy::too_many_arguments)]
+    fn build_task_evaluation(
+        &self,
+        config: &Config,
+        local_identity: &LocalIdentityRecord,
+        actor_key: &StoredKeypair,
+        store: &Store,
+        envelope: &Envelope<TaskResultSubmitted>,
+        retry_attempt: u64,
+        failure_action: Option<&FailureAction>,
+    ) -> Result<Envelope<EvaluationIssued>> {
+        let task_id = envelope
+            .task_id
+            .clone()
+            .ok_or_else(|| anyhow!("task_id is required"))?;
+        let blueprint = store.task_blueprint(&task_id)?;
+        let objective = blueprint
+            .as_ref()
+            .map(|task| task.objective.as_str())
+            .unwrap_or(envelope.body.summary.as_str());
+
+        let attachment = evaluator_attachment(&config.observation, &config.openclaw);
+        let request = BridgeTaskRequest {
+            title: format!("Evaluate task {task_id}"),
+            description: "Evaluate the task result and return scores as JSON.".to_owned(),
+            objective: objective.to_owned(),
+            required_capability: config.openclaw.capability_version.clone(),
+            input_payload: serde_json::json!({
+                "mode": "starweft_owner_evaluator",
+                "task_id": task_id.as_str(),
+                "objective": objective,
+                "status": format!("{:?}", envelope.body.status),
+                "summary": &envelope.body.summary,
+                "output_payload": &envelope.body.output_payload,
+                "retry_attempt": retry_attempt,
+                "failure_action": failure_action.map(FailureAction::label),
+                "failure_reason": failure_action.map(FailureAction::reason),
+            }),
+        };
+
+        let response = execute_task(&attachment, &request)
+            .with_context(|| "failed to execute OpenClaw evaluation task")?;
+
+        let scores = parse_evaluator_scores(&response.output_payload)?;
+        let comment = response
+            .output_payload
+            .get("comment")
+            .and_then(Value::as_str)
+            .unwrap_or("openclaw evaluator")
+            .to_owned();
+
+        UnsignedEnvelope::new(
+            local_identity.actor_id.clone(),
+            Some(envelope.from_actor_id.clone()),
+            EvaluationIssued {
+                subject_actor_id: envelope.from_actor_id.clone(),
+                scores,
+                comment,
+            },
+        )
+        .with_project_id(
+            envelope
+                .project_id
+                .clone()
+                .ok_or_else(|| anyhow!("project_id is required"))?,
+        )
+        .with_task_id(task_id)
+        .sign(actor_key)
+        .map_err(Into::into)
+    }
+}
+
+fn evaluator_attachment(
+    observation: &ObservationSection,
+    openclaw: &crate::config::OpenClawSection,
+) -> OpenClawAttachment {
+    openclaw_attachment(
+        observation.evaluator_bin.as_deref(),
+        observation.evaluator_working_dir.as_deref(),
+        observation.evaluator_timeout_sec,
+        openclaw,
+    )
+}
+
+fn parse_evaluator_scores(payload: &Value) -> Result<std::collections::BTreeMap<String, f32>> {
+    let scores_value = payload
+        .get("scores")
+        .ok_or_else(|| anyhow!("evaluator output must contain a 'scores' object"))?;
+    let scores_map = scores_value
+        .as_object()
+        .ok_or_else(|| anyhow!("evaluator 'scores' must be a JSON object"))?;
+
+    let mut result = std::collections::BTreeMap::new();
+    for (key, value) in scores_map {
+        let score = value
+            .as_f64()
+            .ok_or_else(|| anyhow!("score '{key}' must be a number"))? as f32;
+        result.insert(key.clone(), score.clamp(1.0, 5.0));
+    }
+
+    // Ensure standard dimensions exist with defaults
+    for dimension in ["quality", "speed", "reliability", "alignment"] {
+        result.entry(dimension.to_owned()).or_insert(3.0);
+    }
+
+    Ok(result)
+}
+
 struct RuleBasedRetryPolicy;
 
 impl RetryPolicyEngine for RuleBasedRetryPolicy {
@@ -371,16 +513,28 @@ fn planner_attachment(
     observation: &ObservationSection,
     openclaw: &crate::config::OpenClawSection,
 ) -> OpenClawAttachment {
+    openclaw_attachment(
+        observation.planner_bin.as_deref(),
+        observation.planner_working_dir.as_deref(),
+        observation.planner_timeout_sec,
+        openclaw,
+    )
+}
+
+fn openclaw_attachment(
+    bin: Option<&str>,
+    working_dir: Option<&str>,
+    timeout_sec: u64,
+    openclaw: &crate::config::OpenClawSection,
+) -> OpenClawAttachment {
     OpenClawAttachment {
-        bin: observation
-            .planner_bin
-            .clone()
+        bin: bin
+            .map(ToOwned::to_owned)
             .unwrap_or_else(|| openclaw.bin.clone()),
-        working_dir: observation
-            .planner_working_dir
-            .clone()
+        working_dir: working_dir
+            .map(ToOwned::to_owned)
             .or_else(|| openclaw.working_dir.clone()),
-        timeout_sec: Some(observation.planner_timeout_sec.max(1)),
+        timeout_sec: Some(timeout_sec.max(1)),
     }
 }
 
@@ -452,6 +606,8 @@ struct PlannerTaskPayload {
     expected_output_schema: Option<Value>,
     #[serde(default)]
     rationale: Option<String>,
+    #[serde(default)]
+    depends_on: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,6 +673,7 @@ fn parse_openclaw_planned_tasks(
                 rationale: task
                     .rationale
                     .unwrap_or_else(|| "openclaw planner output".to_owned()),
+                depends_on_indices: task.depends_on,
             })
         })
         .collect()
@@ -565,7 +722,8 @@ fn planner_output_schema() -> Value {
                         "required_capability": { "type": "string" },
                         "input_payload": { "type": "object" },
                         "expected_output_schema": { "type": "object" },
-                        "rationale": { "type": "string" }
+                        "rationale": { "type": "string" },
+                        "depends_on": { "type": "array", "items": { "type": "integer" } }
                     }
                 }
             }
@@ -762,6 +920,7 @@ mod tests {
         );
         let delegated = TaskDelegated {
             parent_task_id: None,
+            depends_on: Vec::new(),
             title: spec.title,
             description: spec.description,
             objective: spec.objective,
@@ -788,6 +947,7 @@ mod tests {
         );
         let delegated = TaskDelegated {
             parent_task_id: None,
+            depends_on: Vec::new(),
             title: planner.title,
             description: planner.description,
             objective: planner.objective,
@@ -815,6 +975,7 @@ mod tests {
         );
         let delegated = TaskDelegated {
             parent_task_id: None,
+            depends_on: Vec::new(),
             title: planner.title,
             description: planner.description,
             objective: planner.objective,

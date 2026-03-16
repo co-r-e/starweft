@@ -68,6 +68,7 @@ fn delegate_tasks(
         let task_id = TaskId::generate();
         let delegated = TaskDelegated {
             parent_task_id: None,
+            depends_on: Vec::new(),
             title: format!("bench task {i}"),
             description: format!("benchmark task number {i} for performance testing"),
             objective: format!("complete benchmark objective {i} successfully"),

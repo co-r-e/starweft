@@ -496,6 +496,7 @@ mod tests {
             Some(ActorId::generate()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "publish target".to_owned(),
                 description: "publish target".to_owned(),
                 objective: "publish target".to_owned(),

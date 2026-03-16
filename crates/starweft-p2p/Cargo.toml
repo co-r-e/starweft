@@ -10,7 +10,7 @@ homepage.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-libp2p = { version = "0.56.0", features = ["cbor", "macros", "mdns", "noise", "request-response", "tcp", "tokio", "yamux"] }
+libp2p = { version = "0.56.0", features = ["autonat", "cbor", "dcutr", "dns", "identify", "macros", "mdns", "noise", "relay", "request-response", "tcp", "tokio", "upnp", "yamux"] }
 multiaddr.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use starweft_id::{ProjectId, TaskId};
-use starweft_p2p::{RuntimeTopology, RuntimeTransport, TransportDriver};
+use starweft_p2p::{NatStatus, RuntimeTopology, RuntimeTransport, TransportDriver};
 use starweft_protocol::SnapshotScopeType;
 use starweft_store::{ActorScopedStats, Store, TaskEventRecord};
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -85,6 +85,7 @@ pub(crate) struct StatusMetricsOutput {
     pub(crate) stop_receipts: u64,
     pub(crate) cached_project_snapshots: u64,
     pub(crate) cached_task_snapshots: u64,
+    pub(crate) nat_public: u8,
     pub(crate) openclaw_enabled: u8,
     pub(crate) worker_accept_join_offers: u8,
     pub(crate) worker_max_active_tasks: u64,
@@ -103,6 +104,7 @@ pub(crate) struct StatusView {
     pub(crate) node_id: String,
     pub(crate) transport: String,
     pub(crate) transport_peer_id: Option<String>,
+    pub(crate) nat_status: NatStatus,
     pub(crate) p2p: String,
     pub(crate) protocol_version: String,
     pub(crate) schema_version: String,
@@ -414,6 +416,7 @@ pub(crate) fn status_metrics_output(view: &StatusView) -> StatusMetricsOutput {
         stop_receipts: view.stop_receipts,
         cached_project_snapshots: view.cached_project_snapshots,
         cached_task_snapshots: view.cached_task_snapshots,
+        nat_public: u8::from(view.nat_status == NatStatus::Public),
         openclaw_enabled: u8::from(view.openclaw_enabled),
         worker_accept_join_offers: u8::from(view.worker_accept_join_offers),
         worker_max_active_tasks: view.worker_max_active_tasks,
@@ -519,6 +522,11 @@ const PROMETHEUS_METRICS: &[(&str, &str, MetricAccessor)] = &[
         "starweft_cached_task_snapshots",
         "Cached task snapshot count",
         |m| m.cached_task_snapshots,
+    ),
+    (
+        "starweft_nat_public",
+        "NAT reachability (1=public,0=private/unknown)",
+        |m| m.nat_public as u64,
     ),
     (
         "starweft_openclaw_enabled",
@@ -1203,6 +1211,7 @@ pub(crate) fn load_status_view_with(
             .unwrap_or_else(|| "uninitialized".to_owned()),
         transport: format!("{:?}", transport.kind()),
         transport_peer_id: transport.peer_id_hint().map(ToOwned::to_owned),
+        nat_status: transport.nat_status(),
         p2p: "ready".to_owned(),
         protocol_version: config.compatibility.protocol_version.clone(),
         schema_version: config.compatibility.schema_version.clone(),
@@ -1517,6 +1526,7 @@ mod tests {
             node_id: "node".to_owned(),
             transport: "LocalMailbox".to_owned(),
             transport_peer_id: None,
+            nat_status: NatStatus::Public,
             p2p: "ready".to_owned(),
             protocol_version: "starweft/0.1".to_owned(),
             schema_version: "starweft-store/4".to_owned(),

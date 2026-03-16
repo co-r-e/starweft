@@ -768,6 +768,9 @@ impl RoutedBody for JoinReject {
 pub struct TaskDelegated {
     /// Parent task ID if this is a sub-task.
     pub parent_task_id: Option<TaskId>,
+    /// Task IDs that must be completed before this task can be dispatched.
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
     /// Short task title.
     pub title: String,
     /// Detailed task description.

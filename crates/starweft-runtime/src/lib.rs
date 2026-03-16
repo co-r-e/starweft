@@ -254,6 +254,7 @@ mod tests {
             Some(worker_actor.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "research".to_owned(),
                 description: "collect data".to_owned(),
                 objective: "validate".to_owned(),
@@ -437,6 +438,7 @@ mod tests {
             Some(worker_actor.clone()),
             TaskDelegated {
                 parent_task_id: None,
+                depends_on: Vec::new(),
                 title: "research".to_owned(),
                 description: "collect data".to_owned(),
                 objective: "validate".to_owned(),
