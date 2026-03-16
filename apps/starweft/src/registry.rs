@@ -638,21 +638,24 @@ fn validate_registry_peer_record(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+struct RegistryRequestContext<'a> {
+    entries: &'a Mutex<HashMap<String, RegistryPeerRecord>>,
+    replay_cache: &'a Mutex<HashMap<String, OffsetDateTime>>,
+    rate_limits: &'a Mutex<HashMap<String, RegistryRateLimitBucket>>,
+}
+
 fn process_registry_request(
     args: &RegistryServeArgs,
     shared_secret: Option<&str>,
     peer_addr: &SocketAddr,
     request: &ParsedRegistryRequest,
-    entries: &Mutex<HashMap<String, RegistryPeerRecord>>,
-    replay_cache: &Mutex<HashMap<String, OffsetDateTime>>,
-    rate_limits: &Mutex<HashMap<String, RegistryRateLimitBucket>>,
+    ctx: &RegistryRequestContext<'_>,
     now: OffsetDateTime,
 ) -> Result<HttpResponse> {
     if let Some(limit) = registry_rate_limit_for(args, &request.method, &request.path) {
         let rate_limit_key = format!("{}:{}:{}", peer_addr.ip(), request.method, request.path);
         if let Some(retry_after) = enforce_registry_rate_limit(
-            &mut rate_limits.lock().expect("registry rate limits"),
+            &mut ctx.rate_limits.lock().expect("registry rate limits"),
             &rate_limit_key,
             limit,
             args.rate_limit_window_sec,
@@ -686,7 +689,7 @@ fn process_registry_request(
             }
         };
         if let Err(error) = remember_registry_nonce(
-            &mut replay_cache.lock().expect("registry replay cache"),
+            &mut ctx.replay_cache.lock().expect("registry replay cache"),
             &validated.nonce,
             now,
         ) {
@@ -699,7 +702,7 @@ fn process_registry_request(
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/peers") => {
             let cutoff = now - TimeDuration::seconds(args.ttl_sec as i64);
-            let mut guard = entries.lock().expect("registry entries");
+            let mut guard = ctx.entries.lock().expect("registry entries");
             guard.retain(|_, record| record.published_at >= cutoff);
             let response = guard.values().cloned().collect::<Vec<_>>();
             registry_json_response(
@@ -720,7 +723,7 @@ fn process_registry_request(
             if let Err(error) = validate_registry_peer_record(&record) {
                 return registry_http_error_response(error);
             }
-            entries
+            ctx.entries
                 .lock()
                 .expect("registry entries")
                 .insert(record.actor_id.clone(), record);
@@ -767,15 +770,18 @@ pub(crate) fn run_registry_serve(args: RegistryServeArgs) -> Result<()> {
         stream.set_read_timeout(registry_timeout_duration(args.read_timeout_ms))?;
         stream.set_write_timeout(registry_timeout_duration(args.write_timeout_ms))?;
 
+        let ctx = RegistryRequestContext {
+            entries: &entries,
+            replay_cache: &replay_cache,
+            rate_limits: &rate_limits,
+        };
         let response = match read_registry_http_request(&mut stream, args.max_body_bytes) {
             Ok(Some(request)) => match process_registry_request(
                 &args,
                 shared_secret.as_deref(),
                 &peer_addr,
                 &request,
-                &entries,
-                &replay_cache,
-                &rate_limits,
+                &ctx,
                 OffsetDateTime::now_utc(),
             ) {
                 Ok(response) => response,
@@ -1190,14 +1196,17 @@ mod tests {
             header_map: HashMap::from([("content-length".to_owned(), "2".to_owned())]),
             body: b"{}".to_vec(),
         };
+        let ctx = RegistryRequestContext {
+            entries: &Mutex::new(HashMap::new()),
+            replay_cache: &Mutex::new(HashMap::new()),
+            rate_limits: &Mutex::new(HashMap::new()),
+        };
         let response = process_registry_request(
             &args,
             None,
             &"127.0.0.1:7777".parse().expect("socket addr"),
             &request,
-            &Mutex::new(HashMap::new()),
-            &Mutex::new(HashMap::new()),
-            &Mutex::new(HashMap::new()),
+            &ctx,
             OffsetDateTime::now_utc(),
         )
         .expect("invalid announce payload should return response");

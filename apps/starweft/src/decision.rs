@@ -51,15 +51,19 @@ pub trait PlanningEngine {
     ) -> Result<Vec<PlannedTaskSpec>>;
 }
 
+pub(crate) struct EvaluationContext<'a> {
+    pub(crate) local_identity: &'a LocalIdentityRecord,
+    pub(crate) actor_key: &'a StoredKeypair,
+    pub(crate) store: &'a Store,
+    pub(crate) envelope: &'a Envelope<TaskResultSubmitted>,
+    pub(crate) retry_attempt: u64,
+    pub(crate) failure_action: Option<&'a FailureAction>,
+}
+
 pub trait EvaluationEngine {
     fn build_task_evaluation(
         &self,
-        local_identity: &LocalIdentityRecord,
-        actor_key: &StoredKeypair,
-        store: &Store,
-        envelope: &Envelope<TaskResultSubmitted>,
-        retry_attempt: u64,
-        failure_action: Option<&FailureAction>,
+        ctx: &EvaluationContext<'_>,
     ) -> Result<Envelope<EvaluationIssued>>;
 }
 
@@ -134,48 +138,24 @@ pub fn planner_task_spec(
 
 pub fn build_task_evaluation(
     config: &Config,
-    local_identity: &LocalIdentityRecord,
-    actor_key: &StoredKeypair,
-    store: &Store,
-    envelope: &Envelope<TaskResultSubmitted>,
-    retry_attempt: u64,
-    failure_action: Option<&FailureAction>,
+    ctx: &EvaluationContext<'_>,
 ) -> Result<Envelope<EvaluationIssued>> {
     match config.observation.evaluator {
-        EvaluationStrategyKind::Heuristic => HeuristicEvaluationEngine.build_task_evaluation(
-            local_identity,
-            actor_key,
-            store,
-            envelope,
-            retry_attempt,
-            failure_action,
-        ),
+        EvaluationStrategyKind::Heuristic => HeuristicEvaluationEngine.build_task_evaluation(ctx),
         EvaluationStrategyKind::Openclaw => {
-            match OpenClawEvaluationEngine.build_task_evaluation(
-                config,
-                local_identity,
-                actor_key,
-                store,
-                envelope,
-                retry_attempt,
-                failure_action,
-            ) {
+            match OpenClawEvaluationEngine.build_task_evaluation(config, ctx) {
                 Ok(result) => Ok(result),
                 Err(error) if config.observation.evaluator_fallback_to_heuristic => {
                     tracing::warn!(
                         "OpenClaw evaluator failed, falling back to heuristic: {error:#}"
                     );
-                    HeuristicEvaluationEngine.build_task_evaluation(
-                        local_identity,
-                        actor_key,
-                        store,
-                        envelope,
-                        retry_attempt,
-                        failure_action,
-                    )
-                    .with_context(|| format!(
-                        "openclaw evaluator failed and heuristic fallback also failed: {error}"
-                    ))
+                    HeuristicEvaluationEngine
+                        .build_task_evaluation(ctx)
+                        .with_context(|| {
+                            format!(
+                            "openclaw evaluator failed and heuristic fallback also failed: {error}"
+                        )
+                        })
                 }
                 Err(error) => Err(error),
             }
@@ -271,62 +251,58 @@ struct HeuristicEvaluationEngine;
 impl EvaluationEngine for HeuristicEvaluationEngine {
     fn build_task_evaluation(
         &self,
-        local_identity: &LocalIdentityRecord,
-        actor_key: &StoredKeypair,
-        store: &Store,
-        envelope: &Envelope<TaskResultSubmitted>,
-        retry_attempt: u64,
-        failure_action: Option<&FailureAction>,
+        ctx: &EvaluationContext<'_>,
     ) -> Result<Envelope<EvaluationIssued>> {
-        let task_id = envelope
+        let task_id = ctx
+            .envelope
             .task_id
             .clone()
             .ok_or_else(|| anyhow!("task_id is required"))?;
-        let blueprint = store.task_blueprint(&task_id)?;
+        let blueprint = ctx.store.task_blueprint(&task_id)?;
         let title = blueprint
             .as_ref()
             .map(|task| task.title.as_str())
-            .unwrap_or(envelope.body.summary.as_str());
+            .unwrap_or(ctx.envelope.body.summary.as_str());
         let objective = blueprint
             .as_ref()
             .map(|task| task.objective.as_str())
-            .unwrap_or(envelope.body.summary.as_str());
+            .unwrap_or(ctx.envelope.body.summary.as_str());
         let evaluation = evaluate_task_result(TaskEvaluationInput {
             title,
             objective,
-            status: envelope.body.status.clone(),
-            summary: &envelope.body.summary,
-            output_payload: &envelope.body.output_payload,
-            artifact_count: envelope.body.artifact_refs.len(),
-            retry_attempt,
-            started_at: envelope.body.started_at,
-            finished_at: envelope.body.finished_at,
-            failure_action: failure_action.map(FailureAction::label),
-            failure_reason: failure_action.map(FailureAction::reason),
+            status: ctx.envelope.body.status.clone(),
+            summary: &ctx.envelope.body.summary,
+            output_payload: &ctx.envelope.body.output_payload,
+            artifact_count: ctx.envelope.body.artifact_refs.len(),
+            retry_attempt: ctx.retry_attempt,
+            started_at: ctx.envelope.body.started_at,
+            finished_at: ctx.envelope.body.finished_at,
+            failure_action: ctx.failure_action.map(FailureAction::label),
+            failure_reason: ctx.failure_action.map(FailureAction::reason),
         });
 
         UnsignedEnvelope::new(
-            local_identity.actor_id.clone(),
-            Some(envelope.from_actor_id.clone()),
+            ctx.local_identity.actor_id.clone(),
+            Some(ctx.envelope.from_actor_id.clone()),
             EvaluationIssued {
-                subject_actor_id: envelope.from_actor_id.clone(),
+                subject_actor_id: ctx.envelope.from_actor_id.clone(),
                 scores: evaluation.scores,
                 comment: evaluation.comment,
             },
         )
         .with_project_id(
-            envelope
+            ctx.envelope
                 .project_id
                 .clone()
                 .ok_or_else(|| anyhow!("project_id is required"))?,
         )
         .with_task_id(
-            envelope
+            ctx.envelope
                 .task_id
                 .clone()
                 .ok_or_else(|| anyhow!("task_id is required"))?,
         )
-        .sign(actor_key)
+        .sign(ctx.actor_key)
         .map_err(Into::into)
     }
 }
@@ -334,26 +310,21 @@ impl EvaluationEngine for HeuristicEvaluationEngine {
 struct OpenClawEvaluationEngine;
 
 impl OpenClawEvaluationEngine {
-    #[allow(clippy::too_many_arguments)]
     fn build_task_evaluation(
         &self,
         config: &Config,
-        local_identity: &LocalIdentityRecord,
-        actor_key: &StoredKeypair,
-        store: &Store,
-        envelope: &Envelope<TaskResultSubmitted>,
-        retry_attempt: u64,
-        failure_action: Option<&FailureAction>,
+        ctx: &EvaluationContext<'_>,
     ) -> Result<Envelope<EvaluationIssued>> {
-        let task_id = envelope
+        let task_id = ctx
+            .envelope
             .task_id
             .clone()
             .ok_or_else(|| anyhow!("task_id is required"))?;
-        let blueprint = store.task_blueprint(&task_id)?;
+        let blueprint = ctx.store.task_blueprint(&task_id)?;
         let objective = blueprint
             .as_ref()
             .map(|task| task.objective.as_str())
-            .unwrap_or(envelope.body.summary.as_str());
+            .unwrap_or(ctx.envelope.body.summary.as_str());
 
         let attachment = evaluator_attachment(&config.observation, &config.openclaw);
         let request = BridgeTaskRequest {
@@ -365,12 +336,12 @@ impl OpenClawEvaluationEngine {
                 "mode": "starweft_owner_evaluator",
                 "task_id": task_id.as_str(),
                 "objective": objective,
-                "status": format!("{:?}", envelope.body.status),
-                "summary": &envelope.body.summary,
-                "output_payload": &envelope.body.output_payload,
-                "retry_attempt": retry_attempt,
-                "failure_action": failure_action.map(FailureAction::label),
-                "failure_reason": failure_action.map(FailureAction::reason),
+                "status": format!("{:?}", ctx.envelope.body.status),
+                "summary": &ctx.envelope.body.summary,
+                "output_payload": &ctx.envelope.body.output_payload,
+                "retry_attempt": ctx.retry_attempt,
+                "failure_action": ctx.failure_action.map(FailureAction::label),
+                "failure_reason": ctx.failure_action.map(FailureAction::reason),
             }),
         };
 
@@ -386,22 +357,22 @@ impl OpenClawEvaluationEngine {
             .to_owned();
 
         UnsignedEnvelope::new(
-            local_identity.actor_id.clone(),
-            Some(envelope.from_actor_id.clone()),
+            ctx.local_identity.actor_id.clone(),
+            Some(ctx.envelope.from_actor_id.clone()),
             EvaluationIssued {
-                subject_actor_id: envelope.from_actor_id.clone(),
+                subject_actor_id: ctx.envelope.from_actor_id.clone(),
                 scores,
                 comment,
             },
         )
         .with_project_id(
-            envelope
+            ctx.envelope
                 .project_id
                 .clone()
                 .ok_or_else(|| anyhow!("project_id is required"))?,
         )
         .with_task_id(task_id)
-        .sign(actor_key)
+        .sign(ctx.actor_key)
         .map_err(Into::into)
     }
 }
@@ -767,8 +738,8 @@ mod tests {
     use super::{OpenClawPlanningEngine, PlanningEngine};
     use super::{
         PlannerContext, classify_task_failure_action_with_policy,
-        fallback_tasks_for_worker_planner, is_planner_task, parse_openclaw_planned_tasks,
-        planned_tasks_from_worker_result, planner_task_spec,
+        fallback_tasks_for_worker_planner, is_planner_task, parse_evaluator_scores,
+        parse_openclaw_planned_tasks, planned_tasks_from_worker_result, planner_task_spec,
     };
     use crate::config::{
         Config, NodeRole, OwnerRetryAction, OwnerRetryRule, OwnerSection, PlanningStrategyKind,
@@ -996,5 +967,70 @@ mod tests {
         .expect("materialize");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].required_capability, "openclaw.execution.v1");
+    }
+
+    #[test]
+    fn parse_evaluator_scores_extracts_and_clamps_values() {
+        let payload = json!({
+            "scores": {
+                "quality": 4.5,
+                "speed": 2.0,
+                "reliability": 6.0,
+                "alignment": 0.5,
+            }
+        });
+        let scores = parse_evaluator_scores(&payload).expect("parse");
+        assert_eq!(scores["quality"], 4.5);
+        assert_eq!(scores["speed"], 2.0);
+        assert_eq!(scores["reliability"], 5.0); // clamped from 6.0
+        assert_eq!(scores["alignment"], 1.0); // clamped from 0.5
+    }
+
+    #[test]
+    fn parse_evaluator_scores_fills_missing_dimensions_with_defaults() {
+        let payload = json!({
+            "scores": {
+                "quality": 4.0,
+            }
+        });
+        let scores = parse_evaluator_scores(&payload).expect("parse");
+        assert_eq!(scores["quality"], 4.0);
+        assert_eq!(scores["speed"], 3.0);
+        assert_eq!(scores["reliability"], 3.0);
+        assert_eq!(scores["alignment"], 3.0);
+    }
+
+    #[test]
+    fn parse_evaluator_scores_preserves_extra_dimensions() {
+        let payload = json!({
+            "scores": {
+                "quality": 3.0,
+                "speed": 3.0,
+                "reliability": 3.0,
+                "alignment": 3.0,
+                "creativity": 4.5,
+            }
+        });
+        let scores = parse_evaluator_scores(&payload).expect("parse");
+        assert_eq!(scores.len(), 5);
+        assert_eq!(scores["creativity"], 4.5);
+    }
+
+    #[test]
+    fn parse_evaluator_scores_rejects_missing_scores_key() {
+        let payload = json!({"comment": "no scores"});
+        let error = parse_evaluator_scores(&payload).expect_err("should fail");
+        assert!(error.to_string().contains("scores"));
+    }
+
+    #[test]
+    fn parse_evaluator_scores_rejects_non_numeric_value() {
+        let payload = json!({
+            "scores": {
+                "quality": "high",
+            }
+        });
+        let error = parse_evaluator_scores(&payload).expect_err("should fail");
+        assert!(error.to_string().contains("quality"));
     }
 }

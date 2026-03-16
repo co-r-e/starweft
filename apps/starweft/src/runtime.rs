@@ -265,16 +265,17 @@ pub(crate) fn run_node(args: RunArgs) -> Result<()> {
                 next_registry_sync_deadline =
                     next_registry_sync_at(&config, OffsetDateTime::now_utc());
             }
-            if let Err(error) = run_node_once(
-                &config,
-                &paths,
-                &store,
-                &topology,
-                &transport,
-                actor_key.as_ref(),
-                &task_completion_queue,
-                &worker_runtime,
-            ) {
+            let inbox_ctx = InboxProcessingContext {
+                config: &config,
+                paths: &paths,
+                store: &store,
+                topology: &topology,
+                transport: &transport,
+                actor_key: actor_key.as_ref(),
+                task_completion_tx: task_completion_queue.tx,
+                worker_runtime: &worker_runtime,
+            };
+            if let Err(error) = run_node_once(&inbox_ctx, &task_completion_queue) {
                 eprintln!("{error:#}");
             }
             if !ready_written {
@@ -286,16 +287,17 @@ pub(crate) fn run_node(args: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    let tick = run_node_once(
-        &config,
-        &paths,
-        &store,
-        &topology,
-        &transport,
-        actor_key.as_ref(),
-        &task_completion_queue,
-        &worker_runtime,
-    )?;
+    let inbox_ctx = InboxProcessingContext {
+        config: &config,
+        paths: &paths,
+        store: &store,
+        topology: &topology,
+        transport: &transport,
+        actor_key: actor_key.as_ref(),
+        task_completion_tx: task_completion_queue.tx,
+        worker_runtime: &worker_runtime,
+    };
+    let tick = run_node_once(&inbox_ctx, &task_completion_queue)?;
     println!("role: {}", config.node.role);
     println!("mode: oneshot");
     println!("queued_outbox: {}", tick.queued_outbox);
@@ -314,39 +316,30 @@ pub(crate) fn run_node(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_node_once(
-    config: &Config,
-    paths: &DataPaths,
-    store: &Store,
-    topology: &RuntimeTopology,
-    transport: &RuntimeTransport,
-    actor_key: Option<&StoredKeypair>,
+    ctx: &InboxProcessingContext<'_>,
     task_completion_queue: &TaskCompletionQueue<'_>,
-    worker_runtime: &WorkerRuntimeState,
 ) -> Result<RunTick> {
-    process_mdns_discoveries(config, paths, store, topology, transport, actor_key)?;
-    process_local_inbox(&InboxProcessingContext {
-        config,
-        paths,
-        store,
-        topology,
-        transport,
-        actor_key,
-        task_completion_tx: task_completion_queue.tx,
-        worker_runtime,
-    })?;
-    process_completed_tasks(
-        config,
-        paths,
-        store,
-        actor_key,
-        task_completion_queue.rx,
-        worker_runtime,
+    process_mdns_discoveries(
+        ctx.config,
+        ctx.paths,
+        ctx.store,
+        ctx.topology,
+        ctx.transport,
+        ctx.actor_key,
     )?;
-    flush_outbox(config, paths, store, transport)?;
-    let stats = store.stats()?;
-    let outbox_preview = store.queued_outbox_messages(10)?;
+    process_local_inbox(ctx)?;
+    process_completed_tasks(
+        ctx.config,
+        ctx.paths,
+        ctx.store,
+        ctx.actor_key,
+        task_completion_queue.rx,
+        ctx.worker_runtime,
+    )?;
+    flush_outbox(ctx.config, ctx.paths, ctx.store, ctx.transport)?;
+    let stats = ctx.store.stats()?;
+    let outbox_preview = ctx.store.queued_outbox_messages(10)?;
     Ok(RunTick {
         queued_outbox: stats.queued_outbox_count,
         running_tasks: stats.running_task_count,
@@ -1901,15 +1894,15 @@ pub(crate) fn handle_owner_task_result(
 
         match &failure_action {
             FailureAction::RetrySameWorker { .. } => {
-                let evaluation = build_task_evaluation(
-                    config,
+                let eval_ctx = decision::EvaluationContext {
                     local_identity,
                     actor_key,
                     store,
-                    &envelope,
+                    envelope: &envelope,
                     retry_attempt,
-                    Some(&failure_action),
-                )?;
+                    failure_action: Some(&failure_action),
+                };
+                let evaluation = build_task_evaluation(config, &eval_ctx)?;
                 runtime.ingest_evaluation_issued(&evaluation)?;
                 runtime.queue_outgoing(&evaluation)?;
                 queue_retry_task(&owner_ctx, &task_id)?;
@@ -1930,15 +1923,15 @@ pub(crate) fn handle_owner_task_result(
                     &principal_actor_id,
                     &[envelope.from_actor_id.clone()],
                 )? {
-                    let evaluation = build_task_evaluation(
-                        config,
+                    let eval_ctx = decision::EvaluationContext {
                         local_identity,
                         actor_key,
                         store,
-                        &envelope,
+                        envelope: &envelope,
                         retry_attempt,
-                        Some(&failure_action),
-                    )?;
+                        failure_action: Some(&failure_action),
+                    };
+                    let evaluation = build_task_evaluation(config, &eval_ctx)?;
                     runtime.ingest_evaluation_issued(&evaluation)?;
                     runtime.queue_outgoing(&evaluation)?;
                     queue_retry_task(&owner_ctx, &task_id)?;
@@ -1953,15 +1946,15 @@ pub(crate) fn handle_owner_task_result(
             FailureAction::NoRetry { .. } => {}
         }
 
-        let evaluation = build_task_evaluation(
-            config,
+        let eval_ctx = decision::EvaluationContext {
             local_identity,
             actor_key,
             store,
-            &envelope,
+            envelope: &envelope,
             retry_attempt,
-            Some(&failure_action),
-        )?;
+            failure_action: Some(&failure_action),
+        };
+        let evaluation = build_task_evaluation(config, &eval_ctx)?;
         runtime.ingest_evaluation_issued(&evaluation)?;
         runtime.queue_outgoing(&evaluation)?;
         if is_planner_task
@@ -2002,15 +1995,15 @@ pub(crate) fn handle_owner_task_result(
         return Ok(());
     }
 
-    let evaluation = build_task_evaluation(
-        config,
+    let eval_ctx = decision::EvaluationContext {
         local_identity,
         actor_key,
         store,
-        &envelope,
+        envelope: &envelope,
         retry_attempt,
-        None,
-    )?;
+        failure_action: None,
+    };
+    let evaluation = build_task_evaluation(config, &eval_ctx)?;
     runtime.ingest_evaluation_issued(&evaluation)?;
     runtime.queue_outgoing(&evaluation)?;
 
@@ -2072,22 +2065,9 @@ pub(crate) fn classify_task_failure_action_with_policy(
 
 pub(crate) fn build_task_evaluation(
     config: &Config,
-    local_identity: &LocalIdentityRecord,
-    actor_key: &StoredKeypair,
-    store: &Store,
-    envelope: &Envelope<TaskResultSubmitted>,
-    retry_attempt: u64,
-    failure_action: Option<&FailureAction>,
+    ctx: &decision::EvaluationContext<'_>,
 ) -> Result<Envelope<EvaluationIssued>> {
-    decision::build_task_evaluation(
-        config,
-        local_identity,
-        actor_key,
-        store,
-        envelope,
-        retry_attempt,
-        failure_action,
-    )
+    decision::build_task_evaluation(config, ctx)
 }
 
 pub(crate) fn handle_worker_join_offer(

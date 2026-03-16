@@ -6423,4 +6423,341 @@ mod tests {
 
         let _ = fs::remove_dir_all(temp);
     }
+
+    /// Helper to create a minimal project + task with dependencies for dependency tests.
+    fn setup_dependency_test() -> (Store, StoredKeypair, ActorId, ActorId, ProjectId) {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-dep-test-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let owner_key = StoredKeypair::generate();
+        let owner_actor = ActorId::generate();
+        let worker_actor = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let vision_id = VisionId::generate();
+        let now = OffsetDateTime::now_utc();
+
+        store
+            .save_vision(&VisionRecord {
+                vision_id: vision_id.clone(),
+                principal_actor_id: owner_actor.clone(),
+                title: "Vision".to_owned(),
+                raw_vision_text: "text".to_owned(),
+                constraints: json!({}),
+                status: "accepted".to_owned(),
+                created_at: now,
+            })
+            .expect("save vision");
+        let charter = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(owner_actor.clone()),
+            ProjectCharter {
+                project_id: project_id.clone(),
+                vision_id,
+                principal_actor_id: owner_actor.clone(),
+                owner_actor_id: owner_actor.clone(),
+                title: "Project".to_owned(),
+                objective: "Objective".to_owned(),
+                stop_authority_actor_id: owner_actor.clone(),
+                participant_policy: ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: EvaluationPolicy {
+                    quality_weight: 1.0,
+                    speed_weight: 0.5,
+                    reliability_weight: 1.0,
+                    alignment_weight: 1.0,
+                },
+            },
+        )
+        .with_project_id(project_id.clone())
+        .sign(&owner_key)
+        .expect("sign charter");
+        store
+            .apply_project_charter(&charter)
+            .expect("apply charter");
+
+        (store, owner_key, owner_actor, worker_actor, project_id)
+    }
+
+    fn create_task(
+        store: &Store,
+        owner_key: &StoredKeypair,
+        owner_actor: &ActorId,
+        project_id: &ProjectId,
+        task_id: TaskId,
+        depends_on: Vec<TaskId>,
+    ) {
+        let task = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(owner_actor.clone()),
+            TaskDelegated {
+                parent_task_id: None,
+                depends_on,
+                title: "Task".to_owned(),
+                description: "desc".to_owned(),
+                objective: "obj".to_owned(),
+                required_capability: "mock".to_owned(),
+                input_payload: json!({}),
+                expected_output_schema: json!({}),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_id)
+        .sign(owner_key)
+        .expect("sign task");
+        store.apply_task_delegated(&task).expect("apply task");
+    }
+
+    #[test]
+    fn task_dependency_ids_returns_stored_dependencies() {
+        let (store, owner_key, owner_actor, _worker, project_id) = setup_dependency_test();
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        let task_c = TaskId::generate();
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_a.clone(),
+            Vec::new(),
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_b.clone(),
+            Vec::new(),
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_c.clone(),
+            vec![task_a.clone(), task_b.clone()],
+        );
+
+        let deps = store.task_dependency_ids(&task_c).expect("deps");
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&task_a));
+        assert!(deps.contains(&task_b));
+
+        let deps_a = store.task_dependency_ids(&task_a).expect("deps a");
+        assert!(deps_a.is_empty());
+    }
+
+    #[test]
+    fn task_dependents_returns_reverse_dependencies() {
+        let (store, owner_key, owner_actor, _worker, project_id) = setup_dependency_test();
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_a.clone(),
+            Vec::new(),
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_b.clone(),
+            vec![task_a.clone()],
+        );
+
+        let dependents = store.task_dependents(&task_a).expect("dependents");
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0], task_b);
+
+        let dependents_b = store.task_dependents(&task_b).expect("dependents b");
+        assert!(dependents_b.is_empty());
+    }
+
+    #[test]
+    fn would_create_dependency_cycle_detects_self_cycle() {
+        let (store, owner_key, owner_actor, _worker, project_id) = setup_dependency_test();
+        let task_a = TaskId::generate();
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_a.clone(),
+            Vec::new(),
+        );
+
+        let is_cycle = store
+            .would_create_dependency_cycle(&task_a, &[task_a.clone()])
+            .expect("cycle check");
+        assert!(is_cycle);
+    }
+
+    #[test]
+    fn would_create_dependency_cycle_detects_two_node_cycle() {
+        let (store, owner_key, owner_actor, _worker, project_id) = setup_dependency_test();
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_a.clone(),
+            Vec::new(),
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_b.clone(),
+            vec![task_a.clone()],
+        );
+
+        // Adding task_a -> task_b would create A->B->A cycle
+        let is_cycle = store
+            .would_create_dependency_cycle(&task_a, &[task_b.clone()])
+            .expect("cycle check");
+        assert!(is_cycle);
+    }
+
+    #[test]
+    fn would_create_dependency_cycle_allows_valid_dag() {
+        let (store, owner_key, owner_actor, _worker, project_id) = setup_dependency_test();
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        let task_c = TaskId::generate();
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_a.clone(),
+            Vec::new(),
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_b.clone(),
+            Vec::new(),
+        );
+
+        // C depends on both A and B — no cycle
+        let is_cycle = store
+            .would_create_dependency_cycle(&task_c, &[task_a, task_b])
+            .expect("cycle check");
+        assert!(!is_cycle);
+    }
+
+    #[test]
+    fn task_dependencies_satisfied_checks_completion_status() {
+        let (store, owner_key, owner_actor, _worker, project_id) = setup_dependency_test();
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_a.clone(),
+            Vec::new(),
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_b.clone(),
+            vec![task_a.clone()],
+        );
+
+        // task_b depends on task_a which is queued → not satisfied
+        let satisfied = store
+            .task_dependencies_satisfied(&task_b)
+            .expect("satisfied");
+        assert!(!satisfied);
+
+        // Complete task_a
+        let result = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(owner_actor.clone()),
+            TaskResultSubmitted {
+                status: TaskExecutionStatus::Completed,
+                summary: "done".to_owned(),
+                output_payload: json!({}),
+                artifact_refs: Vec::new(),
+                started_at: OffsetDateTime::now_utc(),
+                finished_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(task_a.clone())
+        .sign(&owner_key)
+        .expect("sign result");
+        store
+            .apply_task_result_submitted(&result)
+            .expect("apply result");
+
+        // Now task_b dependencies should be satisfied
+        let satisfied = store
+            .task_dependencies_satisfied(&task_b)
+            .expect("satisfied");
+        assert!(satisfied);
+
+        // task_a has no dependencies → always satisfied
+        let satisfied_a = store
+            .task_dependencies_satisfied(&task_a)
+            .expect("satisfied a");
+        assert!(satisfied_a);
+    }
+
+    #[test]
+    fn all_task_dependencies_for_project_returns_full_graph() {
+        let (store, owner_key, owner_actor, _worker, project_id) = setup_dependency_test();
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        let task_c = TaskId::generate();
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_a.clone(),
+            Vec::new(),
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_b.clone(),
+            vec![task_a.clone()],
+        );
+        create_task(
+            &store,
+            &owner_key,
+            &owner_actor,
+            &project_id,
+            task_c.clone(),
+            vec![task_a.clone(), task_b.clone()],
+        );
+
+        let graph = store
+            .all_task_dependencies_for_project(&project_id)
+            .expect("graph");
+        assert_eq!(graph.len(), 2); // task_b and task_c have dependencies
+        assert_eq!(graph[task_b.as_str()].len(), 1);
+        assert_eq!(graph[task_c.as_str()].len(), 2);
+        assert!(!graph.contains_key(task_a.as_str())); // task_a has no dependencies
+    }
 }
