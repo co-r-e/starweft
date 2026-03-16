@@ -99,19 +99,49 @@ fn draw(frame: &mut Frame, view: Option<&StatusView>, error: Option<&str>) {
     draw_footer(frame, chunks[4]);
 }
 
+fn health_color(health: &str) -> Color {
+    if health.contains("openclaw_enabled=true") {
+        Color::Green
+    } else if health.contains("openclaw_enabled=false") {
+        Color::Yellow
+    } else {
+        Color::White
+    }
+}
+
+fn worker_capacity(active: u64, max: u64) -> f64 {
+    if max > 0 {
+        (active as f64 / max as f64).min(1.0)
+    } else {
+        0.0
+    }
+}
+
+fn capacity_color(capacity: f64) -> Color {
+    if capacity >= 1.0 {
+        Color::Red
+    } else if capacity >= 0.75 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn dead_letter_color(dead_letter_count: u64) -> Color {
+    if dead_letter_count > 0 {
+        Color::Red
+    } else {
+        Color::Green
+    }
+}
+
 fn draw_header(frame: &mut Frame, area: Rect, view: Option<&StatusView>) {
     let title = match view {
         Some(v) => format!(" Starweft Dashboard — {} ({}) ", v.role, v.node_id),
         None => " Starweft Dashboard — loading... ".to_owned(),
     };
     let health = view.map(|v| v.health_summary.clone()).unwrap_or_default();
-    let health_color = if health.contains("openclaw_enabled=true") {
-        Color::Green
-    } else if health.contains("openclaw_enabled=false") {
-        Color::Yellow
-    } else {
-        Color::White
-    };
+    let health_color = health_color(&health);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -159,11 +189,7 @@ fn draw_messaging(frame: &mut Frame, area: Rect, view: &StatusView) {
         kv_row("retry_waiting", view.retry_waiting_outbox),
         kv_row("dead_letter", view.dead_letter_outbox),
     ];
-    let dead_color = if view.dead_letter_outbox > 0 {
-        Color::Red
-    } else {
-        Color::Green
-    };
+    let dead_color = dead_letter_color(view.dead_letter_outbox);
     let outbox_table = Table::new(outbox_rows, [Constraint::Length(16), Constraint::Min(10)])
         .block(
             Block::default()
@@ -219,18 +245,8 @@ fn draw_worker_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
     ];
     frame.render_widget(role_table(" Worker ", rows), cols[0]);
 
-    let capacity = if view.worker_max_active_tasks > 0 {
-        (view.active_assigned_tasks as f64 / view.worker_max_active_tasks as f64).min(1.0)
-    } else {
-        0.0
-    };
-    let gauge_color = if capacity >= 1.0 {
-        Color::Red
-    } else if capacity >= 0.75 {
-        Color::Yellow
-    } else {
-        Color::Green
-    };
+    let capacity = worker_capacity(view.active_assigned_tasks, view.worker_max_active_tasks);
+    let gauge_color = capacity_color(capacity);
     let gauge = Gauge::default()
         .block(Block::default().borders(Borders::ALL).title(" Capacity "))
         .gauge_style(Style::default().fg(gauge_color))
@@ -279,4 +295,72 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
         Span::raw(" 終了"),
     ]));
     frame.render_widget(footer, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_color_green_when_openclaw_enabled() {
+        assert_eq!(health_color("openclaw_enabled=true peers=2"), Color::Green);
+    }
+
+    #[test]
+    fn health_color_yellow_when_openclaw_disabled() {
+        assert_eq!(
+            health_color("openclaw_enabled=false peers=0"),
+            Color::Yellow
+        );
+    }
+
+    #[test]
+    fn health_color_white_for_unknown_health() {
+        assert_eq!(health_color("ready"), Color::White);
+        assert_eq!(health_color(""), Color::White);
+    }
+
+    #[test]
+    fn worker_capacity_calculates_ratio() {
+        assert!((worker_capacity(3, 4) - 0.75).abs() < f64::EPSILON);
+        assert!((worker_capacity(0, 4) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn worker_capacity_clamps_to_one() {
+        assert!((worker_capacity(5, 4) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn worker_capacity_zero_when_max_is_zero() {
+        assert!((worker_capacity(0, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn capacity_color_green_under_75_percent() {
+        assert_eq!(capacity_color(0.5), Color::Green);
+        assert_eq!(capacity_color(0.0), Color::Green);
+    }
+
+    #[test]
+    fn capacity_color_yellow_at_75_percent() {
+        assert_eq!(capacity_color(0.75), Color::Yellow);
+        assert_eq!(capacity_color(0.99), Color::Yellow);
+    }
+
+    #[test]
+    fn capacity_color_red_at_full() {
+        assert_eq!(capacity_color(1.0), Color::Red);
+    }
+
+    #[test]
+    fn dead_letter_color_red_when_nonzero() {
+        assert_eq!(dead_letter_color(1), Color::Red);
+        assert_eq!(dead_letter_color(100), Color::Red);
+    }
+
+    #[test]
+    fn dead_letter_color_green_when_zero() {
+        assert_eq!(dead_letter_color(0), Color::Green);
+    }
 }

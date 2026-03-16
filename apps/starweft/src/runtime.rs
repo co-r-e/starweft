@@ -2046,15 +2046,6 @@ pub(crate) fn handle_owner_task_result(
 // Failure classification / evaluation / join / capabilities / stop
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-pub(crate) fn classify_task_failure_action(
-    envelope: &Envelope<TaskResultSubmitted>,
-    failed_attempts: u64,
-    max_retry_attempts: u64,
-) -> FailureAction {
-    decision::classify_task_failure_action(envelope, failed_attempts, max_retry_attempts)
-}
-
 pub(crate) fn classify_task_failure_action_with_policy(
     envelope: &Envelope<TaskResultSubmitted>,
     owner: &OwnerSection,
@@ -3611,7 +3602,7 @@ mod tests {
         .expect("sign envelope");
 
         assert!(matches!(
-            classify_task_failure_action(&envelope, 1, 8),
+            decision::classify_task_failure_action(&envelope, 1, 8),
             FailureAction::RetrySameWorker { .. }
         ));
     }
@@ -3639,7 +3630,7 @@ mod tests {
         .expect("sign envelope");
 
         assert!(matches!(
-            classify_task_failure_action(&envelope, 1, 8),
+            decision::classify_task_failure_action(&envelope, 1, 8),
             FailureAction::RetryDifferentWorker { .. }
         ));
     }
@@ -3667,7 +3658,7 @@ mod tests {
         .expect("sign envelope");
 
         assert!(matches!(
-            classify_task_failure_action(&envelope, 1, 8),
+            decision::classify_task_failure_action(&envelope, 1, 8),
             FailureAction::NoRetry { .. }
         ));
     }
@@ -3695,7 +3686,7 @@ mod tests {
         .expect("sign envelope");
 
         assert!(matches!(
-            classify_task_failure_action(&envelope, 8, 8),
+            decision::classify_task_failure_action(&envelope, 8, 8),
             FailureAction::NoRetry { .. }
         ));
     }

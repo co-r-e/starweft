@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-17
+
+### Added
+
+- **タスク依存グラフ** — タスク間の依存関係を宣言し、前提タスク完了後にのみ後続タスクをディスパッチ
+  - `depends_on: Vec<TaskId>` フィールドを `TaskDelegated` プロトコルメッセージに追加
+  - Store schema v5: `task_dependencies` テーブル + サイクル検出
+  - `depends_on_indices` によるフェーズ順序依存の自動計算 (observation crate)
+  - プランナー出力スキーマが `depends_on` インデックスをサポート
+- **NAT traversal & リレー** — NAT 越えの自動接続確立
+  - AutoNAT による到達性検出、UPnP 自動ポートマッピング
+  - Circuit Relay v2 (server + client)、DCUtR ホールパンチング
+  - Identify プロトコル、DNS トランスポート
+  - `nat_status` を status view / Prometheus メトリクスに追加
+- **OpenClaw 評価エンジン** — ヒューリスティックに加え OpenClaw ベースのタスク評価戦略
+  - `evaluator_fallback_to_heuristic` による自動フォールバック
+  - `evaluator_bin` / `evaluator_working_dir` / `evaluator_timeout_sec` 設定
+- TUI ダッシュボードのユニットテスト (11 tests)
+- Store 依存グラフのユニットテスト (7 tests: サイクル検出、依存クエリ、充足判定)
+- OpenClaw 評価スコア解析のユニットテスト (5 tests: クランプ、デフォルト、エラーケース)
+
+### Changed
+
+- **OwnerContext struct** — owner 系 6 関数のパラメータスプロールを解消 (7-8 params → 2-5 params)
+- **EvaluationContext struct** — 評価エンジン関数のパラメータを統合
+- **RegistryRequestContext struct** — レジストリサーバー状態を構造体に統合
+- `run_node_once` が `InboxProcessingContext` を再利用するようリファクタリング
+- `#[allow(clippy::too_many_arguments)]` を全箇所から除去
+- ops.rs から未使用の `run_repair` / `run_audit` / `create_backup_archive` / `restore_backup_archive` を削除
+- `classify_task_failure_action` をテスト専用 (`#[cfg(test)]`) に変更
+
 ## [0.3.0] - 2026-03-15
 
 ### Added

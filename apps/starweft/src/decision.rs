@@ -163,6 +163,7 @@ pub fn build_task_evaluation(
     }
 }
 
+#[cfg(test)]
 pub fn classify_task_failure_action(
     envelope: &Envelope<TaskResultSubmitted>,
     failed_attempts: u64,

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
@@ -33,27 +33,6 @@ pub struct PublishContextRequest {
     pub project_id: String,
     pub task_id: Option<String>,
     pub format: RenderFormat,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub enum RepairAction {
-    RebuildProjections,
-    ResumeOutbox,
-    ReconcileRunningTasks,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct RepairRequest {
-    pub data_dir: Option<PathBuf>,
-    pub action: RepairAction,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct AuditRequest {
-    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -203,67 +182,6 @@ pub fn run_publish_context(request: PublishContextRequest) -> Result<String> {
     }
 }
 
-#[allow(dead_code)]
-pub fn run_repair(request: RepairRequest) -> Result<String> {
-    let (_config, paths) = load_existing_config(request.data_dir.as_ref())?;
-    let store = Store::open(&paths.ledger_db)?;
-    match request.action {
-        RepairAction::ResumeOutbox => {
-            let report = store.resume_pending_outbox()?;
-            Ok(format!(
-                "repair_action: resume_outbox\nupdated_messages: {}",
-                report.resumed_messages
-            ))
-        }
-        RepairAction::ReconcileRunningTasks => {
-            let report = store.repair_reconcile_running_tasks()?;
-            Ok(format!(
-                "repair_action: reconcile_running_tasks\nstopping_tasks: {}\nstopped_tasks: {}",
-                report.stopping_tasks, report.stopped_tasks
-            ))
-        }
-        RepairAction::RebuildProjections => {
-            let report = store.rebuild_projections_from_task_events()?;
-            Ok(format!(
-                "repair_action: rebuild_projections\nreplayed_events: {}\nrebuilt_projects: {}\nrebuilt_tasks: {}\nrebuilt_task_results: {}\nrebuilt_evaluations: {}\nrebuilt_publish_events: {}\nrebuilt_snapshots: {}\nrebuilt_stop_orders: {}\nrebuilt_stop_receipts: {}",
-                report.replayed_events,
-                report.rebuilt_projects,
-                report.rebuilt_tasks,
-                report.rebuilt_task_results,
-                report.rebuilt_evaluations,
-                report.rebuilt_publish_events,
-                report.rebuilt_snapshots,
-                report.rebuilt_stop_orders,
-                report.rebuilt_stop_receipts,
-            ))
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub fn run_audit(request: AuditRequest) -> Result<String> {
-    let (_config, paths) = load_existing_config(request.data_dir.as_ref())?;
-    let store = Store::open(&paths.ledger_db)?;
-
-    let report = store.verify_task_event_log()?;
-    Ok(format!(
-        "audit_action: verify_log\ntotal_events: {}\nmissing_task_ids: {}\nduplicate_project_charters: {}\nlamport_regressions: {}\nparse_failures: {}\nsignature_failures: {}\nraw_json_mismatches: {}\nunverifiable_signatures: {}\nstatus: {}",
-        report.total_events,
-        report.missing_task_ids,
-        report.duplicate_project_charters,
-        report.lamport_regressions,
-        report.parse_failures,
-        report.signature_failures,
-        report.raw_json_mismatches,
-        report.unverifiable_signatures,
-        if report.errors.is_empty() {
-            "ok"
-        } else {
-            "warning"
-        }
-    ))
-}
-
 fn render_project_snapshot(snapshot: &ProjectSnapshot, format: RenderFormat) -> Result<String> {
     match format {
         RenderFormat::Json => Ok(serde_json::to_string_pretty(snapshot)?),
@@ -373,24 +291,4 @@ fn render_publish_context_markdown(context: &PublishContext) -> String {
         artifact_count,
         latest_comment,
     )
-}
-
-#[allow(dead_code)]
-pub fn create_backup_archive(data_dir: Option<&PathBuf>, output: &Path) -> Result<String> {
-    let output = crate::commands::create_backup_bundle(data_dir, output, false)?;
-    Ok(format!(
-        "backup_dir: {}\nmanifest: {}",
-        output.display(),
-        output.join("manifest.json").display()
-    ))
-}
-
-#[allow(dead_code)]
-pub fn restore_backup_archive(data_dir: Option<&PathBuf>, input: &Path) -> Result<String> {
-    let (input, paths) = crate::commands::restore_backup_bundle(data_dir, input, false)?;
-    Ok(format!(
-        "restored_from: {}\ndata_dir: {}",
-        input.display(),
-        paths.root.display()
-    ))
 }
