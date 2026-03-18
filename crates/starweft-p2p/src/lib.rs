@@ -795,7 +795,10 @@ async fn libp2p_event_loop(
                         let _ = reply_tx.send(Ok(drained));
                     }
                     Libp2pCommand::Deliver { multiaddr, payload, reply_tx } => {
-                        let peer_id = extract_peer_id(&multiaddr)?;
+                        let peer_id = match extract_peer_id(&multiaddr) {
+                            Ok(id) => id,
+                            Err(e) => { let _ = reply_tx.send(Err(e)); continue; }
+                        };
                         swarm.add_peer_address(peer_id, multiaddr.clone());
                         let request_id = swarm.behaviour_mut().request_response.send_request(&peer_id, payload);
                         pending.insert(request_id, (reply_tx, multiaddr));
@@ -918,12 +921,13 @@ async fn libp2p_event_loop(
                     SwarmEvent::Behaviour(StarweftBehaviourEvent::Identify(
                         libp2p::identify::Event::Received { peer_id, info, .. }
                     )) => {
+                        // Don't blindly trust observed_addr from peers — Starweft nodes
+                        // configure listen addresses explicitly via config.toml.
                         tracing::debug!(
-                            "identify received from {peer_id}: {} observed at {:?}",
+                            "identify received from {peer_id}: {} observed at {}",
                             info.protocol_version,
                             info.observed_addr
                         );
-                        swarm.add_external_address(info.observed_addr);
                     }
                     SwarmEvent::Behaviour(StarweftBehaviourEvent::Identify(_)) => {}
                     SwarmEvent::Behaviour(StarweftBehaviourEvent::Autonat(event)) => {

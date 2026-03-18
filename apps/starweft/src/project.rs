@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use starweft_crypto::StoredKeypair;
 use starweft_id::{ActorId, ProjectId, TaskId};
@@ -449,11 +449,15 @@ pub(crate) fn approve_execution_scope(
         human_intervention_required,
         resumed_task_ids,
         dispatched,
-        dispatched_worker_actor_id: dispatched.then(|| {
-            next_worker_actor_id
-                .expect("worker exists when dispatched")
-                .to_string()
-        }),
+        dispatched_worker_actor_id: if dispatched {
+            Some(
+                next_worker_actor_id
+                    .context("[E_INTERNAL] worker not found despite dispatch flag")?
+                    .to_string(),
+            )
+        } else {
+            None
+        },
         policy_blocker,
         remaining_queued_tasks,
     })
@@ -739,7 +743,7 @@ pub(crate) fn build_task_tree_output(
                 .is_ok_and(|status| status.is_terminal())
         })
         .count();
-    let roots = build_task_tree_nodes(&items, root_task_id.map(ToString::to_string));
+    let roots = build_task_tree_nodes(&items, root_task_id.map(ToString::to_string))?;
     Ok(TaskTreeOutput {
         project_id: project_id.to_string(),
         root_task_id: root_task_id.map(ToString::to_string),
@@ -753,7 +757,7 @@ pub(crate) fn build_task_tree_output(
 pub(crate) fn build_task_tree_nodes(
     items: &[TaskListItem],
     root_task_id: Option<String>,
-) -> Vec<TaskTreeNode> {
+) -> Result<Vec<TaskTreeNode>> {
     let ordered_ids: Vec<String> = items.iter().map(|item| item.task_id.clone()).collect();
     let item_map: HashMap<String, TaskListItem> = items
         .iter()
@@ -790,19 +794,19 @@ pub(crate) fn build_task_tree_node(
     task_id: &str,
     item_map: &HashMap<String, TaskListItem>,
     children: &HashMap<String, Vec<String>>,
-) -> TaskTreeNode {
+) -> Result<TaskTreeNode> {
     let item = item_map
         .get(task_id)
         .cloned()
-        .expect("task tree item must exist");
-    let child_nodes = children
+        .context("[E_INTERNAL] task tree item missing")?;
+    let child_nodes: Vec<TaskTreeNode> = children
         .get(task_id)
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .map(|child_id| build_task_tree_node(&child_id, item_map, children))
-        .collect();
-    TaskTreeNode {
+        .collect::<Result<_>>()?;
+    Ok(TaskTreeNode {
         task_id: item.task_id,
         project_id: item.project_id,
         parent_task_id: item.parent_task_id,
@@ -815,7 +819,7 @@ pub(crate) fn build_task_tree_node(
         updated_at: item.updated_at,
         child_count: item.child_count,
         children: child_nodes,
-    }
+    })
 }
 
 pub(crate) fn render_project_list_text(items: &[ProjectListItem]) -> String {
@@ -1279,7 +1283,7 @@ mod tests {
             },
         ];
 
-        let roots = build_task_tree_nodes(&items, None);
+        let roots = build_task_tree_nodes(&items, None).expect("build_task_tree_nodes");
 
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].task_id, "task_root");

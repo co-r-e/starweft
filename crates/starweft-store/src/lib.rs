@@ -4362,7 +4362,7 @@ fn stop_scope_type_name(scope_type: &StopScopeType) -> &'static str {
 }
 
 fn migrate_connection(connection: &Connection) -> Result<()> {
-    connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+    connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
 
     let current_version = schema_user_version(connection)?;
     if current_version > STORE_SCHEMA_VERSION {

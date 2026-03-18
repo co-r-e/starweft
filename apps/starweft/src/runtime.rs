@@ -447,7 +447,13 @@ pub(crate) fn process_local_inbox(ctx: &InboxProcessingContext<'_>) -> Result<()
     let local_identity = ctx.store.local_identity()?;
 
     for line in ctx.transport.receive(ctx.topology)? {
-        let wire: WireEnvelope = serde_json::from_str(&line)?;
+        let wire: WireEnvelope = match serde_json::from_str(&line) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("skipping malformed inbox message: {e}");
+                continue;
+            }
+        };
         if ctx.config.node.role == NodeRole::Relay {
             relay_incoming_wire(ctx.config, ctx.paths, ctx.store, ctx.transport, &wire)?;
             continue;
@@ -2145,9 +2151,8 @@ fn process_mdns_discoveries(
     let capabilities = local_advertised_capabilities(config);
     let runtime = RuntimePipeline::new(store);
     for peer in peers {
-        let prefix = &peer.peer_id[..16.min(peer.peer_id.len())];
-        let actor_id = ActorId::new(format!("mdns_{prefix}"))?;
-        let node_id = NodeId::new(format!("mdns_{prefix}"))?;
+        let actor_id = ActorId::new(format!("mdns_{}", peer.peer_id))?;
+        let node_id = NodeId::new(format!("mdns_{}", peer.peer_id))?;
         for address in &peer.addresses {
             let full_addr = format!("{}/p2p/{}", address, peer.peer_id);
             store.add_peer_address(&PeerAddressRecord {
