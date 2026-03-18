@@ -891,6 +891,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3206,7 +3216,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starweft"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3242,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-crypto"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3256,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-id"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3265,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-observation"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3276,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-openclaw-bridge"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -3290,9 +3300,10 @@ dependencies = [
 
 [[package]]
 name = "starweft-p2p"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
+ "fs2",
  "libp2p",
  "multiaddr",
  "serde",
@@ -3304,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-protocol"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -3317,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-runtime"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -3331,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-stop"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "starweft-id",
@@ -3341,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "starweft-store"
-version = "0.4.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "rusqlite",

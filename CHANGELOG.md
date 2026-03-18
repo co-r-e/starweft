@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-03-18
+
+### Fixed
+
+- **libp2p Deliver** — イベントループ全体をクラッシュさせていた `extract_peer_id` エラーをローカル処理に変更
+- **inbox 処理** — 不正 JSON メッセージ 1 件でバッチ全体が中断する問題を修正
+- **mDNS actor_id** — ピア ID 先頭 16 文字の切り詰めによる衝突リスクをフル ID 使用で解消
+- **SQLite** — `PRAGMA busy_timeout = 5000` 追加（並行 CLI アクセス時の即時 SQLITE_BUSY を防止）
+- **Identify** — ピアからの `observed_addr` を無検証で外部アドレスに追加する問題を修正
+- **project.rs** — 本番コードパスの `.expect()` を `.context()` に置換
+- **local mailbox** — ファイルロックによるアトミック書き込みを実装
+- **Owner 停止命令** — キュー済み未委任タスクも停止対象に含めるよう修正
+- **retry_cooldown** — メインループをブロックしていた `thread::sleep` を除去
+- **libp2p** — `discovered_peers` / `pending` のメモリリークを修正（上限・タイムアウト）
+- **mDNS** — expired ピアを `seen_peers` から除去し再発見を可能に
+- **スキーマエラー** — アップグレード案内をエラーメッセージに追加
+
+### Added
+
+- **mDNS E2E テスト** — `peer add` なしでのピア自動発見テスト（`#[ignore]`）
+- **CI npm publish** — タグ push 時の npm 自動 publish ジョブ
+- **CI バージョン同期チェック** — Cargo.toml と npm/package.json のバージョン一致を検証
+
 ## [0.4.0] - 2026-03-17
 
 ### Added

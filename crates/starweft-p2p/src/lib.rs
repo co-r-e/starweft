@@ -17,9 +17,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_INBOX_CAPACITY: usize = 10_000;
+const MAX_DISCOVERED_PEERS: usize = 1_000;
 const STARWEFT_PROTOCOL_ID: &str = "/starweft/0.1";
 
 /// Circuit Relay v2 operating mode.
@@ -361,13 +362,16 @@ impl TransportDriver for LocalMailboxTransport {
             fs::create_dir_all(parent)?;
         }
 
+        use fs2::FileExt;
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&mailbox_path)?;
+        file.lock_exclusive()?;
         writeln!(file, "{payload}")?;
         file.sync_data()?;
+        fs2::FileExt::unlock(&file)?;
         Ok(Some(DeliveryReport {
             target: mailbox_path.display().to_string(),
         }))
@@ -776,6 +780,7 @@ async fn libp2p_event_loop(
     let mut connected_seed_peers = HashSet::new();
     let mut pending_seed_dials = HashSet::new();
     let mut redial_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut pending_cleanup_interval = tokio::time::interval(Duration::from_secs(30));
     let mut nat_status = NatStatus::Unknown;
     let mut relay_reservation_attempted = HashSet::new();
 
@@ -801,7 +806,7 @@ async fn libp2p_event_loop(
                         };
                         swarm.add_peer_address(peer_id, multiaddr.clone());
                         let request_id = swarm.behaviour_mut().request_response.send_request(&peer_id, payload);
-                        pending.insert(request_id, (reply_tx, multiaddr));
+                        pending.insert(request_id, (Instant::now(), reply_tx, multiaddr));
                     }
                     Libp2pCommand::DrainDiscoveredPeers { reply_tx } => {
                         let drained = std::mem::take(&mut discovered_peers);
@@ -819,6 +824,18 @@ async fn libp2p_event_loop(
             }
             _ = redial_interval.tick() => {
                 dial_seed_peers(swarm, &seed_targets, &connected_seed_peers, &mut pending_seed_dials);
+            }
+            _ = pending_cleanup_interval.tick() => {
+                let now = Instant::now();
+                let expired: Vec<_> = pending.iter()
+                    .filter(|(_, (created, _, _))| now.duration_since(*created) >= Duration::from_secs(30))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in expired {
+                    if let Some((_, reply_tx, _)) = pending.remove(&key) {
+                        let _ = reply_tx.send(Err(anyhow!("request timed out")));
+                    }
+                }
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -857,11 +874,15 @@ async fn libp2p_event_loop(
                                 let accepted = inbox.len() < MAX_INBOX_CAPACITY;
                                 if accepted {
                                     inbox.push(request);
+                                } else {
+                                    tracing::warn!(
+                                        "inbox full ({MAX_INBOX_CAPACITY}), rejecting incoming request"
+                                    );
                                 }
                                 let _ = swarm.behaviour_mut().request_response.send_response(channel, EnvelopeAck { accepted });
                             }
                             request_response::Message::Response { request_id, response } => {
-                                if let Some((reply_tx, multiaddr)) = pending.remove(&request_id) {
+                                if let Some((_, reply_tx, multiaddr)) = pending.remove(&request_id) {
                                     let report = DeliveryReport {
                                         target: multiaddr.to_string(),
                                     };
@@ -878,7 +899,7 @@ async fn libp2p_event_loop(
                     SwarmEvent::Behaviour(StarweftBehaviourEvent::RequestResponse(
                         request_response::Event::OutboundFailure { request_id, error, .. }
                     )) => {
-                        if let Some((reply_tx, _)) = pending.remove(&request_id) {
+                        if let Some((_, reply_tx, _)) = pending.remove(&request_id) {
                             let _ = reply_tx.send(Err(anyhow!("outbound failure: {error}")));
                         }
                     }
@@ -896,26 +917,26 @@ async fn libp2p_event_loop(
                             batch.insert(*peer_id);
                         }
                         for peer_id in batch {
-                            if !mdns_seen_peers.insert(peer_id) {
-                                continue;
-                            }
                             let addresses: Vec<Multiaddr> = peers
                                 .iter()
                                 .filter(|(pid, _)| *pid == peer_id)
                                 .map(|(_, addr)| addr.clone())
                                 .collect();
                             tracing::info!("mDNS discovered peer {peer_id} at {addresses:?}");
-                            discovered_peers.push(DiscoveredPeer {
-                                peer_id: peer_id.to_string(),
+                            queue_discovered_peer(
+                                &mut discovered_peers,
+                                &mut mdns_seen_peers,
+                                peer_id,
                                 addresses,
-                            });
+                            );
                         }
                     }
                     SwarmEvent::Behaviour(StarweftBehaviourEvent::Mdns(
                         libp2p::mdns::Event::Expired(peers)
                     )) => {
-                        for (peer_id, address) in peers {
+                        for (peer_id, address) in &peers {
                             tracing::debug!("mDNS expired peer {peer_id} at {address}");
+                            mdns_seen_peers.remove(peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(StarweftBehaviourEvent::Identify(
@@ -1069,6 +1090,29 @@ fn dial_seed_peers(
     }
 }
 
+fn queue_discovered_peer(
+    discovered_peers: &mut Vec<DiscoveredPeer>,
+    mdns_seen_peers: &mut HashSet<PeerId>,
+    peer_id: PeerId,
+    addresses: Vec<Multiaddr>,
+) -> bool {
+    if mdns_seen_peers.contains(&peer_id) {
+        return false;
+    }
+    if discovered_peers.len() >= MAX_DISCOVERED_PEERS {
+        tracing::warn!(
+            "mDNS discovered peer queue full ({MAX_DISCOVERED_PEERS}), deferring {peer_id}"
+        );
+        return false;
+    }
+    mdns_seen_peers.insert(peer_id);
+    discovered_peers.push(DiscoveredPeer {
+        peer_id: peer_id.to_string(),
+        addresses,
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,5 +1260,43 @@ mod tests {
         ]);
 
         assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn full_mdns_queue_does_not_mark_peer_as_seen() {
+        let mut discovered_peers = (0..MAX_DISCOVERED_PEERS)
+            .map(|index| DiscoveredPeer {
+                peer_id: format!("peer-{index}"),
+                addresses: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut mdns_seen_peers = HashSet::new();
+        let peer_id = libp2p_peer_id_from_private_key([33; 32])
+            .expect("peer id")
+            .parse::<PeerId>()
+            .expect("parse peer id");
+        let addresses = vec![
+            "/ip4/127.0.0.1/tcp/4001"
+                .parse::<Multiaddr>()
+                .expect("multiaddr"),
+        ];
+
+        assert!(!queue_discovered_peer(
+            &mut discovered_peers,
+            &mut mdns_seen_peers,
+            peer_id,
+            addresses.clone(),
+        ));
+        assert!(!mdns_seen_peers.contains(&peer_id));
+
+        discovered_peers.pop();
+
+        assert!(queue_discovered_peer(
+            &mut discovered_peers,
+            &mut mdns_seen_peers,
+            peer_id,
+            addresses,
+        ));
+        assert!(mdns_seen_peers.contains(&peer_id));
     }
 }

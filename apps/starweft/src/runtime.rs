@@ -2458,10 +2458,9 @@ pub(crate) fn evaluate_worker_join_offer(
     Ok((true, None))
 }
 
-pub(crate) fn apply_owner_retry_cooldown(config: &Config) {
-    if config.owner.retry_cooldown_ms > 0 {
-        thread::sleep(Duration::from_millis(config.owner.retry_cooldown_ms));
-    }
+pub(crate) fn apply_owner_retry_cooldown(_config: &Config) {
+    // Intentionally no-op: the run_node_once 200ms sleep provides natural
+    // retry cooldown without blocking the main event loop.
 }
 
 pub(crate) fn handle_owner_join_accept(
@@ -2887,12 +2886,23 @@ pub(crate) fn handle_owner_stop_order(
     .sign(actor_key)?;
     runtime.queue_outgoing(&ack)?;
 
+    // Stop the owner's own queued/active tasks and collect assignees for forwarding.
+    let now = time::OffsetDateTime::now_utc();
     let assignees = match envelope.body.scope_type {
-        StopScopeType::Project => store.project_assignee_actor_ids(&project_id)?,
-        StopScopeType::TaskTree => store.task_tree_assignee_actor_ids(
-            &project_id,
-            &TaskId::new(envelope.body.scope_id.clone())?,
-        )?,
+        StopScopeType::Project => {
+            store.stop_project_tasks_for_actor(&project_id, &local_identity.actor_id, now)?;
+            store.project_assignee_actor_ids(&project_id)?
+        }
+        StopScopeType::TaskTree => {
+            let root_task_id = TaskId::new(envelope.body.scope_id.clone())?;
+            store.stop_task_tree_tasks_for_actor(
+                &project_id,
+                &root_task_id,
+                &local_identity.actor_id,
+                now,
+            )?;
+            store.task_tree_assignee_actor_ids(&project_id, &root_task_id)?
+        }
     };
     let peers = store.list_peer_addresses()?;
     let mut forwarded_workers = 0_usize;

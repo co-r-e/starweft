@@ -4367,7 +4367,9 @@ fn migrate_connection(connection: &Connection) -> Result<()> {
     let current_version = schema_user_version(connection)?;
     if current_version > STORE_SCHEMA_VERSION {
         bail!(
-            "[E_SCHEMA_VERSION] unsupported future schema version: current={current_version} supported={STORE_SCHEMA_VERSION}"
+            "[E_SCHEMA_VERSION] データベースのスキーマバージョンが新しすぎます \
+             (db={current_version}, supported={STORE_SCHEMA_VERSION})。\
+             starweft を最新版にアップグレードしてください: cargo install starweft"
         );
     }
 

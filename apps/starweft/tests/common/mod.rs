@@ -107,12 +107,23 @@ pub fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) {
     panic!("timed out waiting for {needle} in file {}", path.display());
 }
 
+/// Reserves an ephemeral TCP port by binding and immediately releasing it.
+///
+/// This has an inherent TOCTOU race (the port could be taken between release
+/// and actual use), but is safe in practice because integration tests run with
+/// `--test-threads=1`, preventing parallel port conflicts.
 pub fn reserve_tcp_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .expect("bind ephemeral port")
         .local_addr()
         .expect("local addr")
         .port()
+}
+
+pub fn enable_mdns(config_path: &Path) {
+    let config = std::fs::read_to_string(config_path).expect("read config");
+    let updated = config.replace("mdns = false", "mdns = true");
+    std::fs::write(config_path, updated).expect("write config");
 }
 
 pub fn wait_for_node_ready(data_dir: &Path, timeout: Duration) {

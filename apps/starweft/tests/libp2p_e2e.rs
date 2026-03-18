@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use common::{
-    parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run, spawn_foreground,
-    stop_child, test_lock, wait_for_contains, wait_for_node_ready,
+    enable_mdns, parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run,
+    spawn_foreground, stop_child, test_lock, wait_for_contains, wait_for_node_ready,
 };
 use tempfile::TempDir;
 
@@ -2046,4 +2046,85 @@ fn libp2p_retries_after_failed_task_result() {
     stop_child(&mut owner_fg);
     stop_child(&mut worker_a_fg);
     stop_child(&mut worker_b_fg);
+}
+
+#[test]
+#[ignore] // mDNS requires multicast — may not work in CI
+fn libp2p_mdns_discovers_peers_without_manual_peer_add() {
+    let _lock = test_lock();
+
+    let owner_dir = TempDir::new().expect("owner tmpdir");
+    let worker_dir = TempDir::new().expect("worker tmpdir");
+
+    let owner_port = reserve_tcp_port();
+    let worker_port = reserve_tcp_port();
+
+    // Init both nodes
+    run(&[
+        "--data-dir",
+        owner_dir.path().to_str().unwrap(),
+        "init",
+        "--role",
+        "owner",
+    ]);
+    run(&[
+        "--data-dir",
+        worker_dir.path().to_str().unwrap(),
+        "init",
+        "--role",
+        "worker",
+    ]);
+
+    // Create identities
+    run(&[
+        "--data-dir",
+        owner_dir.path().to_str().unwrap(),
+        "identity",
+        "create",
+    ]);
+    run(&[
+        "--data-dir",
+        worker_dir.path().to_str().unwrap(),
+        "identity",
+        "create",
+    ]);
+
+    // Switch to libp2p transport and enable mDNS
+    let owner_config = owner_dir.path().join("config.toml");
+    let worker_config = worker_dir.path().join("config.toml");
+    replace_transport_with_libp2p(&owner_config);
+    replace_transport_with_libp2p(&worker_config);
+    enable_mdns(&owner_config);
+    enable_mdns(&worker_config);
+
+    // Set listen ports (no peer add, no seeds — rely purely on mDNS)
+    let owner_config_content = std::fs::read_to_string(&owner_config).expect("read config");
+    let owner_config_content =
+        owner_config_content.replace("listen_port = 0", &format!("listen_port = {owner_port}"));
+    std::fs::write(&owner_config, owner_config_content).expect("write config");
+
+    let worker_config_content = std::fs::read_to_string(&worker_config).expect("read config");
+    let worker_config_content =
+        worker_config_content.replace("listen_port = 0", &format!("listen_port = {worker_port}"));
+    std::fs::write(&worker_config, worker_config_content).expect("write config");
+
+    // Start both nodes
+    let mut owner_fg = spawn_foreground(&["--data-dir", owner_dir.path().to_str().unwrap(), "run"]);
+    let mut worker_fg =
+        spawn_foreground(&["--data-dir", worker_dir.path().to_str().unwrap(), "run"]);
+
+    wait_for_node_ready(owner_dir.path(), Duration::from_secs(15));
+    wait_for_node_ready(worker_dir.path(), Duration::from_secs(15));
+
+    // Wait for mDNS to discover peers — check the peer_addresses table
+    let owner_db = owner_dir.path().join("starweft.db");
+    wait_for_contains(
+        &owner_db,
+        "SELECT actor_id FROM peer_addresses;",
+        "mdns_",
+        Duration::from_secs(30),
+    );
+
+    stop_child(&mut owner_fg);
+    stop_child(&mut worker_fg);
 }
