@@ -14,19 +14,64 @@ mod vision;
 mod wait;
 mod watch;
 
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
+use clap::{ColorChoice, CommandFactory, FromArgMatches};
 use cli::*;
 use config::load_existing_config;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     init_tracing(&resolve_log_filter(&cli));
 
     if let Err(error) = run(cli) {
         eprintln!("{error:#}");
         std::process::exit(1);
+    }
+}
+
+fn parse_cli() -> Cli {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let color_choice = resolve_color_choice(argv.get(1..).unwrap_or(&[]));
+    let matches = match Cli::command()
+        .color(color_choice)
+        .try_get_matches_from(&argv)
+    {
+        Ok(matches) => matches,
+        Err(error) => error.exit(),
+    };
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+fn resolve_color_choice(args: &[OsString]) -> ColorChoice {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(value) = arg.to_str() {
+            if let Some(color) = value.strip_prefix("--color=") {
+                return color_choice_from_str(color);
+            }
+            if value == "--color" {
+                return iter
+                    .next()
+                    .and_then(|next| next.to_str())
+                    .map(color_choice_from_str)
+                    .unwrap_or(ColorChoice::Auto);
+            }
+        }
+    }
+    ColorChoice::Auto
+}
+
+fn color_choice_from_str(value: &str) -> ColorChoice {
+    match value {
+        "always" => ColorChoice::Always,
+        "never" => ColorChoice::Never,
+        _ => ColorChoice::Auto,
     }
 }
 
@@ -144,5 +189,30 @@ fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_color_choice_prefers_explicit_flag_value() {
+        let args = vec![
+            OsString::from("--verbose"),
+            OsString::from("--color=never"),
+            OsString::from("status"),
+        ];
+        assert_eq!(resolve_color_choice(&args), ColorChoice::Never);
+    }
+
+    #[test]
+    fn resolve_color_choice_stops_after_double_dash() {
+        let args = vec![
+            OsString::from("completions"),
+            OsString::from("--"),
+            OsString::from("--color=always"),
+        ];
+        assert_eq!(resolve_color_choice(&args), ColorChoice::Auto);
     }
 }

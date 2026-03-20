@@ -137,9 +137,28 @@ pub(crate) fn build_local_task_approval_wait_output(
 
 pub(crate) fn run_wait(args: WaitArgs) -> Result<()> {
     let target = parse_wait_target(&args)?;
+    if !args.json {
+        let timeout_label = if args.timeout_sec == 0 {
+            "unlimited".to_owned()
+        } else {
+            format!("{}s", args.timeout_sec)
+        };
+        eprintln!(
+            "waiting: {} (timeout={}, interval={}ms, Ctrl+C to cancel)",
+            wait_target_label(&target),
+            timeout_label,
+            args.interval_ms
+        );
+    }
     let (_, paths) = load_existing_config(args.data_dir.as_ref())?;
     let store = Store::open(&paths.ledger_db)?;
-    let output = wait_for_target(&store, &target, args.timeout_sec, args.interval_ms)?;
+    let output = wait_for_target(
+        &store,
+        &target,
+        args.timeout_sec,
+        args.interval_ms,
+        !args.json,
+    )?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -153,18 +172,35 @@ pub(crate) fn wait_for_target(
     target: &WaitTarget,
     timeout_sec: u64,
     interval_ms: u64,
+    show_progress: bool,
 ) -> Result<WaitOutput> {
     let started = Instant::now();
+    let mut last_dot = Instant::now();
+    let mut printed_progress = false;
     loop {
         if let Some(output) = poll_wait_target(store, target, started.elapsed().as_millis())? {
+            if show_progress && printed_progress {
+                eprintln!();
+            }
             return Ok(output);
         }
 
         if timeout_sec > 0 && started.elapsed() >= Duration::from_secs(timeout_sec) {
+            if show_progress && printed_progress {
+                eprintln!();
+            }
             bail!(
-                "[E_WAIT_TIMEOUT] condition を満たすまで待機しましたが timeout しました: {}",
-                wait_target_label(target)
+                "[E_WAIT_TIMEOUT] condition を満たすまで待機しましたが timeout しました: {} (elapsed={}s)。--timeout-sec を増やすか条件を確認してください",
+                wait_target_label(target),
+                started.elapsed().as_secs()
             );
+        }
+
+        if show_progress && last_dot.elapsed() >= Duration::from_secs(5) {
+            eprint!(".");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            last_dot = Instant::now();
+            printed_progress = true;
         }
 
         thread::sleep(Duration::from_millis(interval_ms.max(50)));

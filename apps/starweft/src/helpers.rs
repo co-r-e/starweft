@@ -11,11 +11,23 @@ use starweft_id::{ActorId, NodeId, ProjectId, TaskId};
 use starweft_observation::{SnapshotCachePolicy, snapshot_is_usable};
 use starweft_p2p::TransportDriver;
 use starweft_protocol::{ArtifactRef, StopScopeType, VisionConstraints};
-use starweft_store::{PeerAddressRecord, PeerIdentityRecord, Store};
+use starweft_store::{LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, Store};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::cli::StopScopeSelection;
 use crate::config::{self, Config, DataPaths, NodeRole, load_existing_config};
+
+pub(crate) fn require_local_identity(
+    store: &Store,
+    paths: &DataPaths,
+) -> Result<LocalIdentityRecord> {
+    store.local_identity()?.ok_or_else(|| {
+        anyhow!(
+            "[E_IDENTITY_MISSING] local_identity が初期化されていません。starweft identity create --data-dir {} を実行してください",
+            paths.root.display()
+        )
+    })
+}
 
 pub(crate) fn resolve_stop_scope(
     data_dir: Option<&PathBuf>,
@@ -85,14 +97,23 @@ pub(crate) fn parse_log_timestamp(line: &str) -> Option<OffsetDateTime> {
 }
 
 pub(crate) fn load_vision_text(text: Option<&str>, file: Option<&Path>) -> Result<String> {
-    match (text, file) {
+    let result = match (text, file) {
         (Some(text), None) => Ok(text.to_owned()),
         (None, Some(path)) => {
             fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
         }
         (Some(_), Some(_)) => bail!("[E_ARGUMENT] --text と --file は同時に指定できません"),
         (None, None) => bail!("[E_ARGUMENT] --text または --file のどちらかが必要です"),
+    }?;
+    const MAX_VISION_TEXT_BYTES: usize = 1_048_576; // 1 MB
+    if result.len() > MAX_VISION_TEXT_BYTES {
+        bail!(
+            "[E_ARGUMENT] vision text が大きすぎます ({} bytes > {} bytes 上限)",
+            result.len(),
+            MAX_VISION_TEXT_BYTES
+        );
     }
+    Ok(result)
 }
 
 pub(crate) fn parse_constraints(entries: &[String]) -> Result<VisionConstraints> {
@@ -282,7 +303,9 @@ pub(crate) fn ensure_binary_exists(bin: &str) -> Result<()> {
         if Path::new(bin).exists() {
             return Ok(());
         }
-        bail!("[E_OPENCLAW_NOT_FOUND] バイナリが見つかりません: {bin}");
+        bail!(
+            "[E_OPENCLAW_NOT_FOUND] バイナリが見つかりません: {bin}。PATH に追加するか starweft openclaw attach --bin <path> で設定してください"
+        );
     }
 
     let path_var = std::env::var_os("PATH")
@@ -293,7 +316,9 @@ pub(crate) fn ensure_binary_exists(bin: &str) -> Result<()> {
         }
     }
 
-    bail!("[E_OPENCLAW_NOT_FOUND] バイナリが見つかりません: {bin}");
+    bail!(
+        "[E_OPENCLAW_NOT_FOUND] バイナリが見つかりません: {bin}。PATH に追加するか starweft openclaw attach --bin <path> で設定してください"
+    );
 }
 
 pub(crate) fn write_runtime_log(config: &Config, path: &Path, line: &str) -> Result<()> {

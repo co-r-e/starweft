@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -111,9 +112,7 @@ pub(crate) fn run_publish_dry_run(args: PublishDryRunArgs) -> Result<()> {
     )?;
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     let store = Store::open(&paths.ledger_db)?;
-    let identity = store
-        .local_identity()?
-        .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
+    let identity = crate::helpers::require_local_identity(&store, &paths)?;
     let actor_key =
         crate::helpers::read_keypair(&crate::helpers::configured_actor_key_path(&config, &paths)?)?;
     let project_id = scope.project_id.to_string();
@@ -212,9 +211,7 @@ pub(crate) fn run_publish_github(args: PublishGitHubArgs) -> Result<()> {
     )?;
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     let store = Store::open(&paths.ledger_db)?;
-    let identity = store
-        .local_identity()?
-        .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
+    let identity = crate::helpers::require_local_identity(&store, &paths)?;
     let actor_key =
         crate::helpers::read_keypair(&crate::helpers::configured_actor_key_path(&config, &paths)?)?;
     let project_id = scope.project_id.to_string();
@@ -269,7 +266,7 @@ pub(crate) fn run_publish_github(args: PublishGitHubArgs) -> Result<()> {
         .build()?;
     let comment = post_github_comment(
         &client,
-        &github_api_base_url(),
+        &github_api_base_url()?,
         &payload,
         &resolve_github_token()?,
     )?;
@@ -391,12 +388,30 @@ fn resolve_github_token() -> Result<String> {
     )
 }
 
-fn github_api_base_url() -> String {
-    std::env::var("STARWEFT_GITHUB_API_BASE_URL")
+fn github_api_base_url() -> Result<String> {
+    let url = std::env::var("STARWEFT_GITHUB_API_BASE_URL")
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned())
+        .unwrap_or_else(|| "https://api.github.com".to_owned());
+
+    let parsed = reqwest::Url::parse(&url).map_err(|error| {
+        anyhow!("[E_GITHUB_API_BASE_URL] STARWEFT_GITHUB_API_BASE_URL が不正です: {error}")
+    })?;
+    let loopback_host = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .map(|address| address.is_loopback())
+                .unwrap_or(false)
+    });
+    match parsed.scheme() {
+        "https" => Ok(url),
+        "http" if loopback_host => Ok(url),
+        _ => bail!(
+            "[E_GITHUB_API_BASE_URL] STARWEFT_GITHUB_API_BASE_URL は https:// を使用してください。ローカル検証のみ http://localhost を許可します: {url}"
+        ),
+    }
 }
 
 pub(crate) fn post_github_comment(

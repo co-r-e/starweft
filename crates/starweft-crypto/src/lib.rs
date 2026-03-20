@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use starweft_id::KeyId;
 use thiserror::Error;
 use time::OffsetDateTime;
+use zeroize::Zeroize;
 
 /// Errors that can occur during cryptographic operations.
 #[derive(Debug, Error)]
@@ -77,8 +78,10 @@ impl StoredKeypair {
 
     /// Decodes and returns the Ed25519 signing key.
     pub fn signing_key(&self) -> Result<SigningKey, CryptoError> {
-        let bytes = decode_32_bytes(&self.secret_key).ok_or(CryptoError::InvalidSecretKey)?;
-        Ok(SigningKey::from_bytes(&bytes))
+        let mut bytes = decode_32_bytes(&self.secret_key).ok_or(CryptoError::InvalidSecretKey)?;
+        let key = SigningKey::from_bytes(&bytes);
+        bytes.zeroize();
+        Ok(key)
     }
 
     /// Decodes and returns the Ed25519 verifying (public) key.
@@ -88,6 +91,8 @@ impl StoredKeypair {
     }
 
     /// Returns the raw 32-byte secret key.
+    ///
+    /// 呼び出し側で使用後に bytes.zeroize() を呼ぶ責務があります
     pub fn secret_key_bytes(&self) -> Result<[u8; 32], CryptoError> {
         decode_32_bytes(&self.secret_key).ok_or(CryptoError::InvalidSecretKey)
     }

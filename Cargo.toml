@@ -44,6 +44,7 @@ toml = "0.8.20"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 ulid = { version = "1.2.0", features = ["serde"] }
+zeroize = "1.8"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

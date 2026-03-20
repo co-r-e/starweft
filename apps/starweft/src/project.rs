@@ -6,6 +6,7 @@ use starweft_protocol::{ApprovalScopeType, ProjectStatus, TaskStatus, VisionCons
 use starweft_store::{LocalIdentityRecord, Store};
 use std::collections::{HashMap, HashSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::cli::{
     ProjectApproveArgs, ProjectListArgs, TaskApproveArgs, TaskListArgs, TaskTreeArgs,
@@ -13,7 +14,8 @@ use crate::cli::{
 use crate::config::{NodeRole, load_existing_config};
 use crate::helpers::{
     configured_actor_key_path, human_intervention_requires_approval, parse_actor_id_arg,
-    parse_rfc3339_arg, read_keypair, submission_is_approved, timestamp_at_or_after,
+    parse_rfc3339_arg, read_keypair, require_local_identity, submission_is_approved,
+    timestamp_at_or_after,
 };
 use crate::runtime::{
     OwnerContext, RemoteApprovalOutput, RemoteApprovalParams, dispatch_next_task_offer,
@@ -173,9 +175,7 @@ pub(crate) fn run_project_approve(args: ProjectApproveArgs) -> Result<()> {
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     let project_id = ProjectId::new(args.project)?;
     let store = Store::open(&paths.ledger_db)?;
-    let local_identity = store
-        .local_identity()?
-        .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
+    let local_identity = require_local_identity(&store, &paths)?;
     let actor_key = read_keypair(&configured_actor_key_path(&config, &paths)?)?;
 
     match config.node.role {
@@ -214,6 +214,7 @@ pub(crate) fn run_project_approve(args: ProjectApproveArgs) -> Result<()> {
                     },
                     args.timeout_sec,
                     args.interval_ms,
+                    false,
                 )?)
             } else {
                 None
@@ -258,9 +259,7 @@ pub(crate) fn run_task_approve(args: TaskApproveArgs) -> Result<()> {
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     let task_id = TaskId::new(args.task)?;
     let store = Store::open(&paths.ledger_db)?;
-    let local_identity = store
-        .local_identity()?
-        .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
+    let local_identity = require_local_identity(&store, &paths)?;
     let actor_key = read_keypair(&configured_actor_key_path(&config, &paths)?)?;
 
     match config.node.role {
@@ -298,6 +297,7 @@ pub(crate) fn run_task_approve(args: TaskApproveArgs) -> Result<()> {
                     },
                     args.timeout_sec,
                     args.interval_ms,
+                    false,
                 )?)
             } else {
                 None
@@ -452,7 +452,7 @@ pub(crate) fn approve_execution_scope(
         dispatched_worker_actor_id: if dispatched {
             Some(
                 next_worker_actor_id
-                    .context("[E_INTERNAL] worker not found despite dispatch flag")?
+                    .context("[E_INTERNAL] 内部状態の不整合です。starweft repair reconcile-running-tasks を試してください")?
                     .to_string(),
             )
         } else {
@@ -824,30 +824,41 @@ pub(crate) fn build_task_tree_node(
 
 pub(crate) fn render_project_list_text(items: &[ProjectListItem]) -> String {
     if items.is_empty() {
-        return "no projects".to_owned();
+        return "no projects\nhint: starweft vision submit でビジョンを投入するとプロジェクトが作成されます".to_owned();
     }
-    items.iter()
-        .map(|item| {
-            format!(
-                "{} status={} approval={} owner={} principal={} active={} completed={} failed={} progress={} retries={} updated_at={} title={}",
-                item.project_id,
-                item.status,
-                item.approval_state,
-                item.owner_actor_id.as_deref().unwrap_or("unknown"),
-                item.principal_actor_id.as_deref().unwrap_or("unknown"),
-                item.active_task_count,
-                item.task_counts.completed,
-                item.task_counts.failed,
-                item.average_progress_value
-                    .map(|value| format!("{value:.3}"))
-                    .unwrap_or_else(|| "none".to_owned()),
-                item.retry_task_count,
-                item.updated_at,
-                item.title,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+
+    let mut lines = Vec::with_capacity(items.len() + 1);
+    lines.push(render_table_row(&[
+        table_cell("ID", 28, TableAlign::Left),
+        table_cell("STATUS", 10, TableAlign::Left),
+        table_cell("APPROVAL", 10, TableAlign::Left),
+        table_cell("ACTIVE", 6, TableAlign::Right),
+        table_cell("DONE", 6, TableAlign::Right),
+        table_cell("FAIL", 6, TableAlign::Right),
+        table_cell("PROGRESS", 8, TableAlign::Right),
+        "TITLE".to_owned(),
+    ]));
+    for item in items {
+        let progress = item
+            .average_progress_value
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "-".to_owned());
+        lines.push(render_table_row(&[
+            table_cell(&item.project_id, 28, TableAlign::Left),
+            table_cell(&item.status, 10, TableAlign::Left),
+            table_cell(&item.approval_state, 10, TableAlign::Left),
+            table_cell(&item.active_task_count.to_string(), 6, TableAlign::Right),
+            table_cell(
+                &item.task_counts.completed.to_string(),
+                6,
+                TableAlign::Right,
+            ),
+            table_cell(&item.task_counts.failed.to_string(), 6, TableAlign::Right),
+            table_cell(&progress, 8, TableAlign::Right),
+            truncate_display_width(&normalize_table_value(&item.title), 40),
+        ]));
+    }
+    lines.join("\n")
 }
 
 pub(crate) fn render_project_approve_text(output: &ProjectApproveOutput) -> String {
@@ -1011,25 +1022,92 @@ pub(crate) fn print_remote_approval_result(
 
 pub(crate) fn render_task_list_text(items: &[TaskListItem]) -> String {
     if items.is_empty() {
-        return "no tasks".to_owned();
+        return "no tasks\nhint: タスクは owner ノードが自動生成します。starweft status で状態を確認してください".to_owned();
     }
-    items.iter()
-        .map(|item| {
-            format!(
-                "{} status={} approval={} project={} assignee={} retry_attempt={} children={} updated_at={} title={}",
-                item.task_id,
-                item.status,
-                item.approval_state,
-                item.project_id,
-                item.assignee_actor_id,
-                item.retry_attempt,
-                item.child_count,
-                item.updated_at,
-                item.title,
-            )
+
+    let mut lines = Vec::with_capacity(items.len() + 1);
+    lines.push(render_table_row(&[
+        table_cell("ID", 28, TableAlign::Left),
+        table_cell("PROJECT", 28, TableAlign::Left),
+        table_cell("STATUS", 10, TableAlign::Left),
+        table_cell("ASSIGNEE", 14, TableAlign::Left),
+        "TITLE".to_owned(),
+    ]));
+    for item in items {
+        lines.push(render_table_row(&[
+            table_cell(&item.task_id, 28, TableAlign::Left),
+            table_cell(&item.project_id, 28, TableAlign::Left),
+            table_cell(&item.status, 10, TableAlign::Left),
+            table_cell(&item.assignee_actor_id, 14, TableAlign::Left),
+            truncate_display_width(&normalize_table_value(&item.title), 40),
+        ]));
+    }
+    lines.join("\n")
+}
+
+#[derive(Clone, Copy)]
+enum TableAlign {
+    Left,
+    Right,
+}
+
+fn render_table_row(columns: &[String]) -> String {
+    columns.join("  ")
+}
+
+fn table_cell(value: &str, width: usize, align: TableAlign) -> String {
+    let normalized = normalize_table_value(value);
+    let truncated = truncate_display_width(&normalized, width);
+    pad_display_width(&truncated, width, align)
+}
+
+fn normalize_table_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\t' => ' ',
+            _ => ch,
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
+}
+
+fn truncate_display_width(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+
+    const ELLIPSIS: &str = "..";
+    let ellipsis_width = UnicodeWidthStr::width(ELLIPSIS);
+    if max_width <= ellipsis_width {
+        return ".".repeat(max_width);
+    }
+
+    let mut truncated = String::new();
+    let mut current_width = 0;
+    let allowed_width = max_width - ellipsis_width;
+    for ch in value.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + ch_width > allowed_width {
+            break;
+        }
+        truncated.push(ch);
+        current_width += ch_width;
+    }
+    truncated.push_str(ELLIPSIS);
+    truncated
+}
+
+fn pad_display_width(value: &str, width: usize, align: TableAlign) -> String {
+    let value_width = UnicodeWidthStr::width(value);
+    if value_width >= width {
+        return value.to_owned();
+    }
+
+    let padding = " ".repeat(width - value_width);
+    match align {
+        TableAlign::Left => format!("{value}{padding}"),
+        TableAlign::Right => format!("{padding}{value}"),
+    }
 }
 
 pub(crate) fn render_task_tree_text(output: &TaskTreeOutput) -> String {
@@ -1134,6 +1212,7 @@ mod tests {
     use starweft_store::{PeerAddressRecord, PeerIdentityRecord, Store};
     use tempfile::TempDir;
     use time::OffsetDateTime;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn project_item_matches_filters_by_status_owner_and_updated_since() {
@@ -1216,6 +1295,101 @@ mod tests {
         };
 
         assert!(task_item_matches_filters(&item, &filters).expect("match"));
+    }
+
+    #[test]
+    fn render_project_list_text_keeps_title_column_aligned_for_multibyte_titles() {
+        let long_ja_title =
+            "日本語タイトルがとても長くて四十桁相当を超えるので省略されます".to_owned();
+        let items = vec![
+            ProjectListItem {
+                project_id: "proj_ascii".to_owned(),
+                vision_id: "vision_01".to_owned(),
+                title: "ASCII title".to_owned(),
+                status: "active".to_owned(),
+                updated_at: "2026-03-10T12:00:00Z".to_owned(),
+                owner_actor_id: Some("owner_01".to_owned()),
+                principal_actor_id: Some("principal_01".to_owned()),
+                task_counts: starweft_store::TaskCountsSnapshot::default(),
+                active_task_count: 1,
+                reported_task_count: 1,
+                average_progress_value: Some(0.25),
+                latest_progress_message: None,
+                retry_task_count: 0,
+                max_retry_attempt: 0,
+                latest_failure_action: None,
+                latest_failure_reason: None,
+                approval_state: "approved".to_owned(),
+                approval_updated_at: None,
+            },
+            ProjectListItem {
+                project_id: "proj_ja".to_owned(),
+                vision_id: "vision_02".to_owned(),
+                title: long_ja_title.clone(),
+                status: "active".to_owned(),
+                updated_at: "2026-03-10T12:00:00Z".to_owned(),
+                owner_actor_id: Some("owner_02".to_owned()),
+                principal_actor_id: Some("principal_02".to_owned()),
+                task_counts: starweft_store::TaskCountsSnapshot::default(),
+                active_task_count: 2,
+                reported_task_count: 2,
+                average_progress_value: Some(0.5),
+                latest_progress_message: None,
+                retry_task_count: 0,
+                max_retry_attempt: 0,
+                latest_failure_action: None,
+                latest_failure_reason: None,
+                approval_state: "approved".to_owned(),
+                approval_updated_at: None,
+            },
+        ];
+
+        let rendered = render_project_list_text(&items);
+        let mut lines = rendered.lines();
+        let _header = lines.next().expect("header");
+        let ascii_line = lines.next().expect("ascii line");
+        let ja_line = lines.next().expect("ja line");
+        let ascii_prefix = ascii_line
+            .strip_suffix("ASCII title")
+            .expect("ascii prefix");
+        let ja_title = truncate_display_width(&long_ja_title, 40);
+        let ja_prefix = ja_line.strip_suffix(&ja_title).expect("ja prefix");
+
+        assert_eq!(
+            UnicodeWidthStr::width(ascii_prefix),
+            UnicodeWidthStr::width(ja_prefix)
+        );
+        assert!(ja_title.ends_with(".."));
+    }
+
+    #[test]
+    fn render_task_list_text_truncates_multibyte_titles_without_panicking() {
+        let long_ja_title =
+            "日本語タイトルがとても長くて四十桁相当を超えるので省略されます".to_owned();
+        let items = vec![TaskListItem {
+            task_id: "task_01".to_owned(),
+            project_id: "proj_01".to_owned(),
+            parent_task_id: None,
+            title: long_ja_title.clone(),
+            status: "running".to_owned(),
+            assignee_actor_id: "worker_01".to_owned(),
+            required_capability: None,
+            retry_attempt: 0,
+            progress_value: None,
+            progress_message: None,
+            result_summary: None,
+            latest_failure_action: None,
+            latest_failure_reason: None,
+            approval_state: "approved".to_owned(),
+            approval_updated_at: None,
+            updated_at: "2026-03-10T12:00:00Z".to_owned(),
+            child_count: 0,
+            depends_on: Vec::new(),
+        }];
+
+        let rendered = render_task_list_text(&items);
+        assert!(rendered.contains(&truncate_display_width(&long_ja_title, 40)));
+        assert!(rendered.contains("worker_01"));
     }
 
     #[test]

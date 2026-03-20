@@ -845,6 +845,38 @@ pub struct Store {
     connection: Connection,
 }
 
+fn with_immediate_transaction(conn: &Connection, f: impl FnOnce() -> Result<()>) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = f();
+    match result {
+        Ok(()) => {
+            if let Err(commit_err) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(commit_err.into());
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_private_store_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set private permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_store_permissions(path: &Path) -> Result<()> {
+    let _ = path;
+    Ok(())
+}
+
 impl Store {
     /// Opens or creates an SQLite database at the given path and runs migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -857,6 +889,8 @@ impl Store {
         let connection =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 
+        set_private_store_permissions(path)?;
+
         // Auto-backup before migration if schema version is behind.
         let current = schema_user_version(&connection)?;
         if current > 0 && current < STORE_SCHEMA_VERSION {
@@ -867,6 +901,7 @@ impl Store {
                     .with_context(|| {
                         format!("pre-migration backup failed: {}", backup_path.display())
                     })?;
+                set_private_store_permissions(&backup_path)?;
             }
         }
 
@@ -894,6 +929,7 @@ impl Store {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         self.connection.backup(DatabaseName::Main, path, None)?;
+        set_private_store_permissions(path)?;
         Ok(())
     }
 
@@ -1099,52 +1135,46 @@ impl Store {
     where
         T: Serialize,
     {
-        self.connection.execute(
-            "DELETE FROM outbox_deliveries WHERE msg_id = ?1",
-            [envelope.msg_id.as_str()],
-        )?;
-        self.connection.execute(
-            r#"
-            INSERT OR REPLACE INTO outbox_messages (
-              msg_id, msg_type, queued_at, raw_json, delivery_state,
-              delivery_attempts, last_attempted_at, next_attempt_at, last_error
-            )
-            VALUES (?1, ?2, ?3, ?4, 'queued', 0, NULL, NULL, NULL)
-            "#,
-            params![
-                envelope.msg_id.as_str(),
-                format!("{:?}", envelope.msg_type),
-                format_time(OffsetDateTime::now_utc())?,
-                serde_json::to_string(envelope)?,
-            ],
-        )?;
+        let msg_id = envelope.msg_id.as_str();
+        let msg_type = format!("{:?}", envelope.msg_type);
+        let queued_at = format_time(OffsetDateTime::now_utc())?;
+        let raw_json = serde_json::to_string(envelope)?;
 
-        Ok(())
+        self.queue_outbox_raw(msg_id, &msg_type, &queued_at, &raw_json)
     }
 
     /// Queues an already-signed wire envelope in the outbox for delivery.
     pub fn queue_outbox_wire(&self, wire: &WireEnvelope) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM outbox_deliveries WHERE msg_id = ?1",
-            [wire.msg_id.as_str()],
-        )?;
-        self.connection.execute(
-            r#"
-            INSERT OR REPLACE INTO outbox_messages (
-              msg_id, msg_type, queued_at, raw_json, delivery_state,
-              delivery_attempts, last_attempted_at, next_attempt_at, last_error
-            )
-            VALUES (?1, ?2, ?3, ?4, 'queued', 0, NULL, NULL, NULL)
-            "#,
-            params![
-                wire.msg_id.as_str(),
-                format!("{:?}", wire.msg_type),
-                format_time(OffsetDateTime::now_utc())?,
-                serde_json::to_string(wire)?,
-            ],
-        )?;
+        let msg_id = wire.msg_id.as_str();
+        let msg_type = format!("{:?}", wire.msg_type);
+        let queued_at = format_time(OffsetDateTime::now_utc())?;
+        let raw_json = serde_json::to_string(wire)?;
 
-        Ok(())
+        self.queue_outbox_raw(msg_id, &msg_type, &queued_at, &raw_json)
+    }
+
+    fn queue_outbox_raw(
+        &self,
+        msg_id: &str,
+        msg_type: &str,
+        queued_at: &str,
+        raw_json: &str,
+    ) -> Result<()> {
+        with_immediate_transaction(&self.connection, || {
+            self.connection
+                .execute("DELETE FROM outbox_deliveries WHERE msg_id = ?1", [msg_id])?;
+            self.connection.execute(
+                r#"
+                INSERT OR REPLACE INTO outbox_messages (
+                  msg_id, msg_type, queued_at, raw_json, delivery_state,
+                  delivery_attempts, last_attempted_at, next_attempt_at, last_error
+                )
+                VALUES (?1, ?2, ?3, ?4, 'queued', 0, NULL, NULL, NULL)
+                "#,
+                params![msg_id, msg_type, queued_at, raw_json],
+            )?;
+            Ok(())
+        })
     }
 
     /// Saves an incoming envelope to the inbox.

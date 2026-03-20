@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use serde_json::Value;
 use starweft_id::{ActorId, VisionId};
 use starweft_protocol::{UnsignedEnvelope, VisionIntent};
@@ -12,7 +12,7 @@ use crate::config::{Config, NodeRole, load_existing_config};
 use crate::decision;
 use crate::helpers::{
     configured_actor_key_path, contains_any, load_vision_text, normalize_whitespace,
-    parse_actor_id_arg, parse_constraints, read_keypair, sha256_hex,
+    parse_actor_id_arg, parse_constraints, read_keypair, require_local_identity, sha256_hex,
 };
 use crate::runtime::{derive_planned_tasks, resolve_default_owner_for_new_project};
 
@@ -78,7 +78,10 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
 
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     if config.node.role != NodeRole::Principal {
-        bail!("[E_ROLE_MISMATCH] vision submit は principal role でのみ実行できます");
+        bail!(
+            "[E_ROLE_MISMATCH] vision submit は principal role でのみ実行できます。現在のロール: {}。principal ノードの --data-dir を指定してください",
+            config.node.role
+        );
     }
 
     let vision_text = load_vision_text(args.text.as_deref(), args.file.as_deref())?;
@@ -103,6 +106,9 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
         && !args.dry_run
         && args.approve.is_none()
     {
+        if !args.json {
+            eprintln!("planning...");
+        }
         let mut preview = build_vision_plan_preview(&config, &vision, owner_actor_id.as_ref())?;
         preview.approval_command = Some(build_vision_submit_command(&VisionSubmitCommandParams {
             data_dir: args.data_dir.as_deref(),
@@ -124,6 +130,9 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
     }
 
     if args.dry_run || args.approve.is_some() {
+        if !args.json {
+            eprintln!("planning...");
+        }
         let mut preview = build_vision_plan_preview(&config, &vision, owner_actor_id.as_ref())?;
         preview.approval_command = Some(build_vision_submit_command(&VisionSubmitCommandParams {
             data_dir: args.data_dir.as_deref(),
@@ -169,9 +178,7 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
     }
 
     let constraint_json = serde_json::to_value(&vision.constraints)?;
-    let identity = store
-        .local_identity()?
-        .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
+    let identity = require_local_identity(&store, &paths)?;
     let actor_key = read_keypair(&configured_actor_key_path(&config, &paths)?)?;
 
     let vision_id = VisionId::generate();
@@ -193,20 +200,26 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
         created_at: time::OffsetDateTime::now_utc(),
     })?;
 
+    if !args.json {
+        eprintln!("submitting...");
+    }
     RuntimePipeline::new(&store).queue_outgoing(&envelope)?;
 
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
+                "submitted": true,
                 "dry_run": false,
                 "vision_id": vision_id,
                 "msg_id": envelope.msg_id,
                 "owner_actor_id": owner_actor_id.as_ref().map(ToString::to_string),
                 "approval_verified": args.approve.is_some(),
+                "next": "starweft status",
             }))?
         );
     } else {
+        println!("submitted: true");
         println!("vision_id: {vision_id}");
         println!("msg_id: {}", envelope.msg_id);
         if let Some(owner_actor_id) = owner_actor_id {
@@ -215,6 +228,7 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
         if args.approve.is_some() {
             println!("approval_verified: true");
         }
+        println!("next: starweft status");
     }
     Ok(())
 }

@@ -101,7 +101,7 @@ pub fn derive_planned_tasks(
             }
         }
         PlanningStrategyKind::OpenclawWorker => {
-            bail!("distributed planner tasks must be delegated to a worker")
+            bail!("[E_PLANNER] 分散プランナータスクは worker に委任する必要があります")
         }
     }
 }
@@ -258,7 +258,7 @@ impl EvaluationEngine for HeuristicEvaluationEngine {
             .envelope
             .task_id
             .clone()
-            .ok_or_else(|| anyhow!("task_id is required"))?;
+            .ok_or_else(|| anyhow!("[E_PROTOCOL] task_id が必要です"))?;
         let blueprint = ctx.store.task_blueprint(&task_id)?;
         let title = blueprint
             .as_ref()
@@ -295,13 +295,13 @@ impl EvaluationEngine for HeuristicEvaluationEngine {
             ctx.envelope
                 .project_id
                 .clone()
-                .ok_or_else(|| anyhow!("project_id is required"))?,
+                .ok_or_else(|| anyhow!("[E_PROTOCOL] project_id が必要です"))?,
         )
         .with_task_id(
             ctx.envelope
                 .task_id
                 .clone()
-                .ok_or_else(|| anyhow!("task_id is required"))?,
+                .ok_or_else(|| anyhow!("[E_PROTOCOL] task_id が必要です"))?,
         )
         .sign(ctx.actor_key)
         .map_err(Into::into)
@@ -320,7 +320,7 @@ impl OpenClawEvaluationEngine {
             .envelope
             .task_id
             .clone()
-            .ok_or_else(|| anyhow!("task_id is required"))?;
+            .ok_or_else(|| anyhow!("[E_PROTOCOL] task_id が必要です"))?;
         let blueprint = ctx.store.task_blueprint(&task_id)?;
         let objective = blueprint
             .as_ref()
@@ -370,7 +370,7 @@ impl OpenClawEvaluationEngine {
             ctx.envelope
                 .project_id
                 .clone()
-                .ok_or_else(|| anyhow!("project_id is required"))?,
+                .ok_or_else(|| anyhow!("[E_PROTOCOL] project_id が必要です"))?,
         )
         .with_task_id(task_id)
         .sign(ctx.actor_key)
@@ -393,16 +393,17 @@ fn evaluator_attachment(
 fn parse_evaluator_scores(payload: &Value) -> Result<std::collections::BTreeMap<String, f32>> {
     let scores_value = payload
         .get("scores")
-        .ok_or_else(|| anyhow!("evaluator output must contain a 'scores' object"))?;
-    let scores_map = scores_value
-        .as_object()
-        .ok_or_else(|| anyhow!("evaluator 'scores' must be a JSON object"))?;
+        .ok_or_else(|| anyhow!("[E_EVALUATOR] evaluator 出力に 'scores' オブジェクトが必要です"))?;
+    let scores_map = scores_value.as_object().ok_or_else(|| {
+        anyhow!("[E_EVALUATOR] 'scores' は JSON オブジェクトである必要があります")
+    })?;
 
     let mut result = std::collections::BTreeMap::new();
     for (key, value) in scores_map {
         let score = value
             .as_f64()
-            .ok_or_else(|| anyhow!("score '{key}' must be a number"))? as f32;
+            .ok_or_else(|| anyhow!("[E_EVALUATOR] スコア '{key}' は数値である必要があります"))?
+            as f32;
         result.insert(key.clone(), score.clamp(1.0, 5.0));
     }
 
@@ -602,7 +603,7 @@ fn parse_openclaw_planned_tasks(
         PlannerOutputPayload::Direct(tasks) => tasks,
     };
     if tasks.is_empty() {
-        bail!("planner output did not contain any tasks");
+        bail!("[E_PLANNER] プランナー出力にタスクが含まれていません");
     }
 
     tasks
@@ -612,7 +613,7 @@ fn parse_openclaw_planned_tasks(
         .map(|(index, task)| {
             let objective = task.objective.trim();
             if objective.is_empty() {
-                bail!("planner task objective must not be empty");
+                bail!("[E_PLANNER] プランナータスクの objective が空です");
             }
             Ok(PlannedTaskSpec {
                 title: if task.title.trim().is_empty() {
@@ -707,17 +708,19 @@ fn planner_context_from_payload(payload: &Value) -> Result<PlannerContext> {
     let vision_title = payload
         .get("vision_title")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("planner payload is missing vision_title"))?
+        .ok_or_else(|| anyhow!("[E_PLANNER] planner payload に vision_title がありません"))?
         .to_owned();
     let raw_vision_text = payload
         .get("raw_vision_text")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("planner payload is missing raw_vision_text"))?
+        .ok_or_else(|| anyhow!("[E_PLANNER] planner payload に raw_vision_text がありません"))?
         .to_owned();
     let default_required_capability = payload
         .get("default_required_capability")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("planner payload is missing default_required_capability"))?
+        .ok_or_else(|| {
+            anyhow!("[E_PLANNER] planner payload に default_required_capability がありません")
+        })?
         .to_owned();
     let constraints = payload
         .get("constraints")

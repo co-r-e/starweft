@@ -819,6 +819,12 @@ pub(crate) fn run_snapshot(args: SnapshotArgs) -> Result<()> {
     }
 
     let mut previous_output: Option<String> = None;
+    if args.watch {
+        eprintln!(
+            "watching: snapshot (interval={}s, Ctrl+C to exit)",
+            args.interval_sec
+        );
+    }
     loop {
         let output = render_snapshot(&args)?;
         if args.watch {
@@ -1063,6 +1069,10 @@ pub(crate) fn run_status(args: StatusArgs) -> Result<()> {
             })?;
         let transport = build_transport(&config, &topology)?;
         let mut previous_output: Option<String> = None;
+        eprintln!(
+            "watching: status (interval={}s, Ctrl+C to exit)",
+            args.interval_sec
+        );
         loop {
             let view = load_status_view_with(&config, &paths, &store, &topology, &transport)?;
             let output = render_status_output(&args, &view)?;
@@ -1356,6 +1366,9 @@ pub(crate) fn run_logs(args: LogsArgs) -> Result<()> {
     };
 
     let mut previous_output: Option<String> = None;
+    if args.follow {
+        eprintln!("following: logs (Ctrl+C to exit)");
+    }
     loop {
         let output = render_logs_output(
             &paths,
@@ -1432,6 +1445,12 @@ pub(crate) fn run_events(args: EventsArgs) -> Result<()> {
     let mut emitted = HashSet::<String>::new();
     let mut first_iteration = true;
 
+    if args.follow {
+        eprintln!(
+            "following: events (interval={}s, Ctrl+C to exit)",
+            args.interval_sec
+        );
+    }
     loop {
         let mut events = load_filtered_task_events(
             &store,

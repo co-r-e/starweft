@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_INBOX_CAPACITY: usize = 10_000;
 const MAX_DISCOVERED_PEERS: usize = 1_000;
@@ -250,8 +251,10 @@ impl RuntimeTransport {
 
 /// Derives the libp2p peer ID string from a 32-byte Ed25519 private key.
 pub fn libp2p_peer_id_from_private_key(private_key: [u8; 32]) -> Result<String> {
+    let mut private_key = private_key;
     let identity = libp2p::identity::Keypair::ed25519_from_bytes(private_key)
         .map_err(|error| anyhow!("failed to decode libp2p identity: {error}"))?;
+    private_key.zeroize();
     Ok(identity.public().to_peer_id().to_string())
 }
 
@@ -449,6 +452,7 @@ impl Libp2pTransport {
         nat_traversal_enabled: bool,
         relay_mode: RelayMode,
     ) -> Result<Self> {
+        let private_key = Zeroizing::new(private_key);
         let listen_addresses = topology
             .listen_addresses
             .iter()
@@ -476,6 +480,7 @@ impl Libp2pTransport {
         let expected_listens = listen_addresses.len();
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (init_tx, init_rx) = mpsc::channel();
+        let init_tx_failure = init_tx.clone();
         let worker = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -510,6 +515,7 @@ impl Libp2pTransport {
             });
 
             if let Err(error) = result {
+                let _ = init_tx_failure.send(Err(anyhow!("{error:#}")));
                 tracing::error!("libp2p worker stopped: {error:#}");
             }
         });
@@ -695,15 +701,22 @@ fn build_behaviour(
 struct SwarmConfig {
     listen_addresses: Vec<Multiaddr>,
     expected_listens: usize,
-    private_key: [u8; 32],
+    private_key: Zeroizing<[u8; 32]>,
     mdns_enabled: bool,
     nat_traversal_enabled: bool,
     relay_mode: RelayMode,
 }
 
-async fn build_swarm(config: SwarmConfig) -> Result<(Swarm<StarweftBehaviour>, Vec<Multiaddr>)> {
-    let identity = libp2p::identity::Keypair::ed25519_from_bytes(config.private_key)
+async fn build_swarm(
+    mut config: SwarmConfig,
+) -> Result<(Swarm<StarweftBehaviour>, Vec<Multiaddr>)> {
+    let private_key = std::mem::take(&mut config.private_key);
+    let mut key_bytes = [0_u8; 32];
+    key_bytes.copy_from_slice(&private_key[..]);
+    drop(private_key);
+    let identity = libp2p::identity::Keypair::ed25519_from_bytes(key_bytes)
         .map_err(|error| anyhow!("failed to decode libp2p identity: {error}"))?;
+    key_bytes.zeroize();
 
     let use_relay_client = matches!(config.relay_mode, RelayMode::Client);
 

@@ -15,8 +15,8 @@ use crate::config::{self, Config, DataPaths, NodeRole, load_existing_config};
 use crate::helpers::{
     configured_actor_key_path, configured_stop_key_path, copy_dir_if_exists, copy_file_if_exists,
     ensure_binary_exists, extract_peer_suffix, parse_multiaddr, read_keypair, remove_path,
-    resolve_peer_public_key, resolve_stop_scope, restore_dir_from_bundle, restore_file_from_bundle,
-    sha256_hex, stop_key_exists,
+    require_local_identity, resolve_peer_public_key, resolve_stop_scope, restore_dir_from_bundle,
+    restore_file_from_bundle, sha256_hex, stop_key_exists,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -60,12 +60,16 @@ pub(crate) fn run_init(args: InitArgs) -> Result<()> {
 
     println!("initialized: {}", paths.root.display());
     println!("role: {}", config.node.role);
+    println!("next_steps:");
+    let data_dir = paths.root.display();
+    let mut step = 1;
     if !args.no_identity && config.node.role != NodeRole::Relay {
-        println!(
-            "next: starweft identity create --data-dir {}",
-            paths.root.display()
-        );
+        println!("  {step}. starweft identity create --data-dir {data_dir}");
+        step += 1;
     }
+    println!("  {step}. starweft peer add <address> --data-dir {data_dir}  # マルチノードの場合");
+    step += 1;
+    println!("  {step}. starweft run --data-dir {data_dir}");
     Ok(())
 }
 
@@ -408,7 +412,7 @@ pub(crate) fn run_repair_list_dead_letters(args: RepairListDeadLettersArgs) -> R
         return Ok(());
     }
     println!("dead_letter_outbox: {}", messages.len());
-    for message in messages {
+    for message in &messages {
         let summary = store.outbox_delivery_summary(&message.msg_id)?;
         println!(
             "{} {} attempts={} targets={}/{} dead={} retry={} last_attempted_at={} error={}",
@@ -419,12 +423,11 @@ pub(crate) fn run_repair_list_dead_letters(args: RepairListDeadLettersArgs) -> R
             summary.total_targets,
             summary.dead_letter_targets,
             summary.retry_waiting_targets,
-            message
-                .last_attempted_at
-                .unwrap_or_else(|| "none".to_owned()),
-            message.last_error.unwrap_or_else(|| "none".to_owned())
+            message.last_attempted_at.as_deref().unwrap_or("none"),
+            message.last_error.as_deref().unwrap_or("none")
         );
     }
+    println!("hint: 問題を解決後、starweft repair resume-outbox で再送できます");
     Ok(())
 }
 
@@ -512,20 +515,20 @@ pub(crate) fn run_identity_create(args: IdentityCreateArgs) -> Result<()> {
         created_at: time::OffsetDateTime::now_utc(),
     })?;
 
+    println!("identity_created: true");
     println!("role: {}", config.node.role);
     println!("actor_id: {actor_id}");
     println!("node_id: {node_id}");
     println!("display_name: {}", config.node.display_name);
     println!("stop_authority: {should_create_stop_key}");
+    println!("next: starweft run --data-dir {}", paths.root.display());
     Ok(())
 }
 
 pub(crate) fn run_identity_show(args: IdentityShowArgs) -> Result<()> {
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     let store = Store::open(&paths.ledger_db)?;
-    let identity = store
-        .local_identity()?
-        .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
+    let identity = require_local_identity(&store, &paths)?;
     let actor_key = read_keypair(&configured_actor_key_path(&config, &paths)?)?;
     let libp2p_peer_id = libp2p_peer_id_from_private_key(actor_key.secret_key_bytes()?)?;
     let stop_key = read_keypair(&configured_stop_key_path(&config, &paths)?).ok();
@@ -635,6 +638,11 @@ pub(crate) fn run_peer_add(args: PeerAddArgs) -> Result<()> {
     } else {
         println!("added: {}", args.multiaddr);
     }
+    println!("actor_id: {actor_id}");
+    println!(
+        "hint: starweft run --data-dir {} でノードを起動できます",
+        paths.root.display()
+    );
     Ok(())
 }
 
@@ -644,7 +652,7 @@ pub(crate) fn run_peer_list(args: PeerListArgs) -> Result<()> {
     let peers = store.list_peer_addresses()?;
 
     if peers.is_empty() {
-        println!("no peers");
+        println!("no peers\nhint: starweft peer add <multiaddr> でピアを追加できます");
         return Ok(());
     }
 
@@ -845,7 +853,10 @@ fn print_validation_result(json: bool, errors: &[String], warnings: &[String]) -
 pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     if config.node.role != NodeRole::Principal {
-        bail!("[E_ROLE_MISMATCH] stop は principal role でのみ実行できます");
+        bail!(
+            "[E_ROLE_MISMATCH] stop は principal role でのみ実行できます。現在のロール: {}。principal ノードの --data-dir を指定してください",
+            config.node.role
+        );
     }
     if !args.yes {
         bail!("[E_CONFIRMATION_REQUIRED] stop 実行には --yes が必要です");
@@ -858,9 +869,7 @@ pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
     }
 
     let store = Store::open(&paths.ledger_db)?;
-    let identity = store
-        .local_identity()?
-        .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
+    let identity = require_local_identity(&store, &paths)?;
     let stop_key_path = configured_stop_key_path(&config, &paths)?;
     if !stop_key_path.exists() {
         bail!(

@@ -613,7 +613,8 @@ pub fn load_existing_config(data_dir: Option<&PathBuf>) -> Result<(Config, DataP
     let paths = DataPaths::from_cli_arg(data_dir)?;
     if !paths.config_toml.exists() {
         bail!(
-            "[E_CONFIG_NOT_FOUND] config.toml が見つかりません: {}",
+            "[E_CONFIG_NOT_FOUND] config.toml が見つかりません: {}\n\
+             まず `starweft init --role <role>` を実行してください",
             paths.config_toml.display()
         );
     }
