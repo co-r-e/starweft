@@ -112,6 +112,10 @@ pub fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) {
 /// This has an inherent TOCTOU race (the port could be taken between release
 /// and actual use), but is safe in practice because integration tests run with
 /// `--test-threads=1`, preventing parallel port conflicts.
+pub fn loopback_tcp_available() -> bool {
+    TcpListener::bind(("127.0.0.1", 0)).is_ok()
+}
+
 pub fn reserve_tcp_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .expect("bind ephemeral port")

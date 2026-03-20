@@ -21,6 +21,10 @@ use wait_timeout::ChildExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+const MAX_STDOUT_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+const MAX_STDERR_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+const TRUNCATION_NOTICE: &str = "\n[WARN] 出力がサイズ上限を超えたため末尾を切り詰めました";
+
 /// Configuration for an external OpenClaw executor binary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenClawAttachment {
@@ -175,8 +179,14 @@ fn execute_task_inner(
         // stdin is dropped here, sending EOF to the child
     }
 
-    let stdout_reader = child.stdout.take().map(spawn_stream_reader);
-    let stderr_reader = child.stderr.take().map(spawn_stream_reader);
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|r| spawn_stream_reader(r, MAX_STDOUT_SIZE));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|r| spawn_stream_reader(r, MAX_STDERR_SIZE));
 
     let timeout = Duration::from_secs(attachment.timeout_sec.unwrap_or(3600));
     let deadline = Instant::now() + timeout;
@@ -210,27 +220,32 @@ fn execute_task_inner(
     if !status.success() {
         bail!(
             "openclaw process failed: status={status} stderr={}",
-            stderr.trim()
+            stderr.content.trim()
         );
     }
-    if stdout.trim().is_empty() {
+    if stdout.truncated {
+        bail!(
+            "[E_OPENCLAW_STDOUT_LIMIT] OpenClaw stdout がサイズ上限を超えました (limit={MAX_STDOUT_SIZE} bytes)"
+        );
+    }
+    if stdout.content.trim().is_empty() {
         return Ok(BridgeTaskResponse {
             summary: request.title.clone(),
             output_payload: serde_json::json!({ "summary": request.title }),
             artifact_refs: Vec::new(),
             progress_updates: Vec::new(),
-            raw_stdout: stdout,
-            raw_stderr: stderr,
+            raw_stdout: stdout.content,
+            raw_stderr: stderr.content,
         });
     }
 
-    let parsed_stdout = parse_stdout(stdout.trim());
+    let parsed_stdout = parse_stdout(stdout.content.trim());
 
     if let Ok(parsed) = serde_json::from_str::<BridgeTaskResponse>(&parsed_stdout.final_payload) {
         return Ok(BridgeTaskResponse {
             progress_updates: parsed_stdout.progress_updates,
-            raw_stdout: stdout,
-            raw_stderr: stderr,
+            raw_stdout: stdout.content,
+            raw_stderr: stderr.content,
             ..parsed
         });
     }
@@ -241,8 +256,8 @@ fn execute_task_inner(
             output_payload: parsed,
             artifact_refs: Vec::new(),
             progress_updates: parsed_stdout.progress_updates,
-            raw_stdout: stdout,
-            raw_stderr: stderr,
+            raw_stdout: stdout.content,
+            raw_stderr: stderr.content,
         });
     }
 
@@ -251,14 +266,20 @@ fn execute_task_inner(
         output_payload: serde_json::json!({ "stdout": parsed_stdout.final_payload }),
         artifact_refs: Vec::new(),
         progress_updates: parsed_stdout.progress_updates,
-        raw_stdout: stdout,
-        raw_stderr: stderr,
+        raw_stdout: stdout.content,
+        raw_stderr: stderr.content,
     })
 }
 
 struct ParsedStdout {
     final_payload: String,
     progress_updates: Vec<BridgeProgressUpdate>,
+}
+
+#[derive(Debug)]
+struct StreamCapture {
+    content: String,
+    truncated: bool,
 }
 
 fn parse_stdout(stdout: &str) -> ParsedStdout {
@@ -285,24 +306,61 @@ fn parse_stdout(stdout: &str) -> ParsedStdout {
     }
 }
 
-fn spawn_stream_reader<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<String>>
+fn spawn_stream_reader<R>(
+    mut reader: R,
+    max_size: usize,
+) -> thread::JoinHandle<std::io::Result<StreamCapture>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut content = String::new();
-        reader.read_to_string(&mut content)?;
-        Ok(content)
+        let mut content = Vec::new();
+        let mut total_read = 0usize;
+        let mut buf = [0u8; 8192];
+        let mut truncated = false;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let remaining = max_size.saturating_sub(total_read);
+            let keep = remaining.min(n);
+            if keep > 0 {
+                content.extend_from_slice(&buf[..keep]);
+            }
+            total_read += n;
+            if total_read > max_size {
+                truncated = true;
+                // Drain remaining data to avoid broken pipe
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+                break;
+            }
+        }
+        let mut content = String::from_utf8_lossy(&content).into_owned();
+        if truncated {
+            content.push_str(TRUNCATION_NOTICE);
+        }
+        Ok(StreamCapture { content, truncated })
     })
 }
 
-fn join_reader(reader: Option<thread::JoinHandle<std::io::Result<String>>>) -> Result<String> {
+fn join_reader(
+    reader: Option<thread::JoinHandle<std::io::Result<StreamCapture>>>,
+) -> Result<StreamCapture> {
     match reader {
         Some(reader) => reader
             .join()
             .map_err(|_| anyhow!("openclaw stream reader panicked"))?
             .map_err(Into::into),
-        None => Ok(String::new()),
+        None => Ok(StreamCapture {
+            content: String::new(),
+            truncated: false,
+        }),
     }
 }
 
@@ -391,6 +449,7 @@ mod win_job {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Cursor;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -524,5 +583,46 @@ printf '{"summary":"late","output_payload":{"done":true}}'
         .expect_err("cancellation should fail");
 
         assert!(error.to_string().contains("E_TASK_CANCELLED"));
+    }
+
+    #[test]
+    fn stream_reader_marks_truncation_and_keeps_prefix_up_to_limit() {
+        let capture = join_reader(Some(spawn_stream_reader(
+            Cursor::new(b"abcdefg".as_slice()),
+            4,
+        )))
+        .expect("capture");
+
+        assert!(capture.truncated);
+        assert!(capture.content.starts_with("abcd"));
+        assert!(capture.content.contains("切り詰めました"));
+    }
+
+    #[test]
+    fn stream_reader_keeps_full_output_when_within_limit() {
+        let capture = join_reader(Some(spawn_stream_reader(
+            Cursor::new(b"abcdef".as_slice()),
+            16,
+        )))
+        .expect("capture");
+
+        assert!(!capture.truncated);
+        assert_eq!(capture.content, "abcdef");
+    }
+
+    #[test]
+    fn stream_reader_preserves_utf8_across_chunk_boundaries() {
+        let mut bytes = vec![b'a'; 8191];
+        bytes.extend_from_slice("あ".as_bytes());
+        let expected = String::from_utf8(bytes.clone()).expect("utf8");
+
+        let capture = join_reader(Some(spawn_stream_reader(
+            Cursor::new(bytes),
+            expected.len() + 8,
+        )))
+        .expect("capture");
+
+        assert!(!capture.truncated);
+        assert_eq!(capture.content, expected);
     }
 }

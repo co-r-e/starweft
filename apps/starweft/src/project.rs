@@ -858,6 +858,33 @@ pub(crate) fn render_project_list_text(items: &[ProjectListItem]) -> String {
             truncate_display_width(&normalize_table_value(&item.title), 40),
         ]));
     }
+
+    // Summary footer
+    let total = items.len();
+    let mut status_counts: HashMap<&str, usize> = HashMap::new();
+    let mut approval_counts: HashMap<&str, usize> = HashMap::new();
+    for item in items {
+        *status_counts.entry(item.status.as_str()).or_default() += 1;
+        *approval_counts
+            .entry(item.approval_state.as_str())
+            .or_default() += 1;
+    }
+    let mut status_parts: Vec<String> = status_counts
+        .iter()
+        .map(|(k, v)| format!("{v} {k}"))
+        .collect();
+    status_parts.sort();
+    let mut approval_parts: Vec<String> = approval_counts
+        .iter()
+        .map(|(k, v)| format!("{v} {k}"))
+        .collect();
+    approval_parts.sort();
+    lines.push(format!(
+        "--- {total} projects | {} | {}",
+        status_parts.join(", "),
+        approval_parts.join(", "),
+    ));
+
     lines.join("\n")
 }
 
@@ -1042,6 +1069,20 @@ pub(crate) fn render_task_list_text(items: &[TaskListItem]) -> String {
             truncate_display_width(&normalize_table_value(&item.title), 40),
         ]));
     }
+
+    // Summary footer
+    let total = items.len();
+    let mut status_counts: HashMap<&str, usize> = HashMap::new();
+    for item in items {
+        *status_counts.entry(item.status.as_str()).or_default() += 1;
+    }
+    let mut status_parts: Vec<String> = status_counts
+        .iter()
+        .map(|(k, v)| format!("{v} {k}"))
+        .collect();
+    status_parts.sort();
+    lines.push(format!("--- {total} tasks | {}", status_parts.join(", "),));
+
     lines.join("\n")
 }
 
@@ -1360,6 +1401,7 @@ mod tests {
             UnicodeWidthStr::width(ja_prefix)
         );
         assert!(ja_title.ends_with(".."));
+        assert!(rendered.contains("--- 2 projects | 2 active | 2 approved"));
     }
 
     #[test]
@@ -1390,6 +1432,7 @@ mod tests {
         let rendered = render_task_list_text(&items);
         assert!(rendered.contains(&truncate_display_width(&long_ja_title, 40)));
         assert!(rendered.contains("worker_01"));
+        assert!(rendered.contains("--- 1 tasks | 1 running"));
     }
 
     #[test]

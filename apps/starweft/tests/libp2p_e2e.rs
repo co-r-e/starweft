@@ -9,10 +9,19 @@ use std::thread;
 use std::time::Duration;
 
 use common::{
-    enable_mdns, parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run,
-    spawn_foreground, stop_child, test_lock, wait_for_contains, wait_for_node_ready,
+    enable_mdns, loopback_tcp_available, parse_keyed_output, replace_transport_with_libp2p,
+    reserve_tcp_port, run, spawn_foreground, stop_child, test_lock, wait_for_contains,
+    wait_for_node_ready,
 };
 use tempfile::TempDir;
+
+macro_rules! require_loopback_tcp {
+    () => {
+        if !loopback_tcp_available() {
+            return;
+        }
+    };
+}
 
 fn set_worker_accept_join_offers(config_path: &Path, accept: bool) {
     let config = std::fs::read_to_string(config_path).expect("read config");
@@ -130,6 +139,7 @@ esac
 
 #[test]
 fn libp2p_three_node_workflow_and_stop() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -414,6 +424,7 @@ fn libp2p_three_node_workflow_and_stop() {
 
 #[test]
 fn libp2p_worker_plans_vision_via_openclaw() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -624,6 +635,7 @@ fn libp2p_worker_plans_vision_via_openclaw() {
 
 #[test]
 fn libp2p_bootstraps_via_discovery_seeds_without_peer_add() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -766,6 +778,7 @@ fn libp2p_bootstraps_via_discovery_seeds_without_peer_add() {
 
 #[test]
 fn libp2p_owner_queries_capabilities_from_running_worker() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -864,6 +877,7 @@ fn libp2p_owner_queries_capabilities_from_running_worker() {
 
 #[test]
 fn libp2p_stop_cancels_running_worker_without_result_submission() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -1160,6 +1174,7 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
 
 #[test]
 fn libp2p_retries_after_join_reject() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -1474,6 +1489,7 @@ fn libp2p_retries_after_join_reject() {
 #[cfg(unix)]
 #[test]
 fn libp2p_worker_executes_via_openclaw_bridge() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -1724,6 +1740,7 @@ fn libp2p_worker_executes_via_openclaw_bridge() {
 #[cfg(unix)]
 #[test]
 fn libp2p_retries_after_failed_task_result() {
+    require_loopback_tcp!();
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();
@@ -2051,6 +2068,7 @@ fn libp2p_retries_after_failed_task_result() {
 #[test]
 #[ignore] // mDNS requires multicast — may not work in CI
 fn libp2p_mdns_discovers_peers_without_manual_peer_add() {
+    require_loopback_tcp!();
     let _lock = test_lock();
 
     let owner_dir = TempDir::new().expect("owner tmpdir");

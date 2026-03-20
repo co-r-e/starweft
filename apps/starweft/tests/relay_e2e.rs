@@ -7,8 +7,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use common::{
-    parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port, run, spawn_foreground,
-    stop_child, test_lock, wait_for_contains, wait_for_node_ready,
+    loopback_tcp_available, parse_keyed_output, replace_transport_with_libp2p, reserve_tcp_port,
+    run, spawn_foreground, stop_child, test_lock, wait_for_contains, wait_for_node_ready,
 };
 use tempfile::TempDir;
 
@@ -257,6 +257,9 @@ fn local_mailbox_relay_forwards_vision_and_charter() {
 
 #[test]
 fn libp2p_relay_forwards_vision_and_charter() {
+    if !loopback_tcp_available() {
+        return;
+    }
     let _guard = test_lock();
     let temp = TempDir::new().expect("tempdir");
     let base = temp.path();

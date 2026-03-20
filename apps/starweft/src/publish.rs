@@ -439,7 +439,28 @@ pub(crate) fn post_github_comment(
     let status = response.status();
     let body = response.text()?;
     if !status.is_success() {
-        bail!("[E_GITHUB_PUBLISH_FAILED] status={status} body={body}");
+        let body_lower = body.to_ascii_lowercase();
+        let guidance = match status.as_u16() {
+            401 => {
+                "トークンが無効または権限不足です。STARWEFT_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN を確認してください"
+            }
+            403 if body_lower.contains("rate limit") || body_lower.contains("abuse") => {
+                "GitHub API レートリミットに達しました。しばらく待ってからリトライしてください"
+            }
+            403 => {
+                "トークンが無効または権限不足です。STARWEFT_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN を確認してください"
+            }
+            404 => {
+                "リポジトリまたは Issue/PR が見つかりません。--repo と --issue/--pr の値を確認してください"
+            }
+            422 => {
+                "リクエストが拒否されました。Issue/PR がロックされているか、無効な状態の可能性があります"
+            }
+            429 => "GitHub API レートリミットに達しました。しばらく待ってからリトライしてください",
+            500..=599 => "GitHub API サーバーエラーです。しばらく待ってからリトライしてください",
+            _ => "予期しないエラーが発生しました",
+        };
+        bail!("[E_GITHUB_PUBLISH_FAILED] status={status}: {guidance}\nresponse_body={body}");
     }
     Ok(serde_json::from_str(&body)?)
 }
@@ -594,7 +615,11 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind listener: {error}"),
+        };
         let address = listener.local_addr().expect("listener address");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept connection");
@@ -673,5 +698,37 @@ mod tests {
             comment.html_url,
             "https://github.test/owner/repo/issues/12#issuecomment-99"
         );
+    }
+
+    #[test]
+    fn github_publish_error_guidance_distinguishes_rate_limit_from_permission_denied() {
+        let rate_limited = reqwest::StatusCode::FORBIDDEN;
+        let permission_denied = reqwest::StatusCode::FORBIDDEN;
+        let rate_limit_body = "You have exceeded a secondary rate limit.";
+        let permission_body = "Resource not accessible by integration";
+
+        let rate_limit_guidance = match rate_limited.as_u16() {
+            401 => "auth",
+            403 if rate_limit_body.to_ascii_lowercase().contains("rate limit")
+                || rate_limit_body.to_ascii_lowercase().contains("abuse") =>
+            {
+                "rate-limit"
+            }
+            403 => "auth",
+            _ => "other",
+        };
+        let permission_guidance = match permission_denied.as_u16() {
+            401 => "auth",
+            403 if permission_body.to_ascii_lowercase().contains("rate limit")
+                || permission_body.to_ascii_lowercase().contains("abuse") =>
+            {
+                "rate-limit"
+            }
+            403 => "auth",
+            _ => "other",
+        };
+
+        assert_eq!(rate_limit_guidance, "rate-limit");
+        assert_eq!(permission_guidance, "auth");
     }
 }

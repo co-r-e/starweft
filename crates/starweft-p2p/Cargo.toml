@@ -18,4 +18,4 @@ tokio = { version = "1.44.1", features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 fs2 = "0.4"
 zeroize.workspace = true
-starweft-protocol = { path = "../starweft-protocol", version = "0.3.1" }
+starweft-protocol = { path = "../starweft-protocol", version = "0.4.0" }

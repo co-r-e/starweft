@@ -146,7 +146,17 @@ pub(crate) enum RepairCommands {
     /// 配信失敗メッセージ一覧
     ListDeadLetters(RepairListDeadLettersArgs),
     /// 実行中タスクの整合性修復
-    ReconcileRunningTasks(CommonDataDirArgs),
+    ReconcileRunningTasks(RepairReconcileArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RepairReconcileArgs {
+    /// データディレクトリ
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
+    pub(crate) data_dir: Option<PathBuf>,
+    /// 修復を実行 (確認用)
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,14 +208,14 @@ pub(crate) enum TaskCommands {
 #[derive(Debug, Args)]
 pub(crate) struct CommonDataDirArgs {
     /// データディレクトリ (デフォルト: ~/.starweft)
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct RepairListDeadLettersArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 表示件数の上限
     #[arg(long, default_value_t = 20)]
@@ -218,7 +228,7 @@ pub(crate) struct RepairListDeadLettersArgs {
 #[derive(Debug, Args)]
 pub(crate) struct BackupCreateArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 出力先パス
     #[arg(long)]
@@ -231,7 +241,7 @@ pub(crate) struct BackupCreateArgs {
 #[derive(Debug, Args)]
 pub(crate) struct BackupRestoreArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 入力バックアップパス
     #[arg(long)]
@@ -239,12 +249,15 @@ pub(crate) struct BackupRestoreArgs {
     /// 既存データを上書き
     #[arg(long)]
     pub(crate) force: bool,
+    /// 復元を実行 (確認用)
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ExportProjectArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 対象プロジェクト ID
     #[arg(long)]
@@ -260,7 +273,7 @@ pub(crate) struct ExportProjectArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ExportTaskArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 対象タスク ID
     #[arg(long)]
@@ -276,7 +289,7 @@ pub(crate) struct ExportTaskArgs {
 #[derive(Debug, Args)]
 pub(crate) struct PublishContextArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 対象プロジェクト ID
     #[arg(long)]
@@ -295,7 +308,7 @@ pub(crate) struct PublishContextArgs {
 #[derive(Debug, Args)]
 pub(crate) struct PublishDryRunArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 対象プロジェクト ID
     #[arg(long)]
@@ -317,7 +330,7 @@ pub(crate) struct PublishDryRunArgs {
 #[derive(Debug, Args)]
 pub(crate) struct PublishGitHubArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 対象プロジェクト ID
     #[arg(long)]
@@ -385,12 +398,15 @@ pub(crate) struct StopScopeSelection {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = r#"EXAMPLES:
+  starweft init --role principal
+  starweft init --role worker --data-dir /opt/starweft --listen /ip4/0.0.0.0/tcp/9000"#)]
 pub(crate) struct InitArgs {
     /// ノードの役割 (principal, owner, worker, relay)
     #[arg(long)]
     pub(crate) role: NodeRole,
     /// データディレクトリ (デフォルト: ~/.starweft)
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// ノードの表示名
     #[arg(long)]
@@ -417,7 +433,7 @@ pub(crate) enum IdentityCommands {
 #[derive(Debug, Args)]
 pub(crate) struct IdentityCreateArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// principal 用の停止権限鍵も同時に生成
     #[arg(long)]
@@ -430,7 +446,7 @@ pub(crate) struct IdentityCreateArgs {
 #[derive(Debug, Args)]
 pub(crate) struct IdentityShowArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// JSON 形式で出力
     #[arg(long)]
@@ -446,11 +462,14 @@ pub(crate) enum PeerCommands {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = r#"EXAMPLES:
+  starweft peer add /ip4/192.168.1.10/tcp/9000
+  starweft peer add /ip4/10.0.0.5/tcp/9000 --label "owner-node" --actor-id ACTOR_ID"#)]
 pub(crate) struct PeerAddArgs {
     /// ピアアドレス (例: /ip4/192.168.1.10/tcp/9000)
     pub(crate) multiaddr: String,
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// ピアのラベル (表示用)
     #[arg(long)]
@@ -481,7 +500,7 @@ pub(crate) struct PeerAddArgs {
 #[derive(Debug, Args)]
 pub(crate) struct PeerListArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
 }
 
@@ -494,7 +513,7 @@ pub(crate) enum OpenClawCommands {
 #[derive(Debug, Args)]
 pub(crate) struct OpenClawAttachArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// OpenClaw バイナリのパス
     #[arg(long)]
@@ -527,7 +546,7 @@ pub(crate) enum RegistryCommands {
 #[derive(Debug, Args)]
 pub(crate) struct ConfigShowArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// JSON 形式で出力
     #[arg(long)]
@@ -537,7 +556,7 @@ pub(crate) struct ConfigShowArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ConfigValidateArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// JSON 形式で出力
     #[arg(long)]
@@ -590,9 +609,13 @@ pub(crate) enum VisionCommands {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = r#"EXAMPLES:
+  starweft vision submit --title "Build API" --text "Create REST endpoints with auth"
+  starweft vision submit --title "Feature" --file vision.md --constraint budget_mode=balanced
+  starweft vision submit --title "Feature" --file vision.md --approve TOKEN"#)]
 pub(crate) struct VisionSubmitArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// ビジョンのタイトル
     #[arg(long)]
@@ -626,7 +649,7 @@ pub(crate) struct VisionSubmitArgs {
 #[derive(Debug, Args)]
 pub(crate) struct VisionPlanArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// ビジョンのタイトル
     #[arg(long)]
@@ -652,9 +675,12 @@ pub(crate) struct VisionPlanArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = r#"EXAMPLES:
+  starweft stop --project PROJECT_ID --reason-code cancelled --reason "Budget exceeded" --yes
+  starweft stop --task-tree TASK_ID --reason-code error --reason "Critical bug found" --yes"#)]
 pub(crate) struct StopArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 停止対象のプロジェクト ID
     #[arg(long)]
@@ -677,9 +703,13 @@ pub(crate) struct StopArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = r#"EXAMPLES:
+  starweft run
+  starweft run --foreground --log-level debug
+  starweft run --role worker --data-dir /opt/starweft-worker"#)]
 pub(crate) struct RunArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// ロール (config.toml の設定を上書き)
     #[arg(long)]
@@ -695,7 +725,7 @@ pub(crate) struct RunArgs {
 #[derive(Debug, Args)]
 pub(crate) struct SnapshotArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 対象プロジェクト ID
     #[arg(long)]
@@ -723,7 +753,7 @@ pub(crate) struct SnapshotArgs {
 #[derive(Debug, Args)]
 pub(crate) struct StatusArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// JSON 形式で出力
     #[arg(long)]
@@ -748,7 +778,7 @@ pub(crate) enum StatusProbeKind {
 #[derive(Debug, Args)]
 pub(crate) struct MetricsArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 出力形式 (prometheus, json)
     #[arg(long, value_enum, default_value_t = MetricsFormat::Prometheus)]
@@ -764,7 +794,7 @@ pub(crate) enum MetricsFormat {
 #[derive(Debug, Args)]
 pub(crate) struct LogsArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// コンポーネント名でフィルタ
     #[arg(long)]
@@ -786,7 +816,7 @@ pub(crate) struct LogsArgs {
 #[derive(Debug, Args)]
 pub(crate) struct EventsArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// プロジェクト ID でフィルタ
     #[arg(long)]
@@ -809,9 +839,13 @@ pub(crate) struct EventsArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = r#"EXAMPLES:
+  starweft wait --vision VISION_ID
+  starweft wait --project PROJECT_ID --until active --timeout-sec 300
+  starweft wait --task TASK_ID --until terminal"#)]
 pub(crate) struct WaitArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 待機対象の Vision ID
     #[arg(long)]
@@ -842,7 +876,7 @@ pub(crate) struct WaitArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ProjectListArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// ステータスでフィルタ (planning, active, stopping, stopped)
     #[arg(long)]
@@ -870,7 +904,7 @@ pub(crate) struct ProjectListArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ProjectApproveArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 承認対象のプロジェクト ID
     #[arg(long)]
@@ -895,7 +929,7 @@ pub(crate) struct ProjectApproveArgs {
 #[derive(Debug, Args)]
 pub(crate) struct TaskListArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// プロジェクト ID でフィルタ
     #[arg(long)]
@@ -923,7 +957,7 @@ pub(crate) struct TaskListArgs {
 #[derive(Debug, Args)]
 pub(crate) struct TaskTreeArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 対象プロジェクト ID
     #[arg(long)]
@@ -939,7 +973,7 @@ pub(crate) struct TaskTreeArgs {
 #[derive(Debug, Args)]
 pub(crate) struct TaskApproveArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// 承認対象のタスク ID
     #[arg(long)]
@@ -964,7 +998,7 @@ pub(crate) struct TaskApproveArgs {
 #[derive(Debug, Args)]
 pub(crate) struct DashboardArgs {
     /// データディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
     /// リフレッシュ間隔(ミリ秒)
     #[arg(long, default_value_t = 1000)]

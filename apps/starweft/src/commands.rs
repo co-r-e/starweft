@@ -15,8 +15,8 @@ use crate::config::{self, Config, DataPaths, NodeRole, load_existing_config};
 use crate::helpers::{
     configured_actor_key_path, configured_stop_key_path, copy_dir_if_exists, copy_file_if_exists,
     ensure_binary_exists, extract_peer_suffix, parse_multiaddr, read_keypair, remove_path,
-    require_local_identity, resolve_peer_public_key, resolve_stop_scope, restore_dir_from_bundle,
-    restore_file_from_bundle, sha256_hex, stop_key_exists,
+    require_local_identity, require_yes_confirmation, resolve_peer_public_key, resolve_stop_scope,
+    restore_dir_from_bundle, restore_file_from_bundle, sha256_hex, stop_key_exists,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -81,6 +81,7 @@ pub(crate) fn run_backup_create(args: BackupCreateArgs) -> Result<()> {
 }
 
 pub(crate) fn run_backup_restore(args: BackupRestoreArgs) -> Result<()> {
+    require_yes_confirmation(args.yes, "backup restore は既存データを上書きします")?;
     let (input, paths) = restore_backup_bundle(args.data_dir.as_ref(), &args.input, args.force)?;
     println!("restored_from: {}", input.display());
     println!("data_dir: {}", paths.root.display());
@@ -431,7 +432,11 @@ pub(crate) fn run_repair_list_dead_letters(args: RepairListDeadLettersArgs) -> R
     Ok(())
 }
 
-pub(crate) fn run_repair_reconcile_running_tasks(args: CommonDataDirArgs) -> Result<()> {
+pub(crate) fn run_repair_reconcile_running_tasks(args: RepairReconcileArgs) -> Result<()> {
+    require_yes_confirmation(
+        args.yes,
+        "reconcile-running-tasks は実行中タスクの状態を変更します",
+    )?;
     let (_, paths) = load_existing_config(args.data_dir.as_ref())?;
     let store = Store::open(&paths.ledger_db)?;
     let report = store.repair_reconcile_running_tasks()?;
@@ -531,7 +536,22 @@ pub(crate) fn run_identity_show(args: IdentityShowArgs) -> Result<()> {
     let identity = require_local_identity(&store, &paths)?;
     let actor_key = read_keypair(&configured_actor_key_path(&config, &paths)?)?;
     let libp2p_peer_id = libp2p_peer_id_from_private_key(actor_key.secret_key_bytes()?)?;
-    let stop_key = read_keypair(&configured_stop_key_path(&config, &paths)?).ok();
+    let stop_key_path = configured_stop_key_path(&config, &paths)?;
+    let stop_authority = stop_key_path.exists();
+    let stop_key = if stop_authority {
+        match read_keypair(&stop_key_path) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                tracing::warn!(
+                    "停止権限鍵を読み込めません: {} ({error})。停止操作は利用できません",
+                    stop_key_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if args.json {
         println!(
@@ -544,7 +564,7 @@ pub(crate) fn run_identity_show(args: IdentityShowArgs) -> Result<()> {
                 "public_key": identity.public_key,
                 "libp2p_peer_id": libp2p_peer_id,
                 "stop_public_key": stop_key.as_ref().map(|key| key.public_key.clone()),
-                "stop_authority": stop_key_exists(&config, &paths),
+                "stop_authority": stop_authority,
             }))?
         );
         return Ok(());
@@ -559,7 +579,7 @@ pub(crate) fn run_identity_show(args: IdentityShowArgs) -> Result<()> {
     if let Some(stop_key) = stop_key {
         println!("stop_public_key: {}", stop_key.public_key);
     }
-    println!("stop_authority: {}", stop_key_exists(&config, &paths));
+    println!("stop_authority: {stop_authority}");
     Ok(())
 }
 
@@ -858,9 +878,7 @@ pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
             config.node.role
         );
     }
-    if !args.yes {
-        bail!("[E_CONFIRMATION_REQUIRED] stop 実行には --yes が必要です");
-    }
+    require_yes_confirmation(args.yes, "stop 実行には確認が必要です")?;
 
     let project = args.project.is_some();
     let task_tree = args.task_tree.is_some();
@@ -932,7 +950,7 @@ mod tests {
     use starweft_id::{ActorId, NodeId};
     use starweft_store::{LocalIdentityRecord, Store};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use time::OffsetDateTime;
 
@@ -1126,6 +1144,30 @@ mod tests {
         let error = restore_backup_bundle(Some(&restore_root), &backup_dir, false)
             .expect_err("restore should fail without signature");
         assert!(error.to_string().contains("E_BACKUP_SIGNATURE_REQUIRED"));
+    }
+
+    #[test]
+    fn run_backup_restore_requires_yes_confirmation() {
+        let error = run_backup_restore(BackupRestoreArgs {
+            data_dir: Some(PathBuf::from("/tmp/unused")),
+            input: PathBuf::from("/tmp/unused-backup"),
+            force: false,
+            yes: false,
+        })
+        .expect_err("missing --yes should fail");
+
+        assert!(error.to_string().contains("E_CONFIRMATION_REQUIRED"));
+    }
+
+    #[test]
+    fn run_repair_reconcile_running_tasks_requires_yes_confirmation() {
+        let error = run_repair_reconcile_running_tasks(RepairReconcileArgs {
+            data_dir: Some(PathBuf::from("/tmp/unused")),
+            yes: false,
+        })
+        .expect_err("missing --yes should fail");
+
+        assert!(error.to_string().contains("E_CONFIRMATION_REQUIRED"));
     }
 
     #[test]

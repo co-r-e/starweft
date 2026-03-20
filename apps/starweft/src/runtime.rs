@@ -279,10 +279,24 @@ pub(crate) fn run_node(args: RunArgs) -> Result<()> {
                 eprintln!("{error:#}");
             }
             if !ready_written {
-                let _ = std::fs::write(paths.root.join(".ready"), "");
+                let ready_content = format!(
+                    "pid={}\nstarted_at={}\n",
+                    std::process::id(),
+                    time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                );
+                if let Err(error) = std::fs::write(paths.root.join(".ready"), &ready_content) {
+                    tracing::warn!(".ready ファイルの書き込みに失敗: {error}");
+                }
                 ready_written = true;
             }
             thread::sleep(Duration::from_millis(200));
+        }
+        if let Err(error) = std::fs::remove_file(paths.root.join(".ready"))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(".ready ファイルの削除に失敗: {error}");
         }
         return Ok(());
     }
@@ -2976,10 +2990,17 @@ pub(crate) fn handle_worker_stop_order(
     };
     let running_task_ids = worker_runtime.cancel_tasks(&affected_task_ids);
     let stop_impact = classify_stop_impact(&affected_task_ids, &running_task_ids);
-    let _ = store.stop_tasks(
-        &stop_impact.immediately_stopped_task_ids,
-        time::OffsetDateTime::now_utc(),
-    )?;
+    store
+        .stop_tasks(
+            &stop_impact.immediately_stopped_task_ids,
+            time::OffsetDateTime::now_utc(),
+        )
+        .inspect_err(|error| {
+            tracing::warn!(
+                "stop_tasks の実行中にエラーが発生: {error} (対象タスク数={})",
+                stop_impact.immediately_stopped_task_ids.len()
+            );
+        })?;
 
     let ack = UnsignedEnvelope::new(
         local_identity.actor_id.clone(),

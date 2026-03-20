@@ -899,7 +899,11 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind registry");
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind registry: {error}"),
+        };
         let address = listener.local_addr().expect("registry addr");
         let shared_secret = "registry-test-secret".to_owned();
         let discovered_actor = ActorId::generate().to_string();

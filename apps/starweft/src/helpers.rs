@@ -29,6 +29,13 @@ pub(crate) fn require_local_identity(
     })
 }
 
+pub(crate) fn require_yes_confirmation(yes: bool, message: &str) -> Result<()> {
+    if !yes {
+        bail!("[E_CONFIRMATION_REQUIRED] {message}。--yes を指定して確認してください");
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_stop_scope(
     data_dir: Option<&PathBuf>,
     project: Option<String>,
@@ -431,7 +438,12 @@ fn prune_artifact_retention(
             .unwrap_or(SystemTime::UNIX_EPOCH);
         timed.retain(|(path, modified)| {
             if *modified < cutoff {
-                let _ = std::fs::remove_file(path);
+                if let Err(error) = std::fs::remove_file(path) {
+                    tracing::debug!(
+                        "古いアーティファクトの削除に失敗: {} ({error})",
+                        path.display()
+                    );
+                }
                 deleted = true;
                 false
             } else {
@@ -447,7 +459,12 @@ fn prune_artifact_retention(
         timed.sort_by_key(|(_, modified)| *modified);
         let remove_count = effective_count.saturating_sub(config.artifacts.max_files);
         for (path, _) in timed.iter().take(remove_count) {
-            let _ = std::fs::remove_file(path);
+            if let Err(error) = std::fs::remove_file(path) {
+                tracing::debug!(
+                    "超過アーティファクトの削除に失敗: {} ({error})",
+                    path.display()
+                );
+            }
             deleted = true;
         }
     }

@@ -187,6 +187,19 @@ fn run(cli: Cli) -> Result<()> {
                 "starweft",
                 &mut std::io::stdout(),
             );
+            let hint = match shell {
+                clap_complete::Shell::Bash => {
+                    "# インストール: eval \"$(starweft completions bash)\" を ~/.bashrc に追加"
+                }
+                clap_complete::Shell::Zsh => {
+                    "# インストール: eval \"$(starweft completions zsh)\" を ~/.zshrc に追加"
+                }
+                clap_complete::Shell::Fish => {
+                    "# インストール: starweft completions fish | source を ~/.config/fish/config.fish に追加"
+                }
+                _ => "# 上記スクリプトをシェル設定ファイルに追加してください",
+            };
+            eprintln!("{hint}");
             Ok(())
         }
     }
