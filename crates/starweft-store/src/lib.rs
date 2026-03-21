@@ -9,7 +9,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -897,7 +897,7 @@ impl Store {
             let backup_path = path.with_extension(format!("pre-v{STORE_SCHEMA_VERSION}.bak"));
             if !backup_path.exists() {
                 connection
-                    .backup(DatabaseName::Main, &backup_path, None)
+                    .backup("main", &backup_path, None)
                     .with_context(|| {
                         format!("pre-migration backup failed: {}", backup_path.display())
                     })?;
@@ -928,7 +928,7 @@ impl Store {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        self.connection.backup(DatabaseName::Main, path, None)?;
+        self.connection.backup("main", path, None)?;
         set_private_store_permissions(path)?;
         Ok(())
     }
@@ -1264,7 +1264,7 @@ impl Store {
                     .to_actor_id
                     .as_ref()
                     .map(|actor_id| actor_id.as_str()),
-                envelope.lamport_ts,
+                envelope.lamport_ts as i64,
                 format_time(envelope.created_at)?,
                 serde_json::to_string(&envelope.body)?,
                 serde_json::to_string(&envelope.signature)?,
