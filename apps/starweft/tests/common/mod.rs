@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 
 use std::net::TcpListener;
 
+// E2E tests spawn multiple processes and poll state repeatedly, so use a
+// slightly slower interval to reduce local CPU churn.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 pub fn starweft_bin() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_starweft")
         .map(PathBuf::from)
@@ -88,7 +92,7 @@ pub fn wait_for_contains(path: &Path, sql: &str, needle: &str, timeout: Duration
         if stdout.contains(needle) {
             return;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(WAIT_POLL_INTERVAL);
     }
     panic!("timed out waiting for {needle} in sqlite query {sql}");
 }
@@ -102,7 +106,7 @@ pub fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) {
                 return;
             }
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(WAIT_POLL_INTERVAL);
     }
     panic!("timed out waiting for {needle} in file {}", path.display());
 }
@@ -137,7 +141,7 @@ pub fn wait_for_node_ready(data_dir: &Path, timeout: Duration) {
         if ready_path.exists() {
             return;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(WAIT_POLL_INTERVAL);
     }
     panic!(
         "timed out waiting for node ready marker at {}",

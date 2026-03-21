@@ -82,6 +82,7 @@ cargo clippy --all-targets -- -D warnings      # lint
 cargo fmt --all --check                        # フォーマットチェック
 ```
 
+- `.cargo/config.toml` で `build.jobs = 2` を設定してあり、ローカルで `cargo test` が全コアを埋めにくい
 - Rust 1.87 (rust-toolchain.toml で固定)
 - clippy は `dbg_macro`, `todo`, `unwrap_used` を deny
 - CI: Ubuntu + macOS で test/lint/fmt/doc

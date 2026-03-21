@@ -275,6 +275,8 @@ starweft completions powershell > starweft.ps1  # PowerShell: . ./starweft.ps1
 cargo test
 ```
 
+このリポジトリでは `.cargo/config.toml` で `build.jobs = 2` を設定しており、ローカルの CPU 使用率が跳ね上がりにくいようにしています。必要なら `cargo test -j <N>` で上書きできます。
+
 含まれるもの:
 
 - unit tests

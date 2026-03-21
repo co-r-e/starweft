@@ -1,0 +1,3 @@
+[build]
+# Keep local builds/tests from saturating every core by default.
+jobs = 2

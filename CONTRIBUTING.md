@@ -39,6 +39,8 @@ cargo build
 cargo test
 ```
 
+This repository caps Cargo build parallelism to 2 via `.cargo/config.toml` to keep local test runs from saturating developer machines. Override with `cargo test -j <N>` when you want more throughput.
+
 ### Lint
 
 ```sh
