@@ -7,8 +7,8 @@ use starweft_observation::{
 };
 use starweft_openclaw_bridge::{BridgeTaskRequest, OpenClawAttachment, execute_task};
 use starweft_protocol::{
-    Envelope, EvaluationIssued, TaskDelegated, TaskExecutionStatus, TaskResultSubmitted,
-    UnsignedEnvelope, VisionConstraints, VisionIntent,
+    Envelope, EvaluationIssued, ExecutionMode, TaskDelegated, TaskExecutionStatus,
+    TaskResultSubmitted, UnsignedEnvelope, VisionConstraints, VisionIntent,
 };
 use starweft_store::{LocalIdentityRecord, Store};
 
@@ -16,6 +16,7 @@ use crate::config::{
     Config, EvaluationStrategyKind, ObservationSection, OwnerRetryAction, OwnerSection,
     PlanningStrategyKind, RetryStrategyKind,
 };
+use crate::helpers::resolve_execution_mode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FailureAction {
@@ -228,7 +229,11 @@ impl PlanningEngine for OpenClawPlanningEngine {
             constraints: vision.constraints.clone(),
             default_required_capability: required_capability.to_owned(),
         };
-        let attachment = planner_attachment(&config.observation, &config.openclaw);
+        let attachment = planner_attachment(
+            &config.observation,
+            &config.openclaw,
+            resolve_execution_mode(&vision.constraints, config.openclaw.default_execution_mode),
+        );
         let request = BridgeTaskRequest {
             title: format!("Plan {}", vision.title),
             description: "Decompose the vision into executable Starweft tasks. Return JSON only."
@@ -327,7 +332,20 @@ impl OpenClawEvaluationEngine {
             .map(|task| task.objective.as_str())
             .unwrap_or(ctx.envelope.body.summary.as_str());
 
-        let attachment = evaluator_attachment(&config.observation, &config.openclaw);
+        let project_id = ctx
+            .envelope
+            .project_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("[E_PROTOCOL] project_id が必要です"))?;
+        let execution_mode = ctx
+            .store
+            .project_vision_constraints(project_id)?
+            .map(|constraints| {
+                resolve_execution_mode(&constraints, config.openclaw.default_execution_mode)
+            })
+            .unwrap_or(config.openclaw.default_execution_mode);
+        let attachment =
+            evaluator_attachment(&config.observation, &config.openclaw, execution_mode);
         let request = BridgeTaskRequest {
             title: format!("Evaluate task {task_id}"),
             description: "Evaluate the task result and return scores as JSON.".to_owned(),
@@ -381,12 +399,14 @@ impl OpenClawEvaluationEngine {
 fn evaluator_attachment(
     observation: &ObservationSection,
     openclaw: &crate::config::OpenClawSection,
+    execution_mode: ExecutionMode,
 ) -> OpenClawAttachment {
     openclaw_attachment(
         observation.evaluator_bin.as_deref(),
         observation.evaluator_working_dir.as_deref(),
         observation.evaluator_timeout_sec,
         openclaw,
+        execution_mode,
     )
 }
 
@@ -485,12 +505,14 @@ impl RetryPolicyEngine for RuleBasedRetryPolicy {
 fn planner_attachment(
     observation: &ObservationSection,
     openclaw: &crate::config::OpenClawSection,
+    execution_mode: ExecutionMode,
 ) -> OpenClawAttachment {
     openclaw_attachment(
         observation.planner_bin.as_deref(),
         observation.planner_working_dir.as_deref(),
         observation.planner_timeout_sec,
         openclaw,
+        execution_mode,
     )
 }
 
@@ -499,6 +521,7 @@ fn openclaw_attachment(
     working_dir: Option<&str>,
     timeout_sec: u64,
     openclaw: &crate::config::OpenClawSection,
+    execution_mode: ExecutionMode,
 ) -> OpenClawAttachment {
     OpenClawAttachment {
         bin: bin
@@ -508,6 +531,12 @@ fn openclaw_attachment(
             .map(ToOwned::to_owned)
             .or_else(|| openclaw.working_dir.clone()),
         timeout_sec: Some(timeout_sec.max(1)),
+        clear_env: execution_mode == ExecutionMode::Controlled,
+        env_allowlist: if execution_mode == ExecutionMode::Controlled {
+            openclaw.controlled_env_allowlist.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -750,10 +779,13 @@ mod tests {
     };
     use serde_json::json;
     use starweft_crypto::StoredKeypair;
-    use starweft_id::{ActorId, TaskId};
+    use starweft_id::{ActorId, ProjectId, TaskId, VisionId};
     use starweft_protocol::{
-        TaskDelegated, TaskExecutionStatus, UnsignedEnvelope, VisionConstraints, VisionIntent,
+        EvaluationPolicy, ExecutionMode, ParticipantPolicy, ProjectCharter, TaskDelegated,
+        TaskExecutionStatus, TaskResultSubmitted, UnsignedEnvelope, VisionConstraints,
+        VisionIntent,
     };
+    use starweft_store::{LocalIdentityRecord, Store};
     #[cfg(unix)]
     use tempfile::TempDir;
     use time::OffsetDateTime;
@@ -847,6 +879,174 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_planner_uses_controlled_execution_mode() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = TempDir::new().expect("tempdir");
+            let planner = temp.path().join("planner.sh");
+            std::fs::write(
+                &planner,
+                "#!/bin/sh\nif [ -n \"$STARWEFT_TEST_PLANNER_SECRET\" ]; then exit 17; fi\nprintf '{\"tasks\":[{\"title\":\"plan-1\",\"objective\":\"do work\"}]}'\n",
+            )
+            .expect("write planner");
+            let mut perms = std::fs::metadata(&planner).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&planner, perms).expect("chmod");
+
+            let mut config = Config::for_role(NodeRole::Owner, temp.path(), None);
+            config.observation.planner = PlanningStrategyKind::Openclaw;
+            config.observation.planner_bin = Some(planner.display().to_string());
+            config.openclaw.default_execution_mode = ExecutionMode::Controlled;
+            unsafe {
+                std::env::set_var("STARWEFT_TEST_PLANNER_SECRET", "should-not-leak");
+            }
+            let tasks = OpenClawPlanningEngine
+                .derive_tasks(
+                    &config,
+                    &VisionIntent {
+                        title: "Vision".to_owned(),
+                        raw_vision_text: "Build and validate".to_owned(),
+                        constraints: VisionConstraints::default(),
+                    },
+                    "openclaw.execution.v1",
+                )
+                .expect("derive tasks");
+            unsafe {
+                std::env::remove_var("STARWEFT_TEST_PLANNER_SECRET");
+            }
+
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].title, "plan-1");
+        }
+    }
+
+    #[test]
+    fn openclaw_evaluator_uses_controlled_execution_mode() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = TempDir::new().expect("tempdir");
+            let evaluator = temp.path().join("evaluator.sh");
+            std::fs::write(
+                &evaluator,
+                "#!/bin/sh\nif [ -n \"$STARWEFT_TEST_EVALUATOR_SECRET\" ]; then exit 19; fi\nprintf '{\"scores\":{\"quality\":4},\"comment\":\"controlled\"}'\n",
+            )
+            .expect("write evaluator");
+            let mut perms = std::fs::metadata(&evaluator)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&evaluator, perms).expect("chmod");
+
+            let store = Store::open(temp.path().join("node.db")).expect("store");
+            let mut config = Config::for_role(NodeRole::Owner, temp.path(), None);
+            config.observation.evaluator = crate::config::EvaluationStrategyKind::Openclaw;
+            config.observation.evaluator_bin = Some(evaluator.display().to_string());
+            config.openclaw.default_execution_mode = ExecutionMode::Controlled;
+
+            let owner_key = StoredKeypair::generate();
+            let worker_key = StoredKeypair::generate();
+            let owner_actor = ActorId::generate();
+            let worker_actor = ActorId::generate();
+            let principal_actor = ActorId::generate();
+            let project_id = ProjectId::generate();
+            let vision_id = VisionId::generate();
+            let task_id = TaskId::generate();
+            let now = OffsetDateTime::now_utc();
+            let local_identity = LocalIdentityRecord {
+                actor_id: owner_actor.clone(),
+                node_id: starweft_id::NodeId::generate(),
+                actor_type: "owner".to_owned(),
+                display_name: "owner".to_owned(),
+                public_key: owner_key.public_key.clone(),
+                private_key_ref: "actor.key".to_owned(),
+                created_at: now,
+            };
+            store
+                .save_vision(&starweft_store::VisionRecord {
+                    vision_id: vision_id.clone(),
+                    principal_actor_id: principal_actor.clone(),
+                    title: "Vision".to_owned(),
+                    raw_vision_text: "Need evaluation".to_owned(),
+                    constraints: serde_json::to_value(VisionConstraints::default())
+                        .expect("constraints"),
+                    status: "accepted".to_owned(),
+                    created_at: now,
+                })
+                .expect("save vision");
+            let charter = UnsignedEnvelope::new(
+                owner_actor.clone(),
+                Some(principal_actor.clone()),
+                ProjectCharter {
+                    project_id: project_id.clone(),
+                    vision_id: vision_id.clone(),
+                    principal_actor_id: principal_actor,
+                    owner_actor_id: owner_actor.clone(),
+                    title: "Project".to_owned(),
+                    objective: "Need evaluation".to_owned(),
+                    stop_authority_actor_id: worker_actor.clone(),
+                    execution_mode: ExecutionMode::Controlled,
+                    participant_policy: ParticipantPolicy {
+                        external_agents_allowed: true,
+                    },
+                    evaluation_policy: EvaluationPolicy {
+                        quality_weight: 1.0,
+                        speed_weight: 1.0,
+                        reliability_weight: 1.0,
+                        alignment_weight: 1.0,
+                    },
+                },
+            )
+            .with_vision_id(vision_id)
+            .with_project_id(project_id.clone())
+            .sign(&owner_key)
+            .expect("charter");
+            store
+                .apply_project_charter(&charter)
+                .expect("apply charter");
+
+            let envelope = UnsignedEnvelope::new(
+                worker_actor,
+                Some(owner_actor),
+                TaskResultSubmitted {
+                    status: TaskExecutionStatus::Completed,
+                    summary: "done".to_owned(),
+                    output_payload: json!({"ok": true}),
+                    artifact_refs: Vec::new(),
+                    started_at: now,
+                    finished_at: now,
+                },
+            )
+            .with_project_id(project_id)
+            .with_task_id(task_id)
+            .sign(&worker_key)
+            .expect("task result");
+            let ctx = super::EvaluationContext {
+                local_identity: &local_identity,
+                actor_key: &owner_key,
+                store: &store,
+                envelope: &envelope,
+                retry_attempt: 0,
+                failure_action: None,
+            };
+
+            unsafe {
+                std::env::set_var("STARWEFT_TEST_EVALUATOR_SECRET", "should-not-leak");
+            }
+            let evaluation = super::build_task_evaluation(&config, &ctx).expect("evaluation");
+            unsafe {
+                std::env::remove_var("STARWEFT_TEST_EVALUATOR_SECRET");
+            }
+
+            assert_eq!(evaluation.body.comment, "controlled");
+            assert_eq!(evaluation.body.scores.get("quality").copied(), Some(4.0));
+        }
+    }
+
+    #[test]
     fn retry_policy_honors_strategy_rules() {
         let keypair = StoredKeypair::generate();
         let envelope = UnsignedEnvelope::new(
@@ -900,6 +1100,7 @@ mod tests {
             description: spec.description,
             objective: spec.objective,
             required_capability: spec.required_capability,
+            execution_mode: starweft_protocol::ExecutionMode::Full,
             input_payload: spec.input_payload,
             expected_output_schema: spec.expected_output_schema,
         };
@@ -927,6 +1128,7 @@ mod tests {
             description: planner.description,
             objective: planner.objective,
             required_capability: planner.required_capability,
+            execution_mode: starweft_protocol::ExecutionMode::Full,
             input_payload: planner.input_payload,
             expected_output_schema: planner.expected_output_schema,
         };
@@ -955,6 +1157,7 @@ mod tests {
             description: planner.description,
             objective: planner.objective,
             required_capability: planner.required_capability,
+            execution_mode: starweft_protocol::ExecutionMode::Full,
             input_payload: planner.input_payload,
             expected_output_schema: planner.expected_output_schema,
         };

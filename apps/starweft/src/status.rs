@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
-use starweft_id::{ProjectId, TaskId};
+use starweft_id::{ActorId, ProjectId, TaskId};
 use starweft_p2p::{NatStatus, RuntimeTopology, RuntimeTransport, TransportDriver};
 use starweft_protocol::SnapshotScopeType;
 use starweft_store::{ActorScopedStats, Store, TaskEventRecord};
@@ -16,7 +16,10 @@ use crate::cli::{
     EventsArgs, LogsArgs, MetricsArgs, MetricsFormat, SnapshotArgs, StatusArgs, StatusProbeKind,
 };
 use crate::config::{Config, DataPaths, load_existing_config};
-use crate::helpers::{cached_snapshot_is_usable, parse_json_or_string, parse_log_timestamp};
+use crate::helpers::{
+    cached_snapshot_is_usable, ensure_binary_exists, parse_json_or_string, parse_log_timestamp,
+    peer_dispatch_eligibility_reason, peer_is_locally_trusted,
+};
 use crate::runtime::{build_transport, queue_snapshot_request};
 use crate::watch::{
     render_log_component_latest_summary, render_log_component_summary, render_log_severity_summary,
@@ -65,7 +68,8 @@ pub(crate) struct StatusMetricsOutput {
     pub(crate) readiness: u8,
     pub(crate) liveness_warning_count: u64,
     pub(crate) readiness_warning_count: u64,
-    pub(crate) connected_peers: u64,
+    pub(crate) known_peers: u64,
+    pub(crate) connected_sessions: u64,
     pub(crate) active_projects: u64,
     pub(crate) running_tasks: u64,
     pub(crate) queued_outbox: u64,
@@ -111,7 +115,10 @@ pub(crate) struct StatusView {
     pub(crate) bridge_capability_version: String,
     pub(crate) listen_addresses: usize,
     pub(crate) seed_peers: usize,
-    pub(crate) connected_peers: u64,
+    pub(crate) known_peers: u64,
+    pub(crate) connected_sessions: Option<u64>,
+    pub(crate) peer_trust_summary: String,
+    pub(crate) peer_dispatch_blocked_preview: Vec<String>,
     pub(crate) visions: u64,
     pub(crate) active_projects: u64,
     pub(crate) running_tasks: u64,
@@ -157,6 +164,7 @@ pub(crate) struct StatusView {
     pub(crate) latest_project_retry_parent_task_id: Option<String>,
     pub(crate) latest_project_failure_action: Option<String>,
     pub(crate) latest_project_failure_reason: Option<String>,
+    pub(crate) latest_project_blocked_reason: Option<String>,
     pub(crate) latest_project_approval_state: Option<String>,
     pub(crate) latest_project_approval_updated_at: Option<String>,
 }
@@ -172,24 +180,31 @@ pub(crate) fn render_status_health_summary(view: &StatusView) -> String {
             view.cached_project_snapshots
         ),
         "owner" => format!(
-            "health_summary: owner projects={} issued_tasks={} running_tasks={} inbox_unprocessed={} evaluations={}",
+            "health_summary: owner projects={} issued_tasks={} running_tasks={} inbox_unprocessed={} evaluations={} peer_trust={}",
             view.owned_projects,
             view.issued_tasks,
             view.running_tasks,
             view.inbox_unprocessed,
-            view.evaluations
+            view.evaluations,
+            view.peer_trust_summary
         ),
         "worker" => format!(
-            "health_summary: worker assigned_tasks={} active_assigned_tasks={} queued_outbox={} openclaw_enabled={} accept_join_offers={}",
+            "health_summary: worker assigned_tasks={} active_assigned_tasks={} queued_outbox={} openclaw_enabled={} accept_join_offers={} peer_trust={}",
             view.assigned_tasks,
             view.active_assigned_tasks,
             view.queued_outbox,
             view.openclaw_enabled,
-            view.worker_accept_join_offers
+            view.worker_accept_join_offers,
+            view.peer_trust_summary
         ),
         "relay" => format!(
-            "health_summary: relay connected_peers={} queued_outbox={} inbox_unprocessed={} transport={}",
-            view.connected_peers, view.queued_outbox, view.inbox_unprocessed, view.transport
+            "health_summary: relay known_peers={} connected_sessions={} queued_outbox={} inbox_unprocessed={} transport={} peer_trust={}",
+            view.known_peers,
+            view.connected_sessions.unwrap_or(0),
+            view.queued_outbox,
+            view.inbox_unprocessed,
+            view.transport,
+            view.peer_trust_summary
         ),
         _ => format!(
             "health_summary: role={} queued_outbox={} inbox_unprocessed={}",
@@ -201,7 +216,7 @@ pub(crate) fn render_status_health_summary(view: &StatusView) -> String {
 pub(crate) fn render_status_role_detail(view: &StatusView) -> String {
     match view.role.as_str() {
         "principal" => format!(
-            "principal_visions={} principal_projects={} cached_project_snapshots={} latest_project_progress={} latest_project_approval={}",
+            "principal_visions={} principal_projects={} cached_project_snapshots={} latest_project_progress={} latest_project_approval={} peer_trust={}",
             view.principal_visions,
             view.principal_projects,
             view.cached_project_snapshots,
@@ -211,10 +226,11 @@ pub(crate) fn render_status_role_detail(view: &StatusView) -> String {
                 .unwrap_or_else(|| "none".to_owned()),
             view.latest_project_approval_state
                 .clone()
-                .unwrap_or_else(|| "none".to_owned())
+                .unwrap_or_else(|| "none".to_owned()),
+            view.peer_trust_summary
         ),
         "owner" => format!(
-            "owned_projects={} issued_tasks={} evaluations={} latest_project_progress={} latest_project_retry={} latest_project_approval={} max_retry_attempts={} retry_cooldown_ms={} retry_rules={}",
+            "owned_projects={} issued_tasks={} evaluations={} latest_project_progress={} latest_project_retry={} latest_project_approval={} latest_project_blocked_reason={} max_retry_attempts={} retry_cooldown_ms={} retry_rules={} peer_trust={}",
             view.owned_projects,
             view.issued_tasks,
             view.evaluations,
@@ -229,20 +245,29 @@ pub(crate) fn render_status_role_detail(view: &StatusView) -> String {
             view.latest_project_approval_state
                 .clone()
                 .unwrap_or_else(|| "none".to_owned()),
+            view.latest_project_blocked_reason
+                .clone()
+                .unwrap_or_else(|| "none".to_owned()),
             view.owner_max_retry_attempts,
             view.owner_retry_cooldown_ms,
-            view.owner_retry_rule_count
+            view.owner_retry_rule_count,
+            view.peer_trust_summary
         ),
         "worker" => format!(
-            "assigned_tasks={} active_assigned_tasks={} openclaw_enabled={} max_active_tasks={}",
+            "assigned_tasks={} active_assigned_tasks={} openclaw_enabled={} max_active_tasks={} peer_trust={}",
             view.assigned_tasks,
             view.active_assigned_tasks,
             view.openclaw_enabled,
-            view.worker_max_active_tasks
+            view.worker_max_active_tasks,
+            view.peer_trust_summary
         ),
         "relay" => format!(
-            "connected_peers={} seed_peers={} transport={}",
-            view.connected_peers, view.seed_peers, view.transport
+            "known_peers={} connected_sessions={} seed_peers={} transport={} peer_trust={}",
+            view.known_peers,
+            view.connected_sessions.unwrap_or(0),
+            view.seed_peers,
+            view.transport,
+            view.peer_trust_summary
         ),
         _ => "none".to_owned(),
     }
@@ -326,8 +351,8 @@ pub(crate) fn evaluate_status_readiness(view: &StatusView) -> StatusProbeReport 
     let mut reasons = liveness.reasons.clone();
     let mut warnings = liveness.warnings.clone();
 
-    if view.connected_peers == 0 {
-        warnings.push("connected_peers=0".to_owned());
+    if view.connected_sessions.is_some_and(|count| count == 0) {
+        warnings.push("connected_sessions=0".to_owned());
     }
 
     if view.role == "worker" {
@@ -396,7 +421,8 @@ pub(crate) fn status_metrics_output(view: &StatusView) -> StatusMetricsOutput {
         readiness: u8::from(view.readiness.ok),
         liveness_warning_count: view.liveness.warnings.len() as u64,
         readiness_warning_count: view.readiness.warnings.len() as u64,
-        connected_peers: view.connected_peers,
+        known_peers: view.known_peers,
+        connected_sessions: view.connected_sessions.unwrap_or(0),
         active_projects: view.active_projects,
         running_tasks: view.running_tasks,
         queued_outbox: view.queued_outbox,
@@ -447,9 +473,14 @@ const PROMETHEUS_METRICS: &[(&str, &str, MetricAccessor)] = &[
         "Number of readiness warnings",
         |m| m.readiness_warning_count,
     ),
-    ("starweft_connected_peers", "Connected peer count", |m| {
-        m.connected_peers
+    ("starweft_known_peers", "Known peer count", |m| {
+        m.known_peers
     }),
+    (
+        "starweft_connected_sessions",
+        "Currently connected transport sessions",
+        |m| m.connected_sessions,
+    ),
     ("starweft_active_projects", "Active project count", |m| {
         m.active_projects
     }),
@@ -818,6 +849,37 @@ pub(crate) fn run_snapshot(args: SnapshotArgs) -> Result<()> {
         bail!("[E_ARGUMENT] --project または --task のどちらか一方を指定してください");
     }
 
+    let mut args = args;
+    let request_once = args.request;
+    if request_once {
+        let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
+        let store = Store::open(&paths.ledger_db)?;
+        if let Some(project_id) = args.project.as_deref() {
+            queue_snapshot_request(
+                &config,
+                &paths,
+                &store,
+                SnapshotScopeType::Project,
+                project_id,
+                args.owner.clone(),
+            )?;
+        } else if let Some(task_id) = args.task.as_deref() {
+            queue_snapshot_request(
+                &config,
+                &paths,
+                &store,
+                SnapshotScopeType::Task,
+                task_id,
+                args.owner.clone(),
+            )?;
+        }
+        if !args.watch {
+            println!("snapshot_request: queued\nsnapshot_source: remote_request");
+            return Ok(());
+        }
+        args.request = false;
+    }
+
     let mut previous_output: Option<String> = None;
     if args.watch {
         eprintln!(
@@ -826,7 +888,13 @@ pub(crate) fn run_snapshot(args: SnapshotArgs) -> Result<()> {
         );
     }
     loop {
-        let output = render_snapshot(&args)?;
+        let output = match render_snapshot(&args) {
+            Ok(output) => output,
+            Err(_error) if request_once && args.watch => {
+                render_pending_remote_snapshot(&args, args.json)?
+            }
+            Err(error) => return Err(error),
+        };
         if args.watch {
             print!("\x1B[2J\x1B[H");
             if args.json {
@@ -864,6 +932,28 @@ pub(crate) fn run_snapshot(args: SnapshotArgs) -> Result<()> {
     Ok(())
 }
 
+fn render_pending_remote_snapshot(args: &SnapshotArgs, json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "snapshot_source": "remote_request_pending",
+            "project_id": args.project,
+            "task_id": args.task,
+        }))?);
+    }
+    let body = if let Some(project_id) = &args.project {
+        format!(
+            "snapshot_request: queued\nsnapshot_source: remote_request_pending\nproject_id: {project_id}"
+        )
+    } else if let Some(task_id) = &args.task {
+        format!(
+            "snapshot_request: queued\nsnapshot_source: remote_request_pending\ntask_id: {task_id}"
+        )
+    } else {
+        "snapshot_request: queued\nsnapshot_source: remote_request_pending".to_owned()
+    };
+    Ok(prepend_snapshot_compact_summary(body))
+}
+
 pub(crate) fn render_status_output(args: &StatusArgs, view: &StatusView) -> Result<String> {
     if args.json {
         return Ok(serde_json::to_string_pretty(view)?);
@@ -892,7 +982,22 @@ pub(crate) fn render_status_output(args: &StatusArgs, view: &StatusView) -> Resu
         format!("p2p: {}", view.p2p),
         format!("listen_addresses: {}", view.listen_addresses),
         format!("seed_peers: {}", view.seed_peers),
-        format!("connected_peers: {}", view.connected_peers),
+        format!("known_peers: {}", view.known_peers),
+        format!(
+            "connected_sessions: {}",
+            view.connected_sessions
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "n/a".to_owned())
+        ),
+        format!("peer_trust_summary: {}", view.peer_trust_summary),
+        format!(
+            "peer_dispatch_blocked_preview: {}",
+            if view.peer_dispatch_blocked_preview.is_empty() {
+                "none".to_owned()
+            } else {
+                view.peer_dispatch_blocked_preview.join(", ")
+            }
+        ),
         format!("visions: {}", view.visions),
         format!("active_projects: {}", view.active_projects),
         format!("running_tasks: {}", view.running_tasks),
@@ -990,6 +1095,12 @@ pub(crate) fn render_status_output(args: &StatusArgs, view: &StatusView) -> Resu
                 .unwrap_or_else(|| "none".to_owned())
         ),
         format!(
+            "latest_project_blocked_reason: {}",
+            view.latest_project_blocked_reason
+                .clone()
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
             "latest_project_approval_state: {}",
             view.latest_project_approval_state
                 .clone()
@@ -1076,6 +1187,12 @@ pub(crate) fn run_status(args: StatusArgs) -> Result<()> {
         loop {
             let view = load_status_view_with(&config, &paths, &store, &topology, &transport)?;
             let output = render_status_output(&args, &view)?;
+            if args.json {
+                println!("{output}");
+                previous_output = Some(output);
+                thread::sleep(Duration::from_secs(args.interval_sec.max(1)));
+                continue;
+            }
             print!("\x1B[2J\x1B[H");
             if let Some(summary) =
                 render_status_compact_watch_summary(previous_output.as_deref(), &output)
@@ -1139,6 +1256,37 @@ pub(crate) fn load_status_view_with(
 ) -> Result<StatusView> {
     let identity = store.local_identity()?;
     let stats = store.stats()?;
+    let mut seen_peer_actors: HashSet<ActorId> = HashSet::new();
+    let mut discovered_peers = 0_u64;
+    let mut trusted_peers = 0_u64;
+    let mut pinned_peers = 0_u64;
+    let mut revoked_peers = 0_u64;
+    let mut peer_dispatch_blocked_preview = Vec::new();
+    for peer in store.list_peer_addresses()? {
+        if !seen_peer_actors.insert(peer.actor_id.clone()) {
+            continue;
+        }
+        if let Some(identity) = store.peer_identity(&peer.actor_id)? {
+            match identity.trust_state {
+                starweft_store::PeerTrustState::Discovered => discovered_peers += 1,
+                starweft_store::PeerTrustState::Trusted => trusted_peers += 1,
+                starweft_store::PeerTrustState::Pinned => pinned_peers += 1,
+                starweft_store::PeerTrustState::Revoked => revoked_peers += 1,
+            }
+            if !peer_is_locally_trusted(identity.trust_state)
+                && peer_dispatch_blocked_preview.len() < 3
+            {
+                peer_dispatch_blocked_preview.push(format!(
+                    "{}:{}",
+                    peer.actor_id,
+                    peer_dispatch_eligibility_reason(identity.trust_state)
+                ));
+            }
+        }
+    }
+    let peer_trust_summary = format!(
+        "trusted={trusted_peers} pinned={pinned_peers} discovered={discovered_peers} revoked={revoked_peers}"
+    );
     let latest_snapshot_at = store.latest_snapshot_created_at()?;
     let latest_stop_id = store.latest_stop_id()?;
     let latest_project_snapshot = store.latest_project_snapshot()?;
@@ -1179,6 +1327,8 @@ pub(crate) fn load_status_view_with(
         .map(|record| store.actor_scoped_stats(&record.actor_id))
         .transpose()?
         .unwrap_or_else(ActorScopedStats::default);
+    let openclaw_ready =
+        config.openclaw.enabled && ensure_binary_exists(&config.openclaw.bin).is_ok();
 
     let mut view = StatusView {
         liveness: StatusProbeReport::new(Vec::new(), Vec::new()),
@@ -1228,7 +1378,10 @@ pub(crate) fn load_status_view_with(
         bridge_capability_version: config.compatibility.bridge_capability_version.clone(),
         listen_addresses: topology.listen_addresses.len(),
         seed_peers: topology.seed_peers.len(),
-        connected_peers: stats.peer_count,
+        known_peers: stats.peer_count,
+        connected_sessions: transport.connected_peer_count(),
+        peer_trust_summary,
+        peer_dispatch_blocked_preview,
         visions: stats.vision_count,
         active_projects: stats.project_count,
         running_tasks: stats.running_task_count,
@@ -1241,7 +1394,7 @@ pub(crate) fn load_status_view_with(
         evaluations: stats.evaluation_count,
         artifacts: stats.artifact_count,
         last_snapshot_at: latest_snapshot_at,
-        openclaw_enabled: config.openclaw.enabled,
+        openclaw_enabled: openclaw_ready,
         openclaw_bin: config.openclaw.enabled.then(|| config.openclaw.bin.clone()),
         worker_accept_join_offers: config.worker.accept_join_offers,
         worker_max_active_tasks: config.worker.max_active_tasks,
@@ -1308,6 +1461,15 @@ pub(crate) fn load_status_view_with(
         latest_project_failure_reason: latest_project_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.retry.latest_failure_reason.clone()),
+        latest_project_blocked_reason: latest_project_snapshot.as_ref().and_then(|snapshot| {
+            snapshot.retry.latest_failure_reason.clone().or_else(|| {
+                snapshot
+                    .retry
+                    .latest_failure_action
+                    .clone()
+                    .map(|action| format!("action:{action}"))
+            })
+        }),
         latest_project_approval_state: latest_project_snapshot
             .as_ref()
             .map(|snapshot| snapshot.approval.state.clone()),
@@ -1552,7 +1714,10 @@ mod tests {
             bridge_capability_version: "openclaw.execution.v1".to_owned(),
             listen_addresses: 1,
             seed_peers: 0,
-            connected_peers: 1,
+            known_peers: 1,
+            connected_sessions: None,
+            peer_trust_summary: "trusted=1 pinned=0 discovered=0 revoked=0".to_owned(),
+            peer_dispatch_blocked_preview: Vec::new(),
             visions: 0,
             active_projects: 0,
             running_tasks: 0,
@@ -1602,6 +1767,7 @@ mod tests {
             latest_project_retry_parent_task_id: None,
             latest_project_failure_action: None,
             latest_project_failure_reason: None,
+            latest_project_blocked_reason: None,
             latest_project_approval_state: None,
             latest_project_approval_updated_at: None,
         }
@@ -1613,11 +1779,11 @@ mod tests {
 
         assert_eq!(
             render_status_health_summary(&worker),
-            "health_summary: worker assigned_tasks=3 active_assigned_tasks=1 queued_outbox=2 openclaw_enabled=true accept_join_offers=true"
+            "health_summary: worker assigned_tasks=3 active_assigned_tasks=1 queued_outbox=2 openclaw_enabled=true accept_join_offers=true peer_trust=trusted=1 pinned=0 discovered=0 revoked=0"
         );
         assert_eq!(
             render_status_role_detail(&worker),
-            "assigned_tasks=3 active_assigned_tasks=1 openclaw_enabled=true max_active_tasks=1"
+            "assigned_tasks=3 active_assigned_tasks=1 openclaw_enabled=true max_active_tasks=1 peer_trust=trusted=1 pinned=0 discovered=0 revoked=0"
         );
     }
 
@@ -1720,14 +1886,39 @@ mod tests {
     }
 
     #[test]
+    fn render_status_output_includes_peer_trust_and_blocked_reason() {
+        let mut worker = sample_worker_status_view();
+        worker.peer_dispatch_blocked_preview = vec!["actor_peer_01:blocked:revoked".to_owned()];
+        worker.latest_project_blocked_reason =
+            Some("unauthorized execution without required human approval".to_owned());
+        let output = render_status_output(
+            &crate::cli::StatusArgs {
+                data_dir: None,
+                json: false,
+                probe: None,
+                watch: false,
+                interval_sec: 2,
+            },
+            &worker,
+        )
+        .expect("render status");
+
+        assert!(output.contains("peer_trust_summary: trusted=1 pinned=0 discovered=0 revoked=0"));
+        assert!(output.contains("peer_dispatch_blocked_preview: actor_peer_01:blocked:revoked"));
+        assert!(output.contains(
+            "latest_project_blocked_reason: unauthorized execution without required human approval"
+        ));
+    }
+
+    #[test]
     fn status_watch_summary_reports_health_delta() {
-        let previous = "health_summary: worker assigned_tasks=3 active_assigned_tasks=1 queued_outbox=2 openclaw_enabled=true accept_join_offers=true\nqueued_outbox: 2";
-        let current = "health_summary: worker assigned_tasks=3 active_assigned_tasks=0 queued_outbox=0 openclaw_enabled=true accept_join_offers=true\nqueued_outbox: 0";
+        let previous = "health_summary: worker assigned_tasks=3 active_assigned_tasks=1 queued_outbox=2 openclaw_enabled=true accept_join_offers=true peer_trust=trusted=1 pinned=0 discovered=0 revoked=0\nqueued_outbox: 2";
+        let current = "health_summary: worker assigned_tasks=3 active_assigned_tasks=0 queued_outbox=0 openclaw_enabled=true accept_join_offers=true peer_trust=trusted=1 pinned=0 discovered=0 revoked=0\nqueued_outbox: 0";
 
         assert_eq!(
             render_status_watch_summary(Some(previous), current),
             Some(
-                "health_delta: worker assigned_tasks=3 active_assigned_tasks=1 queued_outbox=2 openclaw_enabled=true accept_join_offers=true -> worker assigned_tasks=3 active_assigned_tasks=0 queued_outbox=0 openclaw_enabled=true accept_join_offers=true"
+                "health_delta: worker assigned_tasks=3 active_assigned_tasks=1 queued_outbox=2 openclaw_enabled=true accept_join_offers=true peer_trust=trusted=1 pinned=0 discovered=0 revoked=0 -> worker assigned_tasks=3 active_assigned_tasks=0 queued_outbox=0 openclaw_enabled=true accept_join_offers=true peer_trust=trusted=1 pinned=0 discovered=0 revoked=0"
                     .to_owned()
             )
         );

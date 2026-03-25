@@ -147,6 +147,9 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Peer { command } => match command {
             PeerCommands::Add(args) => commands::run_peer_add(*args),
             PeerCommands::List(args) => commands::run_peer_list(args),
+            PeerCommands::Promote(args) => commands::run_peer_promote(args),
+            PeerCommands::Revoke(args) => commands::run_peer_revoke(args),
+            PeerCommands::Rotate(args) => commands::run_peer_rotate(args),
         },
         Commands::Openclaw { command } => match command {
             OpenClawCommands::Attach(args) => commands::run_openclaw_attach(args),

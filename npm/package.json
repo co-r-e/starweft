@@ -1,6 +1,6 @@
 {
   "name": "starweft",
-  "version": "0.3.1",
+  "version": "0.5.0",
   "description": "Distributed multi-agent task coordination CLI for OpenClaw",
   "license": "MIT",
   "repository": {

@@ -82,6 +82,7 @@ pub fn replace_transport_with_libp2p(config_path: &Path) {
 
 pub fn wait_for_contains(path: &Path, sql: &str, needle: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
+    let mut last_stdout = String::new();
     while Instant::now() < deadline {
         let output = Command::new("sqlite3")
             .arg(path)
@@ -92,9 +93,10 @@ pub fn wait_for_contains(path: &Path, sql: &str, needle: &str, timeout: Duration
         if stdout.contains(needle) {
             return;
         }
+        last_stdout = stdout.into_owned();
         thread::sleep(WAIT_POLL_INTERVAL);
     }
-    panic!("timed out waiting for {needle} in sqlite query {sql}");
+    panic!("timed out waiting for {needle} in sqlite query {sql}; last stdout={last_stdout:?}");
 }
 
 #[allow(dead_code)]

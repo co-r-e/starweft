@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use starweft_crypto::StoredKeypair;
-use starweft_id::{ActorId, ProjectId, TaskId};
-use starweft_protocol::{ApprovalScopeType, ProjectStatus, TaskStatus, VisionConstraints};
+use starweft_id::{ActorId, MessageId, ProjectId, TaskId};
+use starweft_protocol::{
+    ApprovalApplied, ApprovalScopeType, ProjectStatus, TaskStatus, UnsignedEnvelope,
+    VisionConstraints,
+};
+use starweft_runtime::RuntimePipeline;
 use starweft_store::{LocalIdentityRecord, Store};
 use std::collections::{HashMap, HashSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -13,18 +17,21 @@ use crate::cli::{
 };
 use crate::config::{NodeRole, load_existing_config};
 use crate::helpers::{
-    configured_actor_key_path, human_intervention_requires_approval, parse_actor_id_arg,
+    approval_state_is_approved, configured_actor_key_path, human_intervention_requires_approval,
+    parse_actor_id_arg,
     parse_rfc3339_arg, read_keypair, require_local_identity, submission_is_approved,
     timestamp_at_or_after,
 };
 use crate::runtime::{
     OwnerContext, RemoteApprovalOutput, RemoteApprovalParams, dispatch_next_task_offer,
-    queue_remote_approval, queue_retry_task, select_next_worker_actor_id,
+    dispatch_specific_task_offer, queue_remote_approval, queue_retry_task,
+    select_next_worker_actor_id, select_worker_for_task,
 };
+#[cfg(test)]
+use crate::runtime::{PolicyBlockedTaskParams, record_owner_policy_blocked_task_result};
 use crate::wait::{
-    ProjectWaitCondition, TaskWaitCondition, WaitOutput, WaitTarget,
-    build_local_project_approval_wait_output, build_local_task_approval_wait_output,
-    render_wait_output_text, wait_for_target,
+    ProjectWaitCondition, TaskWaitCondition, WaitOutput, WaitTarget, render_wait_output_text,
+    wait_for_target,
 };
 
 #[derive(Clone, Debug)]
@@ -182,10 +189,20 @@ pub(crate) fn run_project_approve(args: ProjectApproveArgs) -> Result<()> {
         NodeRole::Owner => {
             let output =
                 approve_project_execution(&store, &local_identity, &actor_key, &project_id)?;
-            let wait_output = args
-                .wait
-                .then(|| build_local_project_approval_wait_output(&store, &project_id))
-                .transpose()?;
+            let wait_output = if args.wait {
+                Some(wait_for_target(
+                    &store,
+                    &WaitTarget::Project {
+                        project_id: project_id.clone(),
+                        until: ProjectWaitCondition::ApprovalApplied,
+                    },
+                    args.timeout_sec,
+                    args.interval_ms,
+                    false,
+                )?)
+            } else {
+                None
+            };
             print_project_approve_result(&output, wait_output.as_ref(), args.json)?;
             Ok(())
         }
@@ -265,10 +282,20 @@ pub(crate) fn run_task_approve(args: TaskApproveArgs) -> Result<()> {
     match config.node.role {
         NodeRole::Owner => {
             let output = approve_task_execution(&store, &local_identity, &actor_key, &task_id)?;
-            let wait_output = args
-                .wait
-                .then(|| build_local_task_approval_wait_output(&store, &task_id))
-                .transpose()?;
+            let wait_output = if args.wait {
+                Some(wait_for_target(
+                    &store,
+                    &WaitTarget::Task {
+                        task_id: task_id.clone(),
+                        until: TaskWaitCondition::ApprovalApplied,
+                    },
+                    args.timeout_sec,
+                    args.interval_ms,
+                    false,
+                )?)
+            } else {
+                None
+            };
             print_task_approve_result(&output, wait_output.as_ref(), args.json)?;
             Ok(())
         }
@@ -318,6 +345,14 @@ pub(crate) fn approve_project_execution(
     project_id: &ProjectId,
 ) -> Result<ProjectApproveOutput> {
     let state = approve_execution_scope(store, local_identity, actor_key, project_id, None)?;
+    record_local_approval_applied_event(
+        store,
+        local_identity,
+        actor_key,
+        project_id,
+        None,
+        &state,
+    )?;
 
     Ok(ProjectApproveOutput {
         project_id: state.project_id,
@@ -348,6 +383,14 @@ pub(crate) fn approve_task_execution(
         &task.project_id,
         Some(task_id),
     )?;
+    record_local_approval_applied_event(
+        store,
+        local_identity,
+        actor_key,
+        &task.project_id,
+        Some(task_id),
+        &state,
+    )?;
     Ok(TaskApproveOutput {
         project_id: state.project_id,
         task_id: task.task_id.to_string(),
@@ -360,6 +403,46 @@ pub(crate) fn approve_task_execution(
         policy_blocker: state.policy_blocker,
         remaining_queued_tasks: state.remaining_queued_tasks,
     })
+}
+
+fn record_local_approval_applied_event(
+    store: &Store,
+    local_identity: &LocalIdentityRecord,
+    actor_key: &StoredKeypair,
+    project_id: &ProjectId,
+    task_id: Option<&TaskId>,
+    state: &ApprovalState,
+) -> Result<()> {
+    let scope_type = if task_id.is_some() {
+        ApprovalScopeType::Task
+    } else {
+        ApprovalScopeType::Project
+    };
+    let scope_id = task_id
+        .map(ToString::to_string)
+        .unwrap_or_else(|| project_id.to_string());
+    let applied = UnsignedEnvelope::new(
+        local_identity.actor_id.clone(),
+        Some(local_identity.actor_id.clone()),
+        ApprovalApplied {
+            scope_type,
+            scope_id,
+            approval_granted_msg_id: MessageId::generate(),
+            approval_updated: state.approval_updated,
+            resumed_task_ids: state.resumed_task_ids.clone(),
+            dispatched: state.dispatched,
+            applied_at: OffsetDateTime::now_utc(),
+        },
+    )
+    .with_project_id(project_id.clone());
+    let applied = if let Some(task_id) = task_id {
+        applied.with_task_id(task_id.clone())
+    } else {
+        applied
+    }
+    .sign(actor_key)?;
+    RuntimePipeline::new(store).record_local_approval_applied(&applied)?;
+    Ok(())
 }
 
 pub(crate) fn approve_execution_scope(
@@ -376,24 +459,32 @@ pub(crate) fn approve_execution_scope(
         anyhow!("[E_VISION_NOT_FOUND] project に対応する vision が見つかりません")
     })?;
     let mut constraints: VisionConstraints = serde_json::from_value(vision.constraints.clone())?;
-    let approval_updated = !submission_is_approved(&constraints);
+    let approval_updated = if let Some(task_id) = target_task_id {
+        !store
+            .task_snapshot(task_id)?
+            .is_some_and(|snapshot| approval_state_is_approved(&snapshot.approval.state))
+    } else {
+        !submission_is_approved(&constraints)
+    };
     let human_intervention_required = human_intervention_requires_approval(&constraints);
-    constraints
-        .extra
-        .insert("submission_approved".to_owned(), Value::Bool(true));
-    constraints.extra.insert(
-        "approved_by_actor_id".to_owned(),
-        Value::String(local_identity.actor_id.to_string()),
-    );
-    constraints.extra.insert(
-        "approved_at".to_owned(),
-        Value::String(OffsetDateTime::now_utc().format(&Rfc3339)?),
-    );
-    vision.constraints = serde_json::to_value(&constraints)?;
-    if human_intervention_required {
-        vision.status = "approved".to_owned();
+    if target_task_id.is_none() {
+        constraints
+            .extra
+            .insert("submission_approved".to_owned(), Value::Bool(true));
+        constraints.extra.insert(
+            "approved_by_actor_id".to_owned(),
+            Value::String(local_identity.actor_id.to_string()),
+        );
+        constraints.extra.insert(
+            "approved_at".to_owned(),
+            Value::String(OffsetDateTime::now_utc().format(&Rfc3339)?),
+        );
+        vision.constraints = serde_json::to_value(&constraints)?;
+        if human_intervention_required {
+            vision.status = "approved".to_owned();
+        }
+        store.save_vision(&vision)?;
     }
-    store.save_vision(&vision)?;
 
     let owner_ctx = OwnerContext {
         store,
@@ -418,14 +509,33 @@ pub(crate) fn approve_execution_scope(
     let principal_actor_id = store
         .project_principal_actor_id(project_id)?
         .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] principal actor が見つかりません"))?;
-    let next_worker_actor_id = select_next_worker_actor_id(
-        store,
-        project_id,
-        &local_identity.actor_id,
-        &principal_actor_id,
-        &[],
-    )?;
-    let dispatched = if let Some(worker_actor_id) = next_worker_actor_id.clone() {
+    let next_worker_actor_id = if let Some(task_id) = target_task_id {
+        select_worker_for_task(
+            store,
+            project_id,
+            task_id,
+            &local_identity.actor_id,
+            &principal_actor_id,
+            &[],
+        )?
+    } else {
+        select_next_worker_actor_id(
+            store,
+            project_id,
+            &local_identity.actor_id,
+            &principal_actor_id,
+            &[],
+        )?
+    };
+    let dispatched = if let (Some(worker_actor_id), Some(task_id)) =
+        (next_worker_actor_id.clone(), target_task_id)
+    {
+        if matches!(store.task_status(task_id)?, Some(TaskStatus::Queued)) {
+            dispatch_specific_task_offer(&owner_ctx, worker_actor_id, task_id)?
+        } else {
+            false
+        }
+    } else if let Some(worker_actor_id) = next_worker_actor_id.clone() {
         dispatch_next_task_offer(&owner_ctx, worker_actor_id)?
     } else {
         false
@@ -1557,6 +1667,7 @@ mod tests {
                 title: "Approval Project".to_owned(),
                 objective: "Need approval".to_owned(),
                 stop_authority_actor_id: principal_actor,
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 participant_policy: starweft_protocol::ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -1590,6 +1701,7 @@ mod tests {
                 public_key: "worker-pk".to_owned(),
                 stop_public_key: None,
                 capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Trusted,
                 updated_at: now,
             })
             .expect("peer identity");
@@ -1692,9 +1804,7 @@ mod tests {
                 principal_actor_id: principal_actor.clone(),
                 title: "Task Approval Vision".to_owned(),
                 raw_vision_text: "Need approval".to_owned(),
-                constraints: serde_json::json!({
-                    "human_intervention": "required",
-                }),
+                constraints: serde_json::json!({}),
                 status: "accepted".to_owned(),
                 created_at: now,
             })
@@ -1710,6 +1820,7 @@ mod tests {
                 title: "Task Approval Project".to_owned(),
                 objective: "Need approval".to_owned(),
                 stop_authority_actor_id: principal_actor,
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 participant_policy: starweft_protocol::ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -1743,6 +1854,7 @@ mod tests {
                 public_key: "worker-pk".to_owned(),
                 stop_public_key: None,
                 capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Trusted,
                 updated_at: now,
             })
             .expect("peer identity");
@@ -1786,9 +1898,24 @@ mod tests {
             Vec::new(),
         )
         .expect("task b");
-        let dispatched =
-            dispatch_next_task_offer(&owner_ctx, owner_actor.clone()).expect("dispatch");
-        assert!(!dispatched);
+        let constraints = store
+            .project_vision_constraints(&project_id)
+            .expect("constraints")
+            .expect("project constraints");
+        for task_id in [&task_a, &task_b] {
+            record_owner_policy_blocked_task_result(&PolicyBlockedTaskParams {
+                store: &store,
+                actor_key: &owner_key,
+                owner_actor_id: &owner_actor,
+                project_id: &project_id,
+                task_id,
+                required_capability: "openclaw.execution.v1",
+                constraints: &constraints,
+                policy_code: "human_approval_required",
+                summary: "unauthorized execution without required human approval",
+            })
+            .expect("record blocked task");
+        }
 
         let local_identity = store
             .local_identity()
@@ -1800,5 +1927,166 @@ mod tests {
         assert_eq!(output.resumed_task_ids.len(), 1);
         assert_eq!(store.task_child_count(&task_a).expect("task a children"), 1);
         assert_eq!(store.task_child_count(&task_b).expect("task b children"), 0);
+    }
+
+    #[test]
+    fn approve_task_execution_uses_target_task_capability_for_dispatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let owner_key = StoredKeypair::generate();
+        let principal_actor = ActorId::generate();
+        let owner_actor = ActorId::generate();
+        let exec_worker = ActorId::generate();
+        let plan_worker = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let vision_id = VisionId::generate();
+        let now = OffsetDateTime::now_utc();
+
+        store
+            .upsert_local_identity(&starweft_store::LocalIdentityRecord {
+                actor_id: owner_actor.clone(),
+                node_id: NodeId::generate(),
+                actor_type: "owner".to_owned(),
+                display_name: "owner".to_owned(),
+                public_key: owner_key.public_key.clone(),
+                private_key_ref: "actor.key".to_owned(),
+                created_at: now,
+            })
+            .expect("local identity");
+        store
+            .save_vision(&starweft_store::VisionRecord {
+                vision_id: vision_id.clone(),
+                principal_actor_id: principal_actor.clone(),
+                title: "Task Approval Vision".to_owned(),
+                raw_vision_text: "Need approval".to_owned(),
+                constraints: serde_json::json!({
+                    "human_intervention": "required",
+                }),
+                status: "accepted".to_owned(),
+                created_at: now,
+            })
+            .expect("save vision");
+        let charter = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(principal_actor.clone()),
+            starweft_protocol::ProjectCharter {
+                project_id: project_id.clone(),
+                vision_id: vision_id.clone(),
+                principal_actor_id: principal_actor.clone(),
+                owner_actor_id: owner_actor.clone(),
+                title: "Task Approval Project".to_owned(),
+                objective: "Need approval".to_owned(),
+                stop_authority_actor_id: principal_actor,
+                execution_mode: starweft_protocol::ExecutionMode::Full,
+                participant_policy: starweft_protocol::ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: starweft_protocol::EvaluationPolicy {
+                    quality_weight: 1.0,
+                    speed_weight: 0.5,
+                    reliability_weight: 1.0,
+                    alignment_weight: 1.0,
+                },
+            },
+        )
+        .with_vision_id(vision_id)
+        .with_project_id(project_id.clone())
+        .sign(&owner_key)
+        .expect("sign charter");
+        store
+            .apply_project_charter(&charter)
+            .expect("apply charter");
+
+        for (actor_id, capability) in [
+            (&exec_worker, "openclaw.execution.v1"),
+            (&plan_worker, "openclaw.plan.v1"),
+        ] {
+            store
+                .add_peer_address(&PeerAddressRecord {
+                    actor_id: actor_id.clone(),
+                    node_id: NodeId::generate(),
+                    multiaddr: format!("/unix/{capability}.sock"),
+                    last_seen_at: None,
+                })
+                .expect("peer address");
+            store
+                .upsert_peer_identity(&PeerIdentityRecord {
+                    actor_id: actor_id.clone(),
+                    node_id: NodeId::generate(),
+                    public_key: format!("{capability}-pk"),
+                    stop_public_key: None,
+                    capabilities: vec![capability.to_owned()],
+                    trust_state: starweft_store::PeerTrustState::Trusted,
+                    updated_at: now,
+                })
+                .expect("peer identity");
+        }
+
+        let owner_ctx = OwnerContext {
+            store: &store,
+            actor_key: &owner_key,
+            owner_actor_id: &owner_actor,
+            project_id: &project_id,
+        };
+
+        let _exec_task = queue_owner_planned_task(
+            &owner_ctx,
+            starweft_observation::PlannedTaskSpec {
+                title: "exec".to_owned(),
+                description: "exec".to_owned(),
+                objective: "exec".to_owned(),
+                required_capability: "openclaw.execution.v1".to_owned(),
+                input_payload: serde_json::json!({}),
+                expected_output_schema: serde_json::json!({}),
+                rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
+            },
+            None,
+            Vec::new(),
+        )
+        .expect("exec task");
+        let plan_task = queue_owner_planned_task(
+            &owner_ctx,
+            starweft_observation::PlannedTaskSpec {
+                title: "plan".to_owned(),
+                description: "plan".to_owned(),
+                objective: "plan".to_owned(),
+                required_capability: "openclaw.plan.v1".to_owned(),
+                input_payload: serde_json::json!({}),
+                expected_output_schema: serde_json::json!({}),
+                rationale: "test".to_owned(),
+                depends_on_indices: Vec::new(),
+            },
+            None,
+            Vec::new(),
+        )
+        .expect("plan task");
+        let first_queued_worker = select_next_worker_actor_id(
+            &store,
+            &project_id,
+            &owner_actor,
+            &charter.body.principal_actor_id,
+            &[],
+        )
+        .expect("select next worker");
+        assert_eq!(first_queued_worker, Some(exec_worker.clone()));
+        let targeted_worker = select_worker_for_task(
+            &store,
+            &project_id,
+            &plan_task,
+            &owner_actor,
+            &charter.body.principal_actor_id,
+            &[],
+        )
+        .expect("select targeted worker");
+        assert_eq!(targeted_worker, Some(plan_worker.clone()));
+
+        let local_identity = store
+            .local_identity()
+            .expect("local identity lookup")
+            .expect("local identity exists");
+        let output = approve_task_execution(&store, &local_identity, &owner_key, &plan_task)
+            .expect("approve task");
+        assert_eq!(output.task_id, plan_task.to_string());
     }
 }

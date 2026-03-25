@@ -4,7 +4,7 @@
 //! the signed envelope format, wire serialization, and domain status enums.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -543,6 +543,8 @@ impl FromStr for TaskStatus {
 pub struct VisionConstraints {
     /// Budget mode (e.g. `"minimal"`, `"standard"`).
     pub budget_mode: Option<String>,
+    /// Effective execution mode for delegated work.
+    pub execution_mode: Option<ExecutionMode>,
     /// Whether external agents may participate.
     pub allow_external_agents: Option<bool>,
     /// Human intervention policy (e.g. `"required"`, `"none"`).
@@ -550,6 +552,39 @@ pub struct VisionConstraints {
     /// Additional constraint key-value pairs.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Permission mode for OpenClaw execution on a worker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Run OpenClaw with full machine-level permissions and inherited environment.
+    #[default]
+    Full,
+    /// Run OpenClaw with a reduced environment controlled by Starweft.
+    Controlled,
+}
+
+impl fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Full => "full",
+            Self::Controlled => "controlled",
+        };
+        f.write_str(value)
+    }
+}
+
+impl FromStr for ExecutionMode {
+    type Err = ProtocolError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "full" => Ok(Self::Full),
+            "controlled" => Ok(Self::Controlled),
+            other => Err(ProtocolError::UnknownStatus(other.to_owned())),
+        }
+    }
 }
 
 /// A vision intent submitted by a principal to initiate work.
@@ -606,6 +641,8 @@ pub struct ProjectCharter {
     pub objective: String,
     /// Actor authorized to issue stop orders.
     pub stop_authority_actor_id: ActorId,
+    /// Effective execution mode for delegated work in this project.
+    pub execution_mode: ExecutionMode,
     /// Policy for agent participation.
     pub participant_policy: ParticipantPolicy,
     /// Policy for task result evaluation.
@@ -719,6 +756,10 @@ impl RoutedBody for CapabilityAdvertisement {
 /// An offer from a project owner to a worker to join and execute tasks.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JoinOffer {
+    /// Stable identifier for this offer.
+    pub offer_id: MessageId,
+    /// Task this offer is for.
+    pub task_id: TaskId,
     /// Capabilities the worker must possess.
     pub required_capabilities: Vec<String>,
     /// Brief outline of the work to be done.
@@ -736,6 +777,10 @@ impl RoutedBody for JoinOffer {
 /// A worker's acceptance of a join offer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JoinAccept {
+    /// Offer being accepted.
+    pub offer_id: MessageId,
+    /// Task tied to the accepted offer.
+    pub task_id: TaskId,
     /// Always `true` for an acceptance.
     pub accepted: bool,
     /// The capabilities the worker confirms it can provide.
@@ -751,6 +796,10 @@ impl RoutedBody for JoinAccept {
 /// A worker's rejection of a join offer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JoinReject {
+    /// Offer being rejected.
+    pub offer_id: MessageId,
+    /// Task tied to the rejected offer.
+    pub task_id: TaskId,
     /// Always `false` for a rejection.
     pub accepted: bool,
     /// Reason for rejecting the offer.
@@ -779,6 +828,8 @@ pub struct TaskDelegated {
     pub objective: String,
     /// Capability required to execute this task.
     pub required_capability: String,
+    /// Effective execution mode for this task.
+    pub execution_mode: ExecutionMode,
     /// Structured input data for the worker.
     pub input_payload: Value,
     /// JSON schema describing the expected output format.
@@ -1013,6 +1064,27 @@ pub enum StopScopeType {
     TaskTree,
 }
 
+/// Signed payload proving which actor authorized a stop order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StopAuthorityPayload {
+    /// Unique stop order identifier.
+    pub stop_id: StopId,
+    /// Project targeted by the stop.
+    pub project_id: ProjectId,
+    /// Whether this stops a project or a task tree.
+    pub scope_type: StopScopeType,
+    /// ID of the entity being stopped.
+    pub scope_id: String,
+    /// Machine-readable reason code.
+    pub reason_code: String,
+    /// Human-readable reason text.
+    pub reason_text: String,
+    /// Actor that holds stop authority for this project.
+    pub authority_actor_id: ActorId,
+    /// When the stop order was issued.
+    pub issued_at: OffsetDateTime,
+}
+
 /// An order to stop a project or task tree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StopOrder {
@@ -1028,6 +1100,10 @@ pub struct StopOrder {
     pub reason_text: String,
     /// When the stop order was issued.
     pub issued_at: OffsetDateTime,
+    /// Actor that authorized this stop.
+    pub authority_actor_id: ActorId,
+    /// Stop-authority signature over the canonical stop payload.
+    pub authority_signature: MessageSignature,
 }
 
 impl RoutedBody for StopOrder {

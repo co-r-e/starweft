@@ -73,7 +73,7 @@ fn draw(frame: &mut Frame, view: Option<&StatusView>, error: Option<&str>) {
 
     let chunks = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(7),
+        Constraint::Length(9),
         Constraint::Length(9),
         Constraint::Min(5),
         Constraint::Length(1),
@@ -166,7 +166,22 @@ fn draw_overview(frame: &mut Frame, area: Rect, view: &StatusView) {
     let rows = vec![
         kv_row("actor_id", &view.actor_id),
         kv_row("node_id", &view.node_id),
-        kv_row("connected_peers", view.connected_peers),
+        kv_row("known_peers", view.known_peers),
+        kv_row(
+            "connected_sessions",
+            view.connected_sessions
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "n/a".to_owned()),
+        ),
+        kv_row("peer_trust", &view.peer_trust_summary),
+        kv_row(
+            "blocked_peers",
+            if view.peer_dispatch_blocked_preview.is_empty() {
+                "none".to_owned()
+            } else {
+                view.peer_dispatch_blocked_preview.join(", ")
+            },
+        ),
         kv_row("active_projects", view.active_projects),
         kv_row("running_tasks", view.running_tasks),
     ];
@@ -264,6 +279,12 @@ fn draw_owner_detail(frame: &mut Frame, area: Rect, view: &StatusView) {
         kv_row("issued_tasks", view.issued_tasks),
         kv_row("max_retry", view.owner_max_retry_attempts),
         kv_row("retry_cooldown_ms", view.owner_retry_cooldown_ms),
+        kv_row(
+            "blocked_reason",
+            view.latest_project_blocked_reason
+                .clone()
+                .unwrap_or_else(|| "none".to_owned()),
+        ),
     ];
     frame.render_widget(role_table(" Owner ", rows), area);
 }

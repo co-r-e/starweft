@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use multiaddr::Multiaddr;
 use serde_json::Value;
-use starweft_crypto::{StoredKeypair, verifying_key_from_base64};
+use starweft_crypto::{StoredKeypair, verify_json, verifying_key_from_base64};
 use starweft_id::{ActorId, NodeId, ProjectId, StopId, TaskId};
 use starweft_observation::{PlannedTaskSpec, estimate_task_duration_sec};
 use starweft_openclaw_bridge::{
@@ -19,17 +19,18 @@ use starweft_openclaw_bridge::{
 use starweft_p2p::{RelayMode, RuntimeTopology, RuntimeTransport, TransportDriver};
 use starweft_protocol::{
     ApprovalApplied, ApprovalGranted, ApprovalScopeType, CapabilityAdvertisement, CapabilityQuery,
-    Envelope, EvaluationIssued, EvaluationPolicy, JoinAccept, JoinOffer, JoinReject, MsgType,
-    PROTOCOL_VERSION, ParticipantPolicy, ProjectCharter, PublishIntentProposed,
+    Envelope, EvaluationIssued, EvaluationPolicy, ExecutionMode, JoinAccept, JoinOffer, JoinReject,
+    MsgType, PROTOCOL_VERSION, ParticipantPolicy, ProjectCharter, PublishIntentProposed,
     PublishIntentSkipped, PublishResultRecorded, RoutedBody, SnapshotRequest, SnapshotResponse,
-    SnapshotScopeType, StopAck, StopAckState, StopComplete, StopFinalState, StopOrder,
-    StopScopeType, TaskDelegated, TaskExecutionStatus, TaskProgress, TaskResultSubmitted,
-    UnsignedEnvelope, VisionConstraints, VisionIntent, WireEnvelope,
+    SnapshotScopeType, StopAck, StopAckState, StopAuthorityPayload, StopComplete, StopFinalState,
+    StopOrder, StopScopeType, TaskDelegated, TaskExecutionStatus, TaskProgress,
+    TaskResultSubmitted, UnsignedEnvelope, VisionConstraints, VisionIntent, WireEnvelope,
 };
 use starweft_runtime::RuntimePipeline;
 use starweft_stop::{classify_stop_impact, should_owner_emit_completion};
 use starweft_store::{
-    LocalIdentityRecord, PeerAddressRecord, STORE_SCHEMA_VERSION_LABEL, Store, VisionRecord,
+    LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, STORE_SCHEMA_VERSION_LABEL, Store,
+    VisionRecord,
 };
 use time::OffsetDateTime;
 
@@ -39,10 +40,13 @@ use crate::config::{
 };
 use crate::decision::{self, FailureAction};
 use crate::helpers::{
-    BootstrapPeerParams, budget_mode_is_minimal, configured_actor_key_path,
+    BootstrapPeerParams, approval_state_is_approved, budget_mode_is_minimal,
+    configured_actor_key_path, ensure_peer_target_is_trusted,
+    human_intervention_requires_approval,
     local_advertised_capabilities, local_listen_addresses, local_stop_public_key_helper,
-    persist_task_artifact, policy_blocking_reason, project_vision_constraints_or_default,
-    read_keypair, sync_discovery_seed_placeholders, upsert_bootstrap_peer,
+    peer_is_locally_trusted, persist_task_artifact, policy_blocking_reason,
+    project_vision_constraints_or_default, read_keypair, resolve_execution_mode,
+    submission_is_approved, sync_discovery_seed_placeholders, upsert_bootstrap_peer,
     worker_supported_capabilities, write_runtime_log,
 };
 use crate::project::approve_execution_scope;
@@ -456,6 +460,7 @@ pub(crate) struct InboxProcessingContext<'a> {
 const OUTBOX_RETRY_DELAY_MILLIS: i64 = 250;
 const OUTBOX_MAX_DELIVERY_ATTEMPTS: u64 = 20;
 const ENVELOPE_EXPIRY_SKEW_SEC: i64 = 30;
+const CAPABILITY_MESSAGE_TTL_SEC: i64 = 60;
 
 pub(crate) fn process_local_inbox(ctx: &InboxProcessingContext<'_>) -> Result<()> {
     let local_identity = ctx.store.local_identity()?;
@@ -700,6 +705,270 @@ pub(crate) fn ensure_envelope_fresh<T>(envelope: &Envelope<T>) -> Result<()> {
     Ok(())
 }
 
+fn ensure_wire_recipient_matches_local(
+    local_identity: &Option<LocalIdentityRecord>,
+    wire: &WireEnvelope,
+) -> Result<()> {
+    let Some(local_identity) = local_identity.as_ref() else {
+        return Ok(());
+    };
+    if wire.to_actor_id.as_ref() != Some(&local_identity.actor_id) {
+        bail!(
+            "[E_UNAUTHORIZED_RECIPIENT] msg_id={} to_actor_id={:?} local_actor_id={}",
+            wire.msg_id,
+            wire.to_actor_id.as_ref().map(ToString::to_string),
+            local_identity.actor_id
+        );
+    }
+    Ok(())
+}
+
+fn ensure_approval_sender_authorized(
+    store: &Store,
+    envelope: &Envelope<ApprovalGranted>,
+) -> Result<()> {
+    let project_id = match envelope.body.scope_type {
+        ApprovalScopeType::Project => envelope
+            .project_id
+            .as_ref()
+            .cloned()
+            .unwrap_or(ProjectId::new(envelope.body.scope_id.clone())?),
+        ApprovalScopeType::Task => {
+            store
+                .task_snapshot(
+                    &envelope
+                        .task_id
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or(TaskId::new(envelope.body.scope_id.clone())?),
+                )?
+                .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task が見つかりません"))?
+                .project_id
+        }
+    };
+    let principal_actor_id = store
+        .project_principal_actor_id(&project_id)?
+        .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] principal actor が見つかりません"))?;
+    if envelope.from_actor_id != principal_actor_id {
+        bail!(
+            "[E_UNAUTHORIZED_APPROVAL] from_actor_id={} principal_actor_id={}",
+            envelope.from_actor_id,
+            principal_actor_id
+        );
+    }
+    ensure_peer_target_is_trusted(store, &envelope.from_actor_id, "approval")?;
+    Ok(())
+}
+
+fn ensure_task_result_sender_authorized(
+    store: &Store,
+    envelope: &Envelope<TaskResultSubmitted>,
+) -> Result<()> {
+    let task_id = envelope
+        .task_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("task_id is required"))?;
+    let expected_actor_id = store
+        .task_assignee_actor_id(task_id)?
+        .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task が見つかりません"))?;
+    if envelope.from_actor_id != expected_actor_id {
+        bail!(
+            "[E_UNAUTHORIZED_TASK_RESULT] from_actor_id={} assignee_actor_id={}",
+            envelope.from_actor_id,
+            expected_actor_id
+        );
+    }
+    ensure_peer_target_is_trusted(store, &envelope.from_actor_id, "task_result")?;
+    Ok(())
+}
+
+fn ensure_snapshot_requester_authorized(
+    store: &Store,
+    envelope: &Envelope<SnapshotRequest>,
+) -> Result<()> {
+    match envelope.body.scope_type {
+        SnapshotScopeType::Project => {
+            let project_id = ProjectId::new(envelope.body.scope_id.clone())?;
+            let owner_actor_id = store
+                .project_owner_actor_id(&project_id)?
+                .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] owner actor が見つかりません"))?;
+            let principal_actor_id = store
+                .project_principal_actor_id(&project_id)?
+                .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] principal actor が見つかりません"))?;
+            if envelope.from_actor_id != owner_actor_id
+                && envelope.from_actor_id != principal_actor_id
+            {
+                bail!(
+                    "[E_UNAUTHORIZED_SNAPSHOT] from_actor_id={} owner_actor_id={} principal_actor_id={}",
+                    envelope.from_actor_id,
+                    owner_actor_id,
+                    principal_actor_id
+                );
+            }
+            ensure_peer_target_is_trusted(store, &envelope.from_actor_id, "snapshot")?;
+        }
+        SnapshotScopeType::Task => {
+            let task_id = TaskId::new(envelope.body.scope_id.clone())?;
+            let task_snapshot = store
+                .task_snapshot(&task_id)?
+                .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task が見つかりません"))?;
+            let owner_actor_id = store
+                .project_owner_actor_id(&task_snapshot.project_id)?
+                .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] owner actor が見つかりません"))?;
+            let principal_actor_id = store
+                .project_principal_actor_id(&task_snapshot.project_id)?
+                .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] principal actor が見つかりません"))?;
+            if envelope.from_actor_id != owner_actor_id
+                && envelope.from_actor_id != principal_actor_id
+                && envelope.from_actor_id != task_snapshot.assignee_actor_id
+            {
+                bail!(
+                    "[E_UNAUTHORIZED_SNAPSHOT] from_actor_id={} owner_actor_id={} principal_actor_id={} assignee_actor_id={}",
+                    envelope.from_actor_id,
+                    owner_actor_id,
+                    principal_actor_id,
+                    task_snapshot.assignee_actor_id
+                );
+            }
+            ensure_peer_target_is_trusted(store, &envelope.from_actor_id, "snapshot")?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_stop_sender_authorized(store: &Store, envelope: &Envelope<StopOrder>) -> Result<()> {
+    let project_id = envelope
+        .project_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("project_id is required"))?;
+    let stop_authority_actor_id = store
+        .project_stop_authority_actor_id(project_id)?
+        .or_else(|| store.project_principal_actor_id(project_id).ok().flatten());
+    let owner_actor_id = store
+        .project_owner_actor_id(project_id)?
+        .or_else(|| store.project_task_owner_actor_id(project_id).ok().flatten());
+    let owner_actor_id = owner_actor_id
+        .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] owner actor が見つかりません"))?;
+    let stop_authority_actor_id = stop_authority_actor_id.unwrap_or_else(|| owner_actor_id.clone());
+    if envelope.from_actor_id != stop_authority_actor_id && envelope.from_actor_id != owner_actor_id
+    {
+        bail!(
+            "[E_UNAUTHORIZED_STOP] from_actor_id={} stop_authority_actor_id={} owner_actor_id={}",
+            envelope.from_actor_id,
+            stop_authority_actor_id,
+            owner_actor_id
+        );
+    }
+    ensure_peer_target_is_trusted(store, &envelope.from_actor_id, "stop")?;
+    if envelope.body.authority_actor_id != stop_authority_actor_id {
+        bail!(
+            "[E_STOP_AUTHORITY_MISMATCH] authority_actor_id={} expected_stop_authority_actor_id={}",
+            envelope.body.authority_actor_id,
+            stop_authority_actor_id
+        );
+    }
+    let stop_authority_identity =
+        store
+            .peer_identity(&stop_authority_actor_id)?
+            .ok_or_else(|| {
+                anyhow!("[E_STOP_AUTHORITY_MISSING] stop authority peer が見つかりません")
+            })?;
+    let stop_public_key = stop_authority_identity
+        .stop_public_key
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "[E_STOP_KEY_REQUIRED] stop authority stop_public_key が未登録です: {stop_authority_actor_id}"
+            )
+        })?;
+    let verification_key = verifying_key_from_base64(stop_public_key)?;
+    verify_json(
+        &verification_key,
+        &stop_authority_payload(envelope)?,
+        &envelope.body.authority_signature,
+    )?;
+    Ok(())
+}
+
+fn stop_authority_payload(envelope: &Envelope<StopOrder>) -> Result<StopAuthorityPayload> {
+    Ok(StopAuthorityPayload {
+        stop_id: envelope.body.stop_id.clone(),
+        project_id: envelope
+            .project_id
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("project_id is required"))?,
+        scope_type: envelope.body.scope_type.clone(),
+        scope_id: envelope.body.scope_id.clone(),
+        reason_code: envelope.body.reason_code.clone(),
+        reason_text: envelope.body.reason_text.clone(),
+        authority_actor_id: envelope.body.authority_actor_id.clone(),
+        issued_at: envelope.body.issued_at,
+    })
+}
+
+fn ensure_owner_routed_sender_trusted(
+    config: &Config,
+    local_identity: &Option<LocalIdentityRecord>,
+    peer_identity: &PeerIdentityRecord,
+    wire: &WireEnvelope,
+) -> Result<()> {
+    let Some(local_identity) = local_identity.as_ref() else {
+        return Ok(());
+    };
+    if config.node.role == NodeRole::Owner
+        && wire.to_actor_id.as_ref() == Some(&local_identity.actor_id)
+        && !peer_is_locally_trusted(peer_identity.trust_state)
+    {
+        bail!(
+            "[E_UNTRUSTED_PEER] discovered peer から owner 宛 routed message を受け付けません: actor_id={} msg_type={:?}",
+            peer_identity.actor_id,
+            wire.msg_type
+        );
+    }
+    Ok(())
+}
+
+fn task_execution_is_approved(
+    store: &Store,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    constraints: &VisionConstraints,
+) -> Result<bool> {
+    if !human_intervention_requires_approval(constraints) || submission_is_approved(constraints) {
+        return Ok(true);
+    }
+    let approved = store
+        .task_snapshot(task_id)?
+        .filter(|snapshot| snapshot.project_id == *project_id)
+        .is_some_and(|snapshot| approval_state_is_approved(&snapshot.approval.state));
+    Ok(approved)
+}
+
+fn task_policy_blocking_reason(
+    store: &Store,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    constraints: &VisionConstraints,
+) -> Result<Option<(&'static str, &'static str)>> {
+    if human_intervention_requires_approval(constraints)
+        && !task_execution_is_approved(store, project_id, task_id, constraints)?
+    {
+        return Ok(Some((
+            "human_approval_required",
+            "unauthorized execution without required human approval",
+        )));
+    }
+    Ok(policy_blocking_reason(constraints).filter(|(code, _)| *code != "human_approval_required"))
+}
+
+fn project_execution_mode(store: &Store, project_id: &ProjectId) -> Result<ExecutionMode> {
+    Ok(resolve_execution_mode(
+        &project_vision_constraints_or_default(store, project_id)?,
+        ExecutionMode::Full,
+    ))
+}
+
 pub(crate) struct IncomingWireContext<'a> {
     pub(crate) config: &'a Config,
     pub(crate) paths: &'a DataPaths,
@@ -754,11 +1023,14 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
                 wire.from_actor_id
             )
         })?;
+    ensure_owner_routed_sender_trusted(ctx.config, ctx.local_identity, &peer_identity, &wire)?;
+    ensure_wire_recipient_matches_local(ctx.local_identity, &wire)?;
     let runtime = RuntimePipeline::new(ctx.store);
 
     let pk = &peer_identity.public_key;
     match wire.msg_type {
-        MsgType::CapabilityQuery | MsgType::CapabilityAdvertisement => {}
+        // CapabilityQuery/CapabilityAdvertisement are handled above with early return.
+        MsgType::CapabilityQuery | MsgType::CapabilityAdvertisement => unreachable!(),
         MsgType::VisionIntent => {
             let envelope = verify_and_decode::<VisionIntent>(wire, pk)?;
             if ctx.config.node.role == NodeRole::Owner {
@@ -773,11 +1045,14 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::ProjectCharter => {
             let envelope = verify_and_decode::<ProjectCharter>(wire, pk)?;
+
             runtime.ingest_project_charter(&envelope)?;
         }
         MsgType::ApprovalGranted => {
             let envelope = verify_and_decode::<ApprovalGranted>(wire, pk)?;
+
             if ctx.config.node.role == NodeRole::Owner {
+                ensure_approval_sender_authorized(ctx.store, &envelope)?;
                 handle_owner_approval_granted(
                     ctx.store,
                     ctx.local_identity,
@@ -790,10 +1065,12 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::ApprovalApplied => {
             let envelope = verify_and_decode::<ApprovalApplied>(wire, pk)?;
+
             runtime.ingest_approval_applied(&envelope)?;
         }
         MsgType::JoinOffer => {
             let envelope = verify_and_decode::<JoinOffer>(wire, pk)?;
+
             if ctx.config.node.role == NodeRole::Worker {
                 handle_worker_join_offer(
                     ctx.config,
@@ -808,6 +1085,7 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::JoinAccept => {
             let envelope = verify_and_decode::<JoinAccept>(wire, pk)?;
+
             if ctx.config.node.role == NodeRole::Owner {
                 handle_owner_join_accept(
                     ctx.config,
@@ -822,6 +1100,7 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::JoinReject => {
             let envelope = verify_and_decode::<JoinReject>(wire, pk)?;
+
             if ctx.config.node.role == NodeRole::Owner {
                 handle_owner_join_reject(
                     ctx.config,
@@ -836,6 +1115,7 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::TaskDelegated => {
             let envelope = verify_and_decode::<TaskDelegated>(wire, pk)?;
+
             if ctx.config.node.role == NodeRole::Worker {
                 handle_worker_task(
                     ctx.config,
@@ -852,11 +1132,14 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::TaskProgress => {
             let envelope = verify_and_decode::<TaskProgress>(wire, pk)?;
+
             runtime.ingest_task_progress(&envelope)?;
         }
         MsgType::TaskResultSubmitted => {
             let envelope = verify_and_decode::<TaskResultSubmitted>(wire, pk)?;
+
             if ctx.config.node.role == NodeRole::Owner {
+                ensure_task_result_sender_authorized(ctx.store, &envelope)?;
                 handle_owner_task_result(
                     ctx.config,
                     ctx.store,
@@ -870,23 +1153,29 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::EvaluationIssued => {
             let envelope = verify_and_decode::<EvaluationIssued>(wire, pk)?;
+
             runtime.ingest_evaluation_issued(&envelope)?;
         }
         MsgType::PublishIntentProposed => {
             let envelope = verify_and_decode::<PublishIntentProposed>(wire, pk)?;
+
             runtime.ingest_publish_intent_proposed(&envelope)?;
         }
         MsgType::PublishIntentSkipped => {
             let envelope = verify_and_decode::<PublishIntentSkipped>(wire, pk)?;
+
             runtime.ingest_publish_intent_skipped(&envelope)?;
         }
         MsgType::PublishResultRecorded => {
             let envelope = verify_and_decode::<PublishResultRecorded>(wire, pk)?;
+
             runtime.ingest_publish_result_recorded(&envelope)?;
         }
         MsgType::SnapshotRequest => {
             let envelope = verify_and_decode::<SnapshotRequest>(wire, pk)?;
+
             if ctx.config.node.role == NodeRole::Owner {
+                ensure_snapshot_requester_authorized(ctx.store, &envelope)?;
                 handle_owner_snapshot_request(
                     ctx.store,
                     ctx.local_identity,
@@ -897,20 +1186,13 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::SnapshotResponse => {
             let envelope = verify_and_decode::<SnapshotResponse>(wire, pk)?;
+
             runtime.ingest_snapshot_response(&envelope)?;
         }
         MsgType::StopOrder => {
-            let stop_key = match peer_identity.stop_public_key.as_deref() {
-                Some(key) => key,
-                None => {
-                    tracing::warn!(
-                        from_actor = %wire.from_actor_id,
-                        "stop_public_key が未設定のため message signing key で StopOrder を検証します"
-                    );
-                    pk
-                }
-            };
-            let envelope = verify_and_decode::<StopOrder>(wire, stop_key)?;
+            let envelope = verify_and_decode::<StopOrder>(wire, pk)?;
+
+            ensure_stop_sender_authorized(ctx.store, &envelope)?;
             match ctx.config.node.role {
                 NodeRole::Owner => {
                     handle_owner_stop_order(ctx.store, ctx.local_identity, ctx.actor_key, envelope)?
@@ -927,6 +1209,7 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::StopAck => {
             let envelope = verify_and_decode::<StopAck>(wire, pk)?;
+
             runtime.ingest_stop_ack(&envelope)?;
             if ctx.config.node.role == NodeRole::Owner {
                 relay_stop_ack_to_principal(
@@ -939,6 +1222,7 @@ pub(crate) fn route_incoming_wire(ctx: &IncomingWireContext<'_>, wire: WireEnvel
         }
         MsgType::StopComplete => {
             let envelope = verify_and_decode::<StopComplete>(wire, pk)?;
+
             runtime.ingest_stop_complete(&envelope)?;
             if ctx.config.node.role == NodeRole::Owner {
                 relay_stop_complete_to_principal(
@@ -1068,6 +1352,7 @@ pub(crate) struct RemoteApprovalParams<'a> {
 pub(crate) fn queue_remote_approval(
     params: RemoteApprovalParams<'_>,
 ) -> Result<RemoteApprovalOutput> {
+    ensure_peer_target_is_trusted(params.store, &params.owner_actor_id, "approval")?;
     let approval = UnsignedEnvelope::new(
         params.approver_actor_id.clone(),
         Some(params.owner_actor_id.clone()),
@@ -1140,6 +1425,7 @@ fn queue_owner_planned_task_with_id(
     depends_on: Vec<TaskId>,
     task_id: TaskId,
 ) -> Result<TaskId> {
+    let execution_mode = project_execution_mode(ctx.store, ctx.project_id)?;
     let task = UnsignedEnvelope::new(
         ctx.owner_actor_id.clone(),
         Some(ctx.owner_actor_id.clone()),
@@ -1150,6 +1436,7 @@ fn queue_owner_planned_task_with_id(
             description: task_spec.description,
             objective: task_spec.objective,
             required_capability: task_spec.required_capability,
+            execution_mode,
             input_payload: task_spec.input_payload,
             expected_output_schema: task_spec.expected_output_schema,
         },
@@ -1313,6 +1600,14 @@ pub(crate) fn handle_owner_vision(
     if store.inbox_message_processed(&envelope.msg_id)? {
         return Ok(());
     }
+    let mut effective_vision = envelope.body.clone();
+    if effective_vision.constraints.execution_mode.is_none() {
+        effective_vision.constraints.execution_mode = Some(config.openclaw.default_execution_mode);
+    }
+    let execution_mode = resolve_execution_mode(
+        &effective_vision.constraints,
+        config.openclaw.default_execution_mode,
+    );
     let vision_id = envelope
         .vision_id
         .clone()
@@ -1320,9 +1615,9 @@ pub(crate) fn handle_owner_vision(
     store.save_vision(&VisionRecord {
         vision_id: vision_id.clone(),
         principal_actor_id: envelope.from_actor_id.clone(),
-        title: envelope.body.title.clone(),
-        raw_vision_text: envelope.body.raw_vision_text.clone(),
-        constraints: serde_json::to_value(&envelope.body.constraints)?,
+        title: effective_vision.title.clone(),
+        raw_vision_text: effective_vision.raw_vision_text.clone(),
+        constraints: serde_json::to_value(&effective_vision.constraints)?,
         status: "accepted".to_owned(),
         created_at: envelope.created_at,
     })?;
@@ -1337,12 +1632,12 @@ pub(crate) fn handle_owner_vision(
             vision_id: vision_id.clone(),
             principal_actor_id: envelope.from_actor_id.clone(),
             owner_actor_id: local_identity.actor_id.clone(),
-            title: format!("{} project", envelope.body.title),
-            objective: envelope.body.raw_vision_text.clone(),
+            title: format!("{} project", effective_vision.title),
+            objective: effective_vision.raw_vision_text.clone(),
             stop_authority_actor_id: envelope.from_actor_id.clone(),
+            execution_mode,
             participant_policy: ParticipantPolicy {
-                external_agents_allowed: envelope
-                    .body
+                external_agents_allowed: effective_vision
                     .constraints
                     .allow_external_agents
                     .unwrap_or(true),
@@ -1364,13 +1659,13 @@ pub(crate) fn handle_owner_vision(
     let initial_tasks = if decision::planning_runs_on_worker(config) {
         vec![decision::planner_task_spec(
             config,
-            &envelope.body,
+            &effective_vision,
             &config.compatibility.bridge_capability_version,
         )]
     } else {
         derive_planned_tasks(
             config,
-            &envelope.body,
+            &effective_vision,
             &config.compatibility.bridge_capability_version,
         )?
     };
@@ -1455,13 +1750,21 @@ pub(crate) fn handle_worker_task(
 
     // Spawn task execution in background thread
     let openclaw_enabled = config.openclaw.enabled;
+    let execution_mode = envelope.body.execution_mode;
+    let controlled_stdio_passthrough =
+        execution_mode == ExecutionMode::Full || config.openclaw.controlled_stdio_passthrough;
     let attachment = OpenClawAttachment {
         bin: config.openclaw.bin.clone(),
         working_dir: config.openclaw.working_dir.clone(),
         timeout_sec: Some(config.openclaw.timeout_sec),
+        clear_env: execution_mode == ExecutionMode::Controlled,
+        env_allowlist: if execution_mode == ExecutionMode::Controlled {
+            config.openclaw.controlled_env_allowlist.clone()
+        } else {
+            Vec::new()
+        },
     };
     let task_title = envelope.body.title.clone();
-    let task_input = envelope.body.input_payload.clone();
     let request = BridgeTaskRequest {
         title: envelope.body.title.clone(),
         description: envelope.body.description.clone(),
@@ -1477,7 +1780,7 @@ pub(crate) fn handle_worker_task(
     worker_runtime.register_task(&task_id, Arc::clone(&cancel_flag));
 
     thread::spawn(move || {
-        let (task_status, bridge_response) = if openclaw_enabled {
+        let (task_status, mut bridge_response) = if openclaw_enabled {
             match execute_task_with_cancel_flag(&attachment, &request, cancel_flag.as_ref()) {
                 Ok(response) => (TaskExecutionStatus::Completed, response),
                 Err(error)
@@ -1499,12 +1802,21 @@ pub(crate) fn handle_worker_task(
                 Err(error) => (
                     TaskExecutionStatus::Failed,
                     BridgeTaskResponse {
-                        summary: format!("bridge failed: {error}"),
-                        output_payload: serde_json::json!({ "bridge_error": error.to_string() }),
+                        summary: format!(
+                            "bridge failed: {}",
+                            sanitize_bridge_error(&error.to_string(), controlled_stdio_passthrough)
+                        ),
+                        output_payload: serde_json::json!({
+                            "bridge_error": sanitize_bridge_error(&error.to_string(), controlled_stdio_passthrough)
+                        }),
                         artifact_refs: Vec::new(),
                         progress_updates: Vec::new(),
                         raw_stdout: String::new(),
-                        raw_stderr: error.to_string(),
+                        raw_stderr: if controlled_stdio_passthrough {
+                            error.to_string()
+                        } else {
+                            String::new()
+                        },
                     },
                 ),
             }
@@ -1515,7 +1827,6 @@ pub(crate) fn handle_worker_task(
                     summary: format!("bridge failed: openclaw disabled for {task_title}"),
                     output_payload: serde_json::json!({
                         "bridge_error": "openclaw disabled",
-                        "input": task_input,
                     }),
                     artifact_refs: Vec::new(),
                     progress_updates: Vec::new(),
@@ -1524,6 +1835,10 @@ pub(crate) fn handle_worker_task(
                 },
             )
         };
+        if !controlled_stdio_passthrough {
+            bridge_response.raw_stdout.clear();
+            bridge_response.raw_stderr.clear();
+        }
 
         let _ = tx.send(TaskCompletion {
             project_id: project_id_clone,
@@ -1767,6 +2082,18 @@ pub(crate) fn append_stderr_line(stderr: &str, line: &str) -> String {
     }
 }
 
+pub(crate) fn sanitize_bridge_error(error: &str, passthrough_stdio: bool) -> String {
+    if passthrough_stdio {
+        return error.to_owned();
+    }
+    error
+        .split(" stderr=")
+        .next()
+        .unwrap_or(error)
+        .trim()
+        .to_owned()
+}
+
 pub(crate) fn collect_json_schema_validation_errors(
     schema: &Value,
     payload: &Value,
@@ -1936,9 +2263,10 @@ pub(crate) fn handle_owner_task_result(
                     .ok_or_else(|| {
                         anyhow!("[E_PROJECT_NOT_FOUND] principal actor が見つかりません")
                     })?;
-                if let Some(next_worker_actor_id) = select_next_worker_actor_id(
+                if let Some(next_worker_actor_id) = select_worker_for_task(
                     store,
                     &project_id,
+                    &task_id,
                     &local_identity.actor_id,
                     &principal_actor_id,
                     &[envelope.from_actor_id.clone()],
@@ -2106,6 +2434,8 @@ pub(crate) fn handle_worker_join_offer(
             local_identity.actor_id.clone(),
             Some(envelope.from_actor_id),
             JoinAccept {
+                offer_id: envelope.body.offer_id.clone(),
+                task_id: envelope.body.task_id.clone(),
                 accepted: true,
                 capabilities_confirmed: worker_supported_capabilities(config),
             },
@@ -2116,6 +2446,7 @@ pub(crate) fn handle_worker_join_offer(
                 .clone()
                 .ok_or_else(|| anyhow!("project_id is required"))?,
         )
+        .with_task_id(envelope.body.task_id.clone())
         .sign(actor_key)?;
         runtime.queue_outgoing(&response)?;
     } else {
@@ -2123,6 +2454,8 @@ pub(crate) fn handle_worker_join_offer(
             local_identity.actor_id.clone(),
             Some(envelope.from_actor_id),
             JoinReject {
+                offer_id: envelope.body.offer_id.clone(),
+                task_id: envelope.body.task_id.clone(),
                 accepted: false,
                 reason: reject_reason.unwrap_or_else(|| "capability mismatch".to_owned()),
             },
@@ -2133,6 +2466,7 @@ pub(crate) fn handle_worker_join_offer(
                 .clone()
                 .ok_or_else(|| anyhow!("project_id is required"))?,
         )
+        .with_task_id(envelope.body.task_id.clone())
         .sign(actor_key)?;
         runtime.queue_outgoing(&response)?;
     }
@@ -2188,6 +2522,9 @@ fn process_mdns_discoveries(
                 requested_at: OffsetDateTime::now_utc(),
             },
         )
+        .with_expires_at(
+            OffsetDateTime::now_utc() + time::Duration::seconds(CAPABILITY_MESSAGE_TTL_SEC),
+        )
         .sign(actor_key)?;
         runtime.queue_outgoing(&query)?;
     }
@@ -2214,7 +2551,7 @@ pub(crate) fn request_peer_capabilities(
     let runtime = RuntimePipeline::new(store);
     let mut seen_actor_ids = HashSet::new();
     for peer in store.list_peer_addresses()? {
-        if !seen_actor_ids.insert(peer.actor_id.to_string()) {
+        if !seen_actor_ids.insert(peer.actor_id.clone()) {
             continue;
         }
         if peer.actor_id == identity.actor_id {
@@ -2231,6 +2568,9 @@ pub(crate) fn request_peer_capabilities(
                 listen_addresses: listen_addresses.clone(),
                 requested_at: OffsetDateTime::now_utc(),
             },
+        )
+        .with_expires_at(
+            OffsetDateTime::now_utc() + time::Duration::seconds(CAPABILITY_MESSAGE_TTL_SEC),
         )
         .sign(actor_key)?;
         runtime.queue_outgoing(&query)?;
@@ -2261,7 +2601,7 @@ pub(crate) fn announce_local_capabilities(
     let runtime = RuntimePipeline::new(store);
     let mut seen_actor_ids = HashSet::new();
     for peer in store.list_peer_addresses()? {
-        if !seen_actor_ids.insert(peer.actor_id.to_string()) {
+        if !seen_actor_ids.insert(peer.actor_id.clone()) {
             continue;
         }
         if peer.actor_id == identity.actor_id {
@@ -2278,6 +2618,9 @@ pub(crate) fn announce_local_capabilities(
                 listen_addresses: listen_addresses.clone(),
                 advertised_at: OffsetDateTime::now_utc(),
             },
+        )
+        .with_expires_at(
+            OffsetDateTime::now_utc() + time::Duration::seconds(CAPABILITY_MESSAGE_TTL_SEC),
         )
         .sign(actor_key)?;
         runtime.queue_outgoing(&advertisement)?;
@@ -2352,6 +2695,9 @@ pub(crate) fn handle_capability_query(
             listen_addresses,
             advertised_at: OffsetDateTime::now_utc(),
         },
+    )
+    .with_expires_at(
+        OffsetDateTime::now_utc() + time::Duration::seconds(CAPABILITY_MESSAGE_TTL_SEC),
     )
     .sign(actor_key)?;
     RuntimePipeline::new(store).queue_outgoing(&advertisement)?;
@@ -2509,16 +2855,31 @@ pub(crate) fn handle_owner_join_accept(
         .project_id
         .clone()
         .ok_or_else(|| anyhow!("project_id is required"))?;
-    let Some(task_id) = store.next_queued_task_for_actor(&project_id, &local_identity.actor_id)?
-    else {
+    if !store.join_offer_exists(
+        &envelope.body.offer_id,
+        &project_id,
+        &envelope.body.task_id,
+        &local_identity.actor_id,
+        &envelope.from_actor_id,
+    )? {
         runtime.mark_inbox_message_processed(&envelope.msg_id)?;
         return Ok(());
-    };
+    }
+    let task_id = envelope.body.task_id.clone();
+    if !matches!(
+        store.task_status(&task_id)?,
+        Some(starweft_protocol::TaskStatus::Queued)
+    ) {
+        runtime.mark_inbox_message_processed(&envelope.msg_id)?;
+        return Ok(());
+    }
     let task_blueprint = store
         .task_blueprint(&task_id)?
         .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task blueprint が見つかりません"))?;
     let constraints = project_vision_constraints_or_default(store, &project_id)?;
-    if let Some((policy_code, summary)) = policy_blocking_reason(&constraints) {
+    if let Some((policy_code, summary)) =
+        task_policy_blocking_reason(store, &project_id, &task_id, &constraints)?
+    {
         record_owner_policy_blocked_task_result(&PolicyBlockedTaskParams {
             store,
             actor_key,
@@ -2534,6 +2895,13 @@ pub(crate) fn handle_owner_join_accept(
         return Ok(());
     }
 
+    let owner_ctx = OwnerContext {
+        store,
+        actor_key,
+        owner_actor_id: &local_identity.actor_id,
+        project_id: &project_id,
+    };
+    queue_project_charter_for_actor(&owner_ctx, &envelope.from_actor_id)?;
     let task = UnsignedEnvelope::new(
         local_identity.actor_id.clone(),
         Some(envelope.from_actor_id),
@@ -2569,13 +2937,24 @@ pub(crate) fn handle_owner_join_reject(
         .project_id
         .clone()
         .ok_or_else(|| anyhow!("project_id is required"))?;
+    if !store.join_offer_exists(
+        &envelope.body.offer_id,
+        &project_id,
+        &envelope.body.task_id,
+        &local_identity.actor_id,
+        &envelope.from_actor_id,
+    )? {
+        runtime.mark_inbox_message_processed(&envelope.msg_id)?;
+        return Ok(());
+    }
     let principal_actor_id = store
         .project_principal_actor_id(&project_id)?
         .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] principal actor が見つかりません"))?;
 
-    if let Some(next_worker_actor_id) = select_next_worker_actor_id(
+    if let Some(next_worker_actor_id) = select_worker_for_task(
         store,
         &project_id,
+        &envelope.body.task_id,
         &local_identity.actor_id,
         &principal_actor_id,
         &[envelope.from_actor_id.clone()],
@@ -2587,7 +2966,12 @@ pub(crate) fn handle_owner_join_reject(
             owner_actor_id: &local_identity.actor_id,
             project_id: &project_id,
         };
-        dispatch_next_task_offer(&owner_ctx, next_worker_actor_id)?;
+        if matches!(
+            store.task_status(&envelope.body.task_id)?,
+            Some(starweft_protocol::TaskStatus::Queued)
+        ) {
+            dispatch_specific_task_offer(&owner_ctx, next_worker_actor_id, &envelope.body.task_id)?;
+        }
     }
 
     runtime.mark_inbox_message_processed(&envelope.msg_id)?;
@@ -2627,7 +3011,9 @@ pub(crate) fn dispatch_next_task_offer(
             .task_blueprint(&task_id)?
             .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task blueprint が見つかりません"))?;
 
-        if let Some((policy_code, summary)) = policy_blocking_reason(&constraints) {
+        if let Some((policy_code, summary)) =
+            task_policy_blocking_reason(ctx.store, ctx.project_id, &task_id, &constraints)?
+        {
             record_owner_policy_blocked_task_result(&PolicyBlockedTaskParams {
                 store: ctx.store,
                 actor_key: ctx.actor_key,
@@ -2643,21 +3029,89 @@ pub(crate) fn dispatch_next_task_offer(
         }
 
         let runtime = RuntimePipeline::new(ctx.store);
-        let join_offer = UnsignedEnvelope::new(
+        let mut join_offer = UnsignedEnvelope::new(
             ctx.owner_actor_id.clone(),
             Some(worker_actor_id.clone()),
             JoinOffer {
+                offer_id: starweft_id::MessageId::generate(),
+                task_id: task_id.clone(),
                 required_capabilities: vec![task_blueprint.required_capability.clone()],
                 task_outline: task_blueprint.title,
                 expected_duration_sec: estimate_task_duration_sec(&task_blueprint.objective),
             },
         )
         .with_project_id(ctx.project_id.clone())
-        .sign(ctx.actor_key)?;
+        .with_task_id(task_id);
+        join_offer.body.offer_id = join_offer.msg_id.clone();
+        let join_offer = join_offer.sign(ctx.actor_key)?;
         ctx.store.append_task_event(&join_offer)?;
         runtime.queue_outgoing(&join_offer)?;
         return Ok(true);
     }
+}
+
+pub(crate) fn dispatch_specific_task_offer(
+    ctx: &OwnerContext<'_>,
+    worker_actor_id: ActorId,
+    task_id: &TaskId,
+) -> Result<bool> {
+    let constraints = project_vision_constraints_or_default(ctx.store, ctx.project_id)?;
+    let task_blueprint = ctx
+        .store
+        .task_blueprint(task_id)?
+        .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task blueprint が見つかりません"))?;
+    if let Some((policy_code, summary)) =
+        task_policy_blocking_reason(ctx.store, ctx.project_id, task_id, &constraints)?
+    {
+        record_owner_policy_blocked_task_result(&PolicyBlockedTaskParams {
+            store: ctx.store,
+            actor_key: ctx.actor_key,
+            owner_actor_id: ctx.owner_actor_id,
+            project_id: ctx.project_id,
+            task_id,
+            required_capability: &task_blueprint.required_capability,
+            constraints: &constraints,
+            policy_code,
+            summary,
+        })?;
+        return Ok(false);
+    }
+    let runtime = RuntimePipeline::new(ctx.store);
+    let mut join_offer = UnsignedEnvelope::new(
+        ctx.owner_actor_id.clone(),
+        Some(worker_actor_id),
+        JoinOffer {
+            offer_id: starweft_id::MessageId::generate(),
+            task_id: task_id.clone(),
+            required_capabilities: vec![task_blueprint.required_capability.clone()],
+            task_outline: task_blueprint.title,
+            expected_duration_sec: estimate_task_duration_sec(&task_blueprint.objective),
+        },
+    )
+    .with_project_id(ctx.project_id.clone())
+    .with_task_id(task_id.clone());
+    join_offer.body.offer_id = join_offer.msg_id.clone();
+    let join_offer = join_offer.sign(ctx.actor_key)?;
+    ctx.store.append_task_event(&join_offer)?;
+    runtime.queue_outgoing(&join_offer)?;
+    Ok(true)
+}
+
+fn queue_project_charter_for_actor(ctx: &OwnerContext<'_>, actor_id: &ActorId) -> Result<()> {
+    let charter = ctx
+        .store
+        .project_charter(ctx.project_id)?
+        .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] project charter が見つかりません"))?;
+    let envelope = UnsignedEnvelope::new(
+        ctx.owner_actor_id.clone(),
+        Some(actor_id.clone()),
+        charter.clone(),
+    )
+    .with_project_id(ctx.project_id.clone())
+    .with_vision_id(charter.vision_id.clone())
+    .sign(ctx.actor_key)?;
+    RuntimePipeline::new(ctx.store).queue_outgoing(&envelope)?;
+    Ok(())
 }
 
 pub(crate) fn select_next_worker_actor_id(
@@ -2667,44 +3121,59 @@ pub(crate) fn select_next_worker_actor_id(
     principal_actor_id: &ActorId,
     excluded_actor_ids: &[ActorId],
 ) -> Result<Option<ActorId>> {
+    let Some(task_id) = store.next_queued_task_for_actor(project_id, owner_actor_id)? else {
+        return Ok(None);
+    };
+    select_worker_for_task(
+        store,
+        project_id,
+        &task_id,
+        owner_actor_id,
+        principal_actor_id,
+        excluded_actor_ids,
+    )
+}
+
+pub(crate) fn select_worker_for_task(
+    store: &Store,
+    _project_id: &starweft_id::ProjectId,
+    task_id: &TaskId,
+    owner_actor_id: &ActorId,
+    principal_actor_id: &ActorId,
+    excluded_actor_ids: &[ActorId],
+) -> Result<Option<ActorId>> {
     let mut excluded = excluded_actor_ids.to_vec();
     excluded.push(owner_actor_id.clone());
     excluded.push(principal_actor_id.clone());
 
     let required_capability = store
-        .next_queued_task_for_actor(project_id, owner_actor_id)?
-        .map(|task_id| {
-            store
-                .task_blueprint(&task_id)?
-                .map(|task| task.required_capability)
-                .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task blueprint が見つかりません"))
-        })
-        .transpose()?;
+        .task_blueprint(task_id)?
+        .map(|task| task.required_capability)
+        .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task blueprint が見つかりません"))?;
     let mut seen_actor_ids = HashSet::new();
     let mut candidates = Vec::new();
     for peer in store.list_peer_addresses()? {
         if excluded.iter().any(|actor_id| actor_id == &peer.actor_id) {
             continue;
         }
-        if !seen_actor_ids.insert(peer.actor_id.to_string()) {
+        if !seen_actor_ids.insert(peer.actor_id.clone()) {
             continue;
         }
-        let capability_rank = match &required_capability {
-            Some(required) => match store.peer_identity(&peer.actor_id)? {
-                Some(identity) if !identity.capabilities.is_empty() => {
-                    if identity
-                        .capabilities
-                        .iter()
-                        .any(|capability| capability == required)
-                    {
-                        0_u8
-                    } else {
-                        2_u8
-                    }
-                }
-                _ => 1_u8,
-            },
-            None => 0_u8,
+        let Some(identity) = store.peer_identity(&peer.actor_id)? else {
+            continue;
+        };
+        if !peer_is_locally_trusted(identity.trust_state) {
+            continue;
+        }
+        let capability_rank = if !identity.capabilities.is_empty()
+            && !identity
+                .capabilities
+                .iter()
+                .any(|capability| capability == &required_capability)
+        {
+            2_u8
+        } else {
+            0_u8
         };
         candidates.push((
             capability_rank,
@@ -2853,6 +3322,7 @@ pub(crate) fn queue_snapshot_request(
         .ok_or_else(|| anyhow!("[E_IDENTITY_MISSING] local_identity が初期化されていません"))?;
     let owner_actor_id =
         resolve_snapshot_owner_actor_id(store, &scope_type, scope_id, owner_actor_id.as_deref())?;
+    ensure_peer_target_is_trusted(store, &owner_actor_id, "snapshot")?;
     let actor_key = read_keypair(&configured_actor_key_path(config, paths)?)?;
     let request = UnsignedEnvelope::new(
         identity.actor_id,
@@ -3117,6 +3587,7 @@ mod tests {
                 description: "busy".to_owned(),
                 objective: "busy".to_owned(),
                 required_capability: "openclaw.execution.v1".to_owned(),
+                execution_mode: ExecutionMode::Full,
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
             },
@@ -3184,6 +3655,7 @@ mod tests {
                 description: "planner".to_owned(),
                 objective: "planner".to_owned(),
                 required_capability: "openclaw.plan.v1".to_owned(),
+                execution_mode: ExecutionMode::Full,
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
             },
@@ -3222,6 +3694,7 @@ mod tests {
                 public_key: "planner-pk".to_owned(),
                 stop_public_key: None,
                 capabilities: vec!["openclaw.plan.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Trusted,
                 updated_at: OffsetDateTime::now_utc(),
             })
             .expect("upsert planner identity");
@@ -3232,6 +3705,7 @@ mod tests {
                 public_key: "exec-pk".to_owned(),
                 stop_public_key: None,
                 capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Trusted,
                 updated_at: OffsetDateTime::now_utc(),
             })
             .expect("upsert exec identity");
@@ -3240,6 +3714,158 @@ mod tests {
             select_next_worker_actor_id(&store, &project_id, &owner_actor, &principal_actor, &[])
                 .expect("select worker");
         assert_eq!(selected, Some(planner_worker));
+    }
+
+    #[test]
+    fn select_next_worker_actor_id_skips_discovered_peers() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let keypair = StoredKeypair::generate();
+        let owner_actor = ActorId::generate();
+        let principal_actor = ActorId::generate();
+        let discovered_worker = ActorId::generate();
+        let trusted_worker = ActorId::generate();
+        let project_id = ProjectId::generate();
+
+        let delegated = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(owner_actor.clone()),
+            TaskDelegated {
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                title: "exec".to_owned(),
+                description: "exec".to_owned(),
+                objective: "exec".to_owned(),
+                required_capability: "openclaw.execution.v1".to_owned(),
+                execution_mode: ExecutionMode::Full,
+                input_payload: serde_json::json!({}),
+                expected_output_schema: serde_json::json!({}),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(TaskId::generate())
+        .sign(&keypair)
+        .expect("sign task");
+        store
+            .apply_task_delegated(&delegated)
+            .expect("apply delegated task");
+        store
+            .append_task_event(&delegated)
+            .expect("append task event");
+
+        for actor_id in [&discovered_worker, &trusted_worker] {
+            store
+                .add_peer_address(&PeerAddressRecord {
+                    actor_id: actor_id.clone(),
+                    node_id: NodeId::generate(),
+                    multiaddr: format!("/unix/{actor_id}.sock"),
+                    last_seen_at: None,
+                })
+                .expect("add peer");
+        }
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: discovered_worker.clone(),
+                node_id: NodeId::generate(),
+                public_key: "discovered-pk".to_owned(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Discovered,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("upsert discovered");
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: trusted_worker.clone(),
+                node_id: NodeId::generate(),
+                public_key: "trusted-pk".to_owned(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Trusted,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("upsert trusted");
+
+        let selected =
+            select_next_worker_actor_id(&store, &project_id, &owner_actor, &principal_actor, &[])
+                .expect("select worker");
+        assert_eq!(selected, Some(trusted_worker));
+    }
+
+    #[test]
+    fn select_next_worker_actor_id_skips_revoked_peers() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let keypair = StoredKeypair::generate();
+        let owner_actor = ActorId::generate();
+        let principal_actor = ActorId::generate();
+        let revoked_worker = ActorId::generate();
+        let trusted_worker = ActorId::generate();
+        let project_id = ProjectId::generate();
+
+        let delegated = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(owner_actor.clone()),
+            TaskDelegated {
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                title: "exec".to_owned(),
+                description: "exec".to_owned(),
+                objective: "exec".to_owned(),
+                required_capability: "openclaw.execution.v1".to_owned(),
+                execution_mode: ExecutionMode::Full,
+                input_payload: serde_json::json!({}),
+                expected_output_schema: serde_json::json!({}),
+            },
+        )
+        .with_project_id(project_id.clone())
+        .with_task_id(TaskId::generate())
+        .sign(&keypair)
+        .expect("sign task");
+        store
+            .apply_task_delegated(&delegated)
+            .expect("apply delegated task");
+        store
+            .append_task_event(&delegated)
+            .expect("append task event");
+
+        for actor_id in [&revoked_worker, &trusted_worker] {
+            store
+                .add_peer_address(&PeerAddressRecord {
+                    actor_id: actor_id.clone(),
+                    node_id: NodeId::generate(),
+                    multiaddr: format!("/unix/{actor_id}.sock"),
+                    last_seen_at: None,
+                })
+                .expect("add peer");
+        }
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: revoked_worker.clone(),
+                node_id: NodeId::generate(),
+                public_key: "revoked-pk".to_owned(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Revoked,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("upsert revoked");
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: trusted_worker.clone(),
+                node_id: NodeId::generate(),
+                public_key: "trusted-pk".to_owned(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Trusted,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("upsert trusted");
+
+        let selected =
+            select_next_worker_actor_id(&store, &project_id, &owner_actor, &principal_actor, &[])
+                .expect("select worker");
+        assert_eq!(selected, Some(trusted_worker));
     }
 
     #[test]
@@ -3279,6 +3905,7 @@ mod tests {
                 title: "Policy Project".to_owned(),
                 objective: "No external execution".to_owned(),
                 stop_authority_actor_id: principal_actor,
+                execution_mode: ExecutionMode::Full,
                 participant_policy: starweft_protocol::ParticipantPolicy {
                     external_agents_allowed: false,
                 },
@@ -3374,6 +4001,7 @@ mod tests {
                 title: "Minimal Budget Project".to_owned(),
                 objective: "Run sequentially".to_owned(),
                 stop_authority_actor_id: principal_actor,
+                execution_mode: ExecutionMode::Full,
                 participant_policy: starweft_protocol::ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -3404,6 +4032,7 @@ mod tests {
                 description: "running".to_owned(),
                 objective: "running".to_owned(),
                 required_capability: "openclaw.execution.v1".to_owned(),
+                execution_mode: ExecutionMode::Full,
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
             },
@@ -3541,6 +4170,7 @@ mod tests {
                 title: "project".to_owned(),
                 objective: "objective".to_owned(),
                 stop_authority_actor_id: ActorId::generate(),
+                execution_mode: ExecutionMode::Full,
                 participant_policy: ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -3576,6 +4206,89 @@ mod tests {
             envelope.into_wire().expect("wire"),
         )
         .expect("duplicate should short-circuit");
+    }
+
+    #[test]
+    fn route_incoming_wire_rejects_discovered_sender_for_owner() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let config = Config::for_role(NodeRole::Owner, temp.path(), None);
+        let topology = RuntimeTopology::default();
+        let transport = RuntimeTransport::local_mailbox();
+        let (task_completion_tx, _task_completion_rx) = mpsc::channel();
+        let worker_runtime = WorkerRuntimeState::default();
+        let paths = DataPaths::from_root(temp.path());
+        let owner_key = StoredKeypair::generate();
+        let remote_key = StoredKeypair::generate();
+        let owner_actor = ActorId::generate();
+        let remote_actor = ActorId::generate();
+        let owner_identity = LocalIdentityRecord {
+            actor_id: owner_actor.clone(),
+            node_id: NodeId::generate(),
+            actor_type: "owner".to_owned(),
+            display_name: "owner".to_owned(),
+            public_key: owner_key.public_key.clone(),
+            private_key_ref: "actor.key".to_owned(),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        store
+            .upsert_local_identity(&owner_identity)
+            .expect("local identity");
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: remote_actor.clone(),
+                node_id: NodeId::generate(),
+                public_key: remote_key.public_key.clone(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Discovered,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("peer identity");
+        let local_identity = Some(owner_identity.clone());
+
+        let envelope = UnsignedEnvelope::new(
+            remote_actor,
+            Some(owner_actor),
+            ProjectCharter {
+                project_id: ProjectId::generate(),
+                vision_id: VisionId::generate(),
+                principal_actor_id: ActorId::generate(),
+                owner_actor_id: ActorId::generate(),
+                title: "project".to_owned(),
+                objective: "objective".to_owned(),
+                stop_authority_actor_id: ActorId::generate(),
+                execution_mode: ExecutionMode::Full,
+                participant_policy: ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: EvaluationPolicy {
+                    quality_weight: 1.0,
+                    speed_weight: 1.0,
+                    reliability_weight: 1.0,
+                    alignment_weight: 1.0,
+                },
+            },
+        )
+        .sign(&remote_key)
+        .expect("sign envelope");
+
+        let error = route_incoming_wire(
+            &IncomingWireContext {
+                config: &config,
+                paths: &paths,
+                store: &store,
+                topology: &topology,
+                transport: &transport,
+                local_identity: &local_identity,
+                actor_key: Some(&owner_key),
+                task_completion_tx: &task_completion_tx,
+                worker_runtime: &worker_runtime,
+            },
+            envelope.into_wire().expect("wire"),
+        )
+        .expect_err("discovered owner-routed peer must be rejected");
+        assert!(error.to_string().contains("E_UNTRUSTED_PEER"));
     }
 
     #[test]
@@ -3797,6 +4510,229 @@ mod tests {
     }
 
     #[test]
+    fn queue_remote_approval_rejects_discovered_owner_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let principal_key = StoredKeypair::generate();
+        let principal_actor = ActorId::generate();
+        let owner_actor = ActorId::generate();
+
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: owner_actor.clone(),
+                node_id: NodeId::generate(),
+                public_key: StoredKeypair::generate().public_key,
+                stop_public_key: None,
+                capabilities: Vec::new(),
+                trust_state: starweft_store::PeerTrustState::Discovered,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("owner identity");
+
+        let error = queue_remote_approval(RemoteApprovalParams {
+            store: &store,
+            actor_key: &principal_key,
+            approver_actor_id: &principal_actor,
+            owner_actor_id: owner_actor.clone(),
+            scope_type: ApprovalScopeType::Project,
+            scope_id: ProjectId::generate().to_string(),
+            project_id: None,
+            task_id: None,
+        })
+        .expect_err("discovered owner target must be rejected");
+        assert!(error.to_string().contains("E_UNTRUSTED_PEER"));
+    }
+
+    #[test]
+    fn owner_relay_stop_rejects_invalid_authority_signature() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let owner_key = StoredKeypair::generate();
+        let principal_key = StoredKeypair::generate();
+        let principal_stop_key = StoredKeypair::generate();
+        let owner_actor = ActorId::generate();
+        let principal_actor = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let vision_id = VisionId::generate();
+        let now = OffsetDateTime::now_utc();
+
+        let charter = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(principal_actor.clone()),
+            ProjectCharter {
+                project_id: project_id.clone(),
+                vision_id,
+                principal_actor_id: principal_actor.clone(),
+                owner_actor_id: owner_actor.clone(),
+                title: "Stop Project".to_owned(),
+                objective: "Stop Project".to_owned(),
+                stop_authority_actor_id: principal_actor.clone(),
+                execution_mode: ExecutionMode::Full,
+                participant_policy: ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: EvaluationPolicy {
+                    quality_weight: 1.0,
+                    speed_weight: 1.0,
+                    reliability_weight: 1.0,
+                    alignment_weight: 1.0,
+                },
+            },
+        )
+        .with_project_id(project_id.clone())
+        .sign(&owner_key)
+        .expect("sign charter");
+        store
+            .apply_project_charter(&charter)
+            .expect("apply charter");
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: owner_actor.clone(),
+                node_id: NodeId::generate(),
+                public_key: owner_key.public_key.clone(),
+                stop_public_key: None,
+                capabilities: Vec::new(),
+                trust_state: starweft_store::PeerTrustState::Trusted,
+                updated_at: now,
+            })
+            .expect("owner identity");
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: principal_actor.clone(),
+                node_id: NodeId::generate(),
+                public_key: principal_key.public_key.clone(),
+                stop_public_key: Some(principal_stop_key.public_key.clone()),
+                capabilities: Vec::new(),
+                trust_state: starweft_store::PeerTrustState::Trusted,
+                updated_at: now,
+            })
+            .expect("principal identity");
+
+        let envelope = UnsignedEnvelope::new(
+            owner_actor,
+            Some(ActorId::generate()),
+            StopOrder {
+                stop_id: StopId::generate(),
+                scope_type: StopScopeType::Project,
+                scope_id: project_id.to_string(),
+                reason_code: "user".to_owned(),
+                reason_text: "stop".to_owned(),
+                issued_at: now,
+                authority_actor_id: principal_actor.clone(),
+                authority_signature: owner_key
+                    .sign_json(&serde_json::json!({"invalid": true}))
+                    .expect("invalid authority signature"),
+            },
+        )
+        .with_project_id(project_id)
+        .sign(&owner_key)
+        .expect("sign stop");
+
+        let error = ensure_stop_sender_authorized(&store, &envelope)
+            .expect_err("invalid authority signature must be rejected");
+        assert!(error.to_string().contains("signature verification failed"));
+    }
+
+    #[test]
+    fn owner_relay_stop_accepts_valid_authority_signature() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = Store::open(temp.path().join("node.db")).expect("store");
+        let owner_key = StoredKeypair::generate();
+        let principal_key = StoredKeypair::generate();
+        let principal_stop_key = StoredKeypair::generate();
+        let owner_actor = ActorId::generate();
+        let principal_actor = ActorId::generate();
+        let project_id = ProjectId::generate();
+        let vision_id = VisionId::generate();
+        let now = OffsetDateTime::now_utc();
+
+        let charter = UnsignedEnvelope::new(
+            owner_actor.clone(),
+            Some(principal_actor.clone()),
+            ProjectCharter {
+                project_id: project_id.clone(),
+                vision_id,
+                principal_actor_id: principal_actor.clone(),
+                owner_actor_id: owner_actor.clone(),
+                title: "Stop Project".to_owned(),
+                objective: "Stop Project".to_owned(),
+                stop_authority_actor_id: principal_actor.clone(),
+                execution_mode: ExecutionMode::Full,
+                participant_policy: ParticipantPolicy {
+                    external_agents_allowed: true,
+                },
+                evaluation_policy: EvaluationPolicy {
+                    quality_weight: 1.0,
+                    speed_weight: 1.0,
+                    reliability_weight: 1.0,
+                    alignment_weight: 1.0,
+                },
+            },
+        )
+        .with_project_id(project_id.clone())
+        .sign(&owner_key)
+        .expect("sign charter");
+        store
+            .apply_project_charter(&charter)
+            .expect("apply charter");
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: owner_actor.clone(),
+                node_id: NodeId::generate(),
+                public_key: owner_key.public_key.clone(),
+                stop_public_key: None,
+                capabilities: Vec::new(),
+                trust_state: starweft_store::PeerTrustState::Trusted,
+                updated_at: now,
+            })
+            .expect("owner identity");
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: principal_actor.clone(),
+                node_id: NodeId::generate(),
+                public_key: principal_key.public_key.clone(),
+                stop_public_key: Some(principal_stop_key.public_key.clone()),
+                capabilities: Vec::new(),
+                trust_state: starweft_store::PeerTrustState::Trusted,
+                updated_at: now,
+            })
+            .expect("principal identity");
+
+        let stop_id = StopId::generate();
+        let order = StopOrder {
+            stop_id: stop_id.clone(),
+            scope_type: StopScopeType::Project,
+            scope_id: project_id.to_string(),
+            reason_code: "user".to_owned(),
+            reason_text: "stop".to_owned(),
+            issued_at: now,
+            authority_actor_id: principal_actor.clone(),
+            authority_signature: {
+                let payload = starweft_protocol::StopAuthorityPayload {
+                    stop_id,
+                    project_id: project_id.clone(),
+                    scope_type: StopScopeType::Project,
+                    scope_id: project_id.to_string(),
+                    reason_code: "user".to_owned(),
+                    reason_text: "stop".to_owned(),
+                    authority_actor_id: principal_actor.clone(),
+                    issued_at: now,
+                };
+                principal_stop_key
+                    .sign_json(&payload)
+                    .expect("authority signature")
+            },
+        };
+        let envelope = UnsignedEnvelope::new(owner_actor, Some(ActorId::generate()), order)
+            .with_project_id(project_id)
+            .sign(&owner_key)
+            .expect("sign stop");
+
+        ensure_stop_sender_authorized(&store, &envelope)
+            .expect("valid proxy stop should be accepted");
+    }
+
+    #[test]
     fn flush_outbox_schedules_retry_for_unsupported_targets() {
         let temp = TempDir::new().expect("tempdir");
         let store = Store::open(temp.path().join("node.db")).expect("store");
@@ -3984,6 +4920,7 @@ mod tests {
                 title: "Remote Approval Project".to_owned(),
                 objective: "Need approval".to_owned(),
                 stop_authority_actor_id: principal_actor.clone(),
+                execution_mode: ExecutionMode::Full,
                 participant_policy: starweft_protocol::ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -4017,6 +4954,7 @@ mod tests {
                 public_key: "worker-pk".to_owned(),
                 stop_public_key: None,
                 capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: starweft_store::PeerTrustState::Trusted,
                 updated_at: now,
             })
             .expect("peer identity");

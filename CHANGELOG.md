@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-25
+
+### Added
+
+- **Peer trust model** — 4段階の信頼状態 (discovered / trusted / pinned / revoked) によるピアライフサイクル管理
+  - `peer promote` / `peer revoke` / `peer rotate` サブコマンドを追加
+  - discovered peer は task dispatch・control plane 操作から自動的にブロック
+  - revoked peer は再発見によっても復元されない
+  - `status` / `peer list` に trust_state・dispatch eligibility・key fingerprint を表示
+- **ExecutionMode (full / controlled)** — OpenClaw サブプロセスの実行権限制御
+  - `--execution-mode` CLI オプション、`--constraint execution_mode=controlled` でも指定可
+  - `controlled` モードでは環境変数をクリアし、`controlled_env_allowlist` で明示許可した変数のみ渡す
+  - `controlled_stdio_passthrough` で stdout/stderr の外部流出を制御
+  - `ProjectCharter` / `TaskDelegated` / `VisionConstraints` に `execution_mode` フィールド追加
+- **StopOrder authority signature** — 停止命令の二重署名検証
+  - `StopAuthorityPayload` を stop_key で署名し、envelope は actor_key で署名
+  - 受信側で authority_actor_id と stop_public_key による二重検証を実施
+- **Inbound message authorization** — 受信メッセージの送信者認可チェック
+  - `ApprovalGranted`: principal actor のみ受理
+  - `TaskResultSubmitted`: 割当 worker のみ受理
+  - `SnapshotRequest`: owner / principal / assignee のみ受理
+  - `StopOrder`: stop_authority / owner のみ受理、authority signature 検証
+  - discovered peer からの owner 宛 routed message を拒否
+- **Wire-level recipient validation** — envelope の to_actor_id とローカル identity の一致を wire レベルで 1 回検証
+- **Registry actor signature** — レジストリ announce/peers レコードに Ed25519 actor 署名を追加・検証
+- **Public key validation** — `peer add` / bootstrap 時の Ed25519 公開鍵フォーマット検証
+- **Backup/restore の安全性向上** — ステージングディレクトリを使ったアトミックリストア + ロールバック
+- **File permission hardening** — データディレクトリ・設定ファイルに 0700/0600 パーミッション (Unix) / ACL (Windows) を強制
+- **Config validate の拡充** — registry URL スキーム検証、shared secret 警告、パーミッション drift 検出
+- **JoinOffer task binding** — `offer_id` + `task_id` で JoinOffer/Accept/Reject を特定タスクに紐付け
+- **Task-level approval** — プロジェクト全体だけでなく個別タスクの承認・dispatch をサポート
+- **ApprovalApplied event** — 承認適用をイベントとして記録し、`wait --until approval_applied` で待機可能に
+- **connected_sessions メトリクス** — libp2p transport の実際の接続数を表示 (known_peers と分離)
+- **Publish failure recording** — GitHub publish 失敗時も PublishResultRecorded イベントを記録
+- **Store schema v6** — `peer_keys` テーブルに `trust_state` カラム追加 + マイグレーション
+
+### Changed
+
+- **Peer discovery → discovered trust state** — mDNS / registry 経由の自動発見ピアは `discovered` 状態で登録（従来は即 `trusted`）
+- `peer list` の出力フォーマットを拡張 (trust / dispatch eligibility / key fingerprint / capabilities)
+- `status` に `peer_trust_summary` / `peer_dispatch_blocked_preview` / `latest_project_blocked_reason` を追加
+- `connected_peers` メトリクスを `known_peers` + `connected_sessions` に分離
+- `openclaw_enabled` を実際の binary 存在チェック結果に基づくよう変更
+- CapabilityQuery / CapabilityAdvertisement に TTL (`expires_at`) を追加
+- `select_next_worker_actor_id` をタスク固有の `select_worker_for_task` に分離
+- `snapshot --request` と `--watch` を組み合わせた remote snapshot polling をサポート
+- `status --watch --json` で JSON 出力をそのまま流すよう改善
+- E2E テストのデバッグ情報を改善 (`last_stdout` 付きタイムアウトメッセージ)
+
+### Fixed
+
+- `approval_states` のプロジェクトスコープ検索に `scope_type = 'project'` フィルタを追加
+- Task snapshot の approval 状態にタスク固有の `task_approval_snapshot_from` を使用
+- `stop_orders` テーブルの `issuer_actor_id` を `authority_actor_id` に修正
+
 ## [0.3.1] - 2026-03-18
 
 ### Fixed

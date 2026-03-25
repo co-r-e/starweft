@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use starweft_id::{ProjectId, TaskId};
-use starweft_protocol::{RoutedBody, StopScopeType, UnsignedEnvelope};
+use starweft_protocol::{ExecutionMode, RoutedBody, StopScopeType, UnsignedEnvelope};
 
 use crate::config::NodeRole;
 
@@ -13,6 +13,27 @@ pub(crate) enum ColorMode {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum ExecutionModeArg {
+    Full,
+    Controlled,
+}
+
+impl From<ExecutionModeArg> for ExecutionMode {
+    fn from(value: ExecutionModeArg) -> Self {
+        match value {
+            ExecutionModeArg::Full => ExecutionMode::Full,
+            ExecutionModeArg::Controlled => ExecutionMode::Controlled,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum PeerTrustArg {
+    Trusted,
+    Pinned,
 }
 
 #[derive(Debug, Parser)]
@@ -459,6 +480,12 @@ pub(crate) enum PeerCommands {
     Add(Box<PeerAddArgs>),
     /// 登録済みピア一覧
     List(PeerListArgs),
+    /// discovered peer を trusted/pinned に昇格
+    Promote(PeerPromoteArgs),
+    /// peer を revoked にする
+    Revoke(PeerRevokeArgs),
+    /// peer 公開鍵をローテーションする
+    Rotate(PeerRotateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -502,6 +529,48 @@ pub(crate) struct PeerListArgs {
     /// データディレクトリ
     #[arg(long, env = "STARWEFT_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PeerPromoteArgs {
+    /// 昇格する Actor ID
+    pub(crate) actor_id: String,
+    /// データディレクトリ
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
+    pub(crate) data_dir: Option<PathBuf>,
+    /// 昇格先の trust state
+    #[arg(long, value_enum, default_value_t = PeerTrustArg::Trusted)]
+    pub(crate) trust: PeerTrustArg,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PeerRevokeArgs {
+    /// 対象 Actor ID
+    pub(crate) actor_id: String,
+    /// データディレクトリ
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
+    pub(crate) data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PeerRotateArgs {
+    /// 対象 Actor ID
+    pub(crate) actor_id: String,
+    /// データディレクトリ
+    #[arg(long, env = "STARWEFT_DATA_DIR")]
+    pub(crate) data_dir: Option<PathBuf>,
+    /// 新しい公開鍵 (base64)
+    #[arg(long)]
+    pub(crate) public_key: Option<String>,
+    /// 新しい公開鍵ファイル
+    #[arg(long = "public-key-file")]
+    pub(crate) public_key_file: Option<PathBuf>,
+    /// 新しい停止権限公開鍵 (base64)
+    #[arg(long = "stop-public-key")]
+    pub(crate) stop_public_key: Option<String>,
+    /// 新しい停止権限公開鍵ファイル
+    #[arg(long = "stop-public-key-file")]
+    pub(crate) stop_public_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -629,6 +698,9 @@ pub(crate) struct VisionSubmitArgs {
     /// 制約条件 (key=value 形式, 複数指定可)
     #[arg(long = "constraint")]
     pub(crate) constraints: Vec<String>,
+    /// OpenClaw 実行権限モード
+    #[arg(long, value_enum)]
+    pub(crate) execution_mode: Option<ExecutionModeArg>,
     /// 送信先 owner の Actor ID
     #[arg(long)]
     pub(crate) owner: Option<String>,
@@ -663,6 +735,9 @@ pub(crate) struct VisionPlanArgs {
     /// 制約条件 (key=value 形式, 複数指定可)
     #[arg(long = "constraint")]
     pub(crate) constraints: Vec<String>,
+    /// OpenClaw 実行権限モード
+    #[arg(long, value_enum)]
+    pub(crate) execution_mode: Option<ExecutionModeArg>,
     /// 送信先 owner の Actor ID
     #[arg(long)]
     pub(crate) owner: Option<String>,

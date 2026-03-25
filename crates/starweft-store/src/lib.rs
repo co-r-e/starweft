@@ -33,8 +33,8 @@ const ACTIVE_TASK_STATUSES_SQL: &str = "('queued', 'accepted', 'running', 'stopp
 /// SQL fragment for terminal task statuses
 const TERMINAL_TASK_STATUSES_SQL: &str = "('completed', 'failed', 'stopped')";
 
-pub const STORE_SCHEMA_VERSION: i32 = 5;
-pub const STORE_SCHEMA_VERSION_LABEL: &str = "starweft-store/5";
+pub const STORE_SCHEMA_VERSION: i32 = 6;
+pub const STORE_SCHEMA_VERSION_LABEL: &str = "starweft-store/6";
 
 const SCHEMA_V1: &str = r#"
 
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS peer_keys (
   public_key TEXT NOT NULL,
   stop_public_key TEXT,
   capabilities_json TEXT,
+  trust_state TEXT NOT NULL DEFAULT 'trusted',
   updated_at TEXT NOT NULL
 );
 
@@ -304,8 +305,47 @@ pub struct PeerIdentityRecord {
     pub stop_public_key: Option<String>,
     /// Capabilities advertised by this peer.
     pub capabilities: Vec<String>,
+    /// How strongly this identity is trusted locally.
+    pub trust_state: PeerTrustState,
     /// When this identity record was last updated.
     pub updated_at: OffsetDateTime,
+}
+
+/// Local trust classification for peer identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerTrustState {
+    Discovered,
+    Trusted,
+    Pinned,
+    Revoked,
+}
+
+impl PeerTrustState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovered => "discovered",
+            Self::Trusted => "trusted",
+            Self::Pinned => "pinned",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+impl FromStr for PeerTrustState {
+    type Err = std::io::Error;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "discovered" => Ok(Self::Discovered),
+            "trusted" => Ok(Self::Trusted),
+            "pinned" => Ok(Self::Pinned),
+            "revoked" => Ok(Self::Revoked),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown peer trust state: {other}"),
+            )),
+        }
+    }
 }
 
 /// A stored vision record.
@@ -1048,13 +1088,14 @@ impl Store {
     pub fn upsert_peer_identity(&self, peer: &PeerIdentityRecord) -> Result<()> {
         self.connection.execute(
             r#"
-            INSERT INTO peer_keys (actor_id, node_id, public_key, stop_public_key, capabilities_json, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO peer_keys (actor_id, node_id, public_key, stop_public_key, capabilities_json, trust_state, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(actor_id) DO UPDATE SET
               node_id = excluded.node_id,
               public_key = excluded.public_key,
               stop_public_key = excluded.stop_public_key,
               capabilities_json = excluded.capabilities_json,
+              trust_state = excluded.trust_state,
               updated_at = excluded.updated_at
             "#,
             params![
@@ -1063,17 +1104,50 @@ impl Store {
                 &peer.public_key,
                 peer.stop_public_key.as_deref(),
                 serde_json::to_string(&peer.capabilities)?,
+                peer.trust_state.as_str(),
                 format_time(peer.updated_at)?,
             ],
         )?;
         Ok(())
     }
 
+    /// Inserts or updates a discovered peer without overriding stronger local trust.
+    pub fn upsert_discovered_peer_identity(&self, peer: &PeerIdentityRecord) -> Result<bool> {
+        if peer.trust_state != PeerTrustState::Discovered {
+            bail!("discovered peer upsert requires discovered trust state");
+        }
+        if let Some(existing) = self.peer_identity(&peer.actor_id)? {
+            if matches!(
+                existing.trust_state,
+                PeerTrustState::Trusted | PeerTrustState::Pinned | PeerTrustState::Revoked
+            ) {
+                if existing.trust_state == PeerTrustState::Revoked {
+                    return Ok(false);
+                }
+                if existing.public_key != peer.public_key
+                    || existing.stop_public_key != peer.stop_public_key
+                    || existing.node_id != peer.node_id
+                {
+                    return Ok(false);
+                }
+                let updated = PeerIdentityRecord {
+                    capabilities: peer.capabilities.clone(),
+                    updated_at: peer.updated_at,
+                    ..existing
+                };
+                self.upsert_peer_identity(&updated)?;
+                return Ok(true);
+            }
+        }
+        self.upsert_peer_identity(peer)?;
+        Ok(true)
+    }
+
     /// Retrieves identity data for a peer by actor ID.
     pub fn peer_identity(&self, actor_id: &ActorId) -> Result<Option<PeerIdentityRecord>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT actor_id, node_id, public_key, stop_public_key, capabilities_json, updated_at
+            SELECT actor_id, node_id, public_key, stop_public_key, capabilities_json, trust_state, updated_at
             FROM peer_keys
             WHERE actor_id = ?1
             LIMIT 1
@@ -1094,7 +1168,11 @@ impl Store {
                         .transpose()
                         .map_err(sql_conversion_error)?
                         .unwrap_or_default(),
-                    updated_at: parse_time(&row.get::<_, String>(5)?)
+                    trust_state: row
+                        .get::<_, String>(5)?
+                        .parse()
+                        .map_err(sql_conversion_error)?,
+                    updated_at: parse_time(&row.get::<_, String>(6)?)
                         .map_err(sql_conversion_error)?,
                 })
             })
@@ -1287,7 +1365,7 @@ impl Store {
                 envelope.body.stop_id.as_str(),
                 stop_scope_type_name(&envelope.body.scope_type),
                 &envelope.body.scope_id,
-                envelope.from_actor_id.as_str(),
+                envelope.body.authority_actor_id.as_str(),
                 &envelope.body.reason_code,
                 &envelope.body.reason_text,
                 format_time(envelope.body.issued_at)?,
@@ -2071,6 +2149,25 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Returns an owner actor inferred from task issuers for a project.
+    pub fn project_task_owner_actor_id(&self, project_id: &ProjectId) -> Result<Option<ActorId>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT issuer_actor_id
+            FROM tasks
+            WHERE project_id = ?1
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([project_id.as_str()], |row| {
+                ActorId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Returns the vision constraints associated with a project.
     pub fn project_vision_constraints(
         &self,
@@ -2141,7 +2238,7 @@ impl Store {
             r#"
             SELECT scope_type, scope_id, approval_updated, resumed_task_ids_json, dispatched, updated_at
             FROM approval_states
-            WHERE project_id = ?1
+            WHERE project_id = ?1 AND scope_type = 'project'
             ORDER BY updated_at DESC
             LIMIT 1
             "#,
@@ -2222,6 +2319,24 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Returns the assignee actor ID for a task.
+    pub fn task_assignee_actor_id(&self, task_id: &TaskId) -> Result<Option<ActorId>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT assignee_actor_id
+            FROM tasks
+            WHERE task_id = ?1
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([task_id.as_str()], |row| {
+                ActorId::new(row.get::<_, String>(0)?).map_err(sql_conversion_error)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Returns the principal actor ID for a project.
     pub fn project_principal_actor_id(&self, project_id: &ProjectId) -> Result<Option<ActorId>> {
         let mut statement = self.connection.prepare(
@@ -2238,6 +2353,71 @@ impl Store {
             })
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Returns the stop-authority actor ID declared in the project charter.
+    pub fn project_stop_authority_actor_id(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<ActorId>> {
+        Ok(self
+            .project_charter(project_id)?
+            .map(|charter| charter.stop_authority_actor_id))
+    }
+
+    /// Returns the latest project charter body for a project.
+    pub fn project_charter(&self, project_id: &ProjectId) -> Result<Option<ProjectCharter>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT body_json
+            FROM task_events
+            WHERE project_id = ?1 AND msg_type = 'ProjectCharter'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row([project_id.as_str()], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(|body_json| {
+                let charter: ProjectCharter = serde_json::from_str(&body_json)?;
+                Ok(charter)
+            })
+            .transpose()
+    }
+
+    /// Returns whether a matching JoinOffer exists in the event log.
+    pub fn join_offer_exists(
+        &self,
+        offer_id: &MessageId,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        owner_actor_id: &ActorId,
+        worker_actor_id: &ActorId,
+    ) -> Result<bool> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT COUNT(*)
+            FROM task_events
+            WHERE msg_id = ?1
+              AND msg_type = 'JoinOffer'
+              AND project_id = ?2
+              AND task_id = ?3
+              AND from_actor_id = ?4
+              AND to_actor_id = ?5
+            "#,
+        )?;
+        let count = statement.query_row(
+            params![
+                offer_id.as_str(),
+                project_id.as_str(),
+                task_id.as_str(),
+                owner_actor_id.as_str(),
+                worker_actor_id.as_str(),
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Returns the next queued task assigned to a specific actor.
@@ -2390,7 +2570,7 @@ impl Store {
         let constraints = self
             .project_vision_constraints(project_id)?
             .unwrap_or_default();
-        project.approval = approval_snapshot_from(
+        project.approval = project_approval_snapshot_from(
             &constraints,
             self.approval_projection_for_project(project_id)?,
         );
@@ -2609,7 +2789,7 @@ impl Store {
         let constraints = self
             .project_vision_constraints(&snapshot.project_id)?
             .unwrap_or_default();
-        snapshot.approval = approval_snapshot_from(
+        snapshot.approval = task_approval_snapshot_from(
             &constraints,
             self.approval_projection_for_task(&snapshot.task_id)?,
         );
@@ -3219,7 +3399,7 @@ impl Store {
             let constraints = self
                 .project_vision_constraints(&snapshot.project_id)?
                 .unwrap_or_default();
-            snapshot.approval = approval_snapshot_from(
+            snapshot.approval = task_approval_snapshot_from(
                 &constraints,
                 self.approval_projection_for_task(&snapshot.task_id)?,
             );
@@ -4488,6 +4668,10 @@ fn apply_migration(connection: &Connection, version: i32) -> Result<()> {
             )?;
             Ok(())
         }
+        6 => {
+            ensure_peer_keys_columns(connection)?;
+            Ok(())
+        }
         _ => bail!("[E_SCHEMA_VERSION] unknown schema migration target: {version}"),
     }
 }
@@ -4508,10 +4692,12 @@ fn ensure_peer_keys_columns(connection: &Connection) -> Result<()> {
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
     let mut has_stop_public_key = false;
     let mut has_capabilities_json = false;
+    let mut has_trust_state = false;
     for column in columns {
         match column?.as_str() {
             "stop_public_key" => has_stop_public_key = true,
             "capabilities_json" => has_capabilities_json = true,
+            "trust_state" => has_trust_state = true,
             _ => {}
         }
     }
@@ -4522,6 +4708,12 @@ fn ensure_peer_keys_columns(connection: &Connection) -> Result<()> {
     if !has_capabilities_json {
         connection.execute(
             "ALTER TABLE peer_keys ADD COLUMN capabilities_json TEXT",
+            [],
+        )?;
+    }
+    if !has_trust_state {
+        connection.execute(
+            "ALTER TABLE peer_keys ADD COLUMN trust_state TEXT NOT NULL DEFAULT 'trusted'",
             [],
         )?;
     }
@@ -4913,12 +5105,38 @@ fn submission_is_approved(constraints: &VisionConstraints) -> bool {
         .unwrap_or(false)
 }
 
-fn approval_snapshot_from(
+fn project_approval_snapshot_from(
     constraints: &VisionConstraints,
     projection: Option<ApprovalProjectionRecord>,
 ) -> ApprovalSnapshot {
     let state = if human_intervention_requires_approval(constraints) {
         if submission_is_approved(constraints) {
+            "approved"
+        } else {
+            "pending"
+        }
+    } else {
+        "not_required"
+    };
+    ApprovalSnapshot {
+        state: state.to_owned(),
+        updated_at: projection.as_ref().map(|record| record.updated_at.clone()),
+        scope_type: projection.as_ref().map(|record| record.scope_type.clone()),
+        scope_id: projection.as_ref().map(|record| record.scope_id.clone()),
+        approval_updated: projection.as_ref().map(|record| record.approval_updated),
+        resumed_task_count: projection.as_ref().map(|record| record.resumed_task_count),
+        dispatched: projection.as_ref().map(|record| record.dispatched),
+    }
+}
+
+fn task_approval_snapshot_from(
+    constraints: &VisionConstraints,
+    projection: Option<ApprovalProjectionRecord>,
+) -> ApprovalSnapshot {
+    let state = if human_intervention_requires_approval(constraints) {
+        if submission_is_approved(constraints) {
+            "approved_via_project"
+        } else if projection.is_some() {
             "approved"
         } else {
             "pending"
@@ -5111,8 +5329,9 @@ fn sql_conversion_error(error: impl std::error::Error + Send + Sync + 'static) -
 #[cfg(test)]
 mod tests {
     use super::{
-        DeliveryState, LocalIdentityRecord, PeerAddressRecord, STORE_SCHEMA_VERSION, Store,
-        VisionRecord, decode_task_event, format_time, schema_user_version,
+        DeliveryState, LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, PeerTrustState,
+        STORE_SCHEMA_VERSION, Store, VisionRecord, decode_task_event, format_time,
+        schema_user_version,
     };
     use rusqlite::{Connection, params};
     use serde_json::{Value, json};
@@ -5179,6 +5398,7 @@ mod tests {
                 title: "Project".to_owned(),
                 objective: "Objective".to_owned(),
                 stop_authority_actor_id: principal_actor_id.clone(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 participant_policy: ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -5208,6 +5428,7 @@ mod tests {
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
                 required_capability: "mock".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: json!({"task":"input"}),
                 expected_output_schema: json!({"type":"object"}),
             },
@@ -5788,6 +6009,7 @@ mod tests {
                 title: "Project".to_owned(),
                 objective: "Objective".to_owned(),
                 stop_authority_actor_id: principal_actor_id,
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 participant_policy: ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -6091,6 +6313,7 @@ mod tests {
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
                 required_capability: "mock".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: json!({}),
                 expected_output_schema: json!({}),
             },
@@ -6139,6 +6362,7 @@ mod tests {
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
                 required_capability: "mock".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: json!({}),
                 expected_output_schema: json!({}),
             },
@@ -6223,6 +6447,7 @@ mod tests {
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
                 required_capability: "mock".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: json!({}),
                 expected_output_schema: json!({}),
             },
@@ -6329,6 +6554,7 @@ mod tests {
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
                 required_capability: "mock".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: json!({}),
                 expected_output_schema: json!({}),
             },
@@ -6456,6 +6682,54 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[test]
+    fn upsert_discovered_peer_identity_does_not_restore_revoked_peer() {
+        let temp = std::env::temp_dir().join(format!(
+            "starweft-store-revoked-peer-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+        let store = Store::open(temp.join("node.db")).expect("open store");
+        let actor_id = ActorId::generate();
+        let node_id = NodeId::generate();
+        let revoked_key = StoredKeypair::generate();
+        let discovered_key = StoredKeypair::generate();
+
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: actor_id.clone(),
+                node_id: node_id.clone(),
+                public_key: revoked_key.public_key.clone(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: PeerTrustState::Revoked,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("insert revoked peer");
+
+        let accepted = store
+            .upsert_discovered_peer_identity(&PeerIdentityRecord {
+                actor_id: actor_id.clone(),
+                node_id,
+                public_key: discovered_key.public_key.clone(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: PeerTrustState::Discovered,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("upsert discovered peer");
+
+        assert!(!accepted);
+        let identity = store
+            .peer_identity(&actor_id)
+            .expect("lookup")
+            .expect("identity exists");
+        assert_eq!(identity.trust_state, PeerTrustState::Revoked);
+        assert_eq!(identity.public_key, revoked_key.public_key);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
     /// Helper to create a minimal project + task with dependencies for dependency tests.
     fn setup_dependency_test() -> (Store, StoredKeypair, ActorId, ActorId, ProjectId) {
         let temp = std::env::temp_dir().join(format!(
@@ -6493,6 +6767,7 @@ mod tests {
                 title: "Project".to_owned(),
                 objective: "Objective".to_owned(),
                 stop_authority_actor_id: owner_actor.clone(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 participant_policy: ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -6532,6 +6807,7 @@ mod tests {
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
                 required_capability: "mock".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: json!({}),
                 expected_output_schema: json!({}),
             },

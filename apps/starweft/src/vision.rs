@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use serde_json::Value;
 use starweft_id::{ActorId, VisionId};
-use starweft_protocol::{UnsignedEnvelope, VisionIntent};
+use starweft_protocol::{ExecutionMode, UnsignedEnvelope, VisionIntent};
 use starweft_runtime::RuntimePipeline;
 use starweft_store::{Store, VisionRecord};
 
@@ -36,6 +36,7 @@ pub(crate) struct VisionPlanPreview {
     pub(crate) node_role: String,
     pub(crate) title: String,
     pub(crate) target_owner_actor_id: Option<String>,
+    pub(crate) effective_execution_mode: String,
     pub(crate) constraints: Value,
     pub(crate) task_count: usize,
     pub(crate) confidence: f32,
@@ -63,6 +64,7 @@ pub(crate) struct VisionSubmitCommandParams<'a> {
     pub(crate) text: Option<&'a str>,
     pub(crate) file: Option<&'a Path>,
     pub(crate) constraints: &'a [String],
+    pub(crate) execution_mode: Option<ExecutionMode>,
     pub(crate) owner_actor_id: Option<&'a str>,
     pub(crate) approve_token: Option<&'a str>,
     pub(crate) json: bool,
@@ -85,7 +87,10 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
     }
 
     let vision_text = load_vision_text(args.text.as_deref(), args.file.as_deref())?;
-    let constraints = parse_constraints(&args.constraints)?;
+    let mut constraints = parse_constraints(&args.constraints)?;
+    if let Some(mode) = args.execution_mode {
+        constraints.execution_mode = Some(mode.into());
+    }
     let store = Store::open(&paths.ledger_db)?;
     let owner_actor_id = Some(resolve_default_owner_for_new_project(
         &store,
@@ -116,6 +121,7 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
             text: args.text.as_deref(),
             file: args.file.as_deref(),
             constraints: &args.constraints,
+            execution_mode: vision.constraints.execution_mode,
             owner_actor_id: preview.target_owner_actor_id.as_deref(),
             approve_token: Some(preview.approval_token.as_str()),
             json: args.json,
@@ -140,6 +146,7 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
             text: args.text.as_deref(),
             file: args.file.as_deref(),
             constraints: &args.constraints,
+            execution_mode: vision.constraints.execution_mode,
             owner_actor_id: preview.target_owner_actor_id.as_deref(),
             approve_token: Some(preview.approval_token.as_str()),
             json: args.json,
@@ -236,7 +243,10 @@ pub(crate) fn run_vision_submit(args: VisionSubmitArgs) -> Result<()> {
 pub(crate) fn run_vision_plan(args: VisionPlanArgs) -> Result<()> {
     let (config, _) = load_existing_config(args.data_dir.as_ref())?;
     let vision_text = load_vision_text(args.text.as_deref(), args.file.as_deref())?;
-    let constraints = parse_constraints(&args.constraints)?;
+    let mut constraints = parse_constraints(&args.constraints)?;
+    if let Some(mode) = args.execution_mode {
+        constraints.execution_mode = Some(mode.into());
+    }
     let target_owner_actor_id = args.owner.as_deref().map(parse_actor_id_arg).transpose()?;
     let mut preview = build_vision_plan_preview(
         &config,
@@ -253,6 +263,10 @@ pub(crate) fn run_vision_plan(args: VisionPlanArgs) -> Result<()> {
         text: args.text.as_deref(),
         file: args.file.as_deref(),
         constraints: &args.constraints,
+        execution_mode: preview
+            .effective_execution_mode
+            .parse::<ExecutionMode>()
+            .ok(),
         owner_actor_id: preview.target_owner_actor_id.as_deref(),
         approve_token: Some(preview.approval_token.as_str()),
         json: args.json,
@@ -309,6 +323,10 @@ pub(crate) fn build_vision_plan_preview(
     let (confidence, planning_risk, planning_risk_factors) =
         assess_vision_plan_preview(config, vision, &missing_information, tasks.len());
     let approval_reasons = infer_vision_approval_reasons(&missing_information, &planning_risk);
+    let effective_execution_mode = vision
+        .constraints
+        .execution_mode
+        .unwrap_or(config.openclaw.default_execution_mode);
 
     let mut preview = VisionPlanPreview {
         preview_only: true,
@@ -318,6 +336,7 @@ pub(crate) fn build_vision_plan_preview(
         node_role: config.node.role.to_string(),
         title: vision.title.clone(),
         target_owner_actor_id: target_owner_actor_id.map(ToString::to_string),
+        effective_execution_mode: effective_execution_mode.to_string(),
         constraints: serde_json::to_value(&vision.constraints)?,
         task_count: tasks.len(),
         confidence,
@@ -363,6 +382,9 @@ pub(crate) fn build_vision_submit_command(params: &VisionSubmitCommandParams<'_>
     }
     for constraint in params.constraints {
         push_command_option(&mut parts, "--constraint", constraint);
+    }
+    if let Some(execution_mode) = params.execution_mode {
+        push_command_option(&mut parts, "--execution-mode", &execution_mode.to_string());
     }
     if let Some(owner_actor_id) = params.owner_actor_id {
         push_command_option(&mut parts, "--owner", owner_actor_id);
@@ -417,6 +439,7 @@ pub(crate) fn build_vision_plan_approval_token(preview: &VisionPlanPreview) -> R
         "node_role": preview.node_role,
         "title": preview.title,
         "target_owner_actor_id": preview.target_owner_actor_id,
+        "effective_execution_mode": preview.effective_execution_mode,
         "constraints": preview.constraints,
         "task_count": preview.task_count,
         "confidence": preview.confidence,
@@ -452,6 +475,10 @@ pub(crate) fn render_vision_plan_preview_text(preview: &VisionPlanPreview) -> St
         "preview_only: true".to_owned(),
         format!("title: {}", preview.title),
         format!("node_role: {}", preview.node_role),
+        format!(
+            "effective_execution_mode: {}",
+            preview.effective_execution_mode
+        ),
         format!("planner_mode: {}", preview.planner_mode),
         format!("planner_target: {}", preview.planner_target),
         format!(
@@ -547,6 +574,7 @@ pub(crate) fn print_vision_missing_information(
             serde_json::to_string_pretty(&serde_json::json!({
                 "preview_only": preview.preview_only,
                 "title": preview.title,
+                "effective_execution_mode": preview.effective_execution_mode,
                 "confidence": preview.confidence,
                 "planning_risk": preview.planning_risk,
                 "planning_risk_factors": preview.planning_risk_factors,
@@ -707,7 +735,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, NodeRole, PlanningStrategyKind};
     use starweft_id::ActorId;
-    use starweft_protocol::VisionIntent;
+    use starweft_protocol::{ExecutionMode, VisionIntent};
     use std::path::Path;
 
     #[test]
@@ -722,6 +750,7 @@ mod tests {
                     .to_owned(),
                 constraints: starweft_protocol::VisionConstraints {
                     budget_mode: Some("balanced".to_owned()),
+                    execution_mode: Some(ExecutionMode::Controlled),
                     allow_external_agents: Some(true),
                     human_intervention: Some("required".to_owned()),
                     extra: Default::default(),
@@ -826,6 +855,7 @@ mod tests {
             text: Some("Need 'quoted' acceptance"),
             file: None,
             constraints: &[String::from("budget_mode=balanced")],
+            execution_mode: Some(ExecutionMode::Controlled),
             owner_actor_id: Some("actor_123"),
             approve_token: Some("token_456"),
             json: true,
@@ -834,6 +864,7 @@ mod tests {
         assert!(command.contains("--data-dir '/tmp/star weft'"));
         assert!(command.contains("--title 'Ship feature'\"'\"'s alpha'"));
         assert!(command.contains("--text 'Need '\"'\"'quoted'\"'\"' acceptance'"));
+        assert!(command.contains("--execution-mode controlled"));
         assert!(command.contains("--approve token_456"));
         assert!(command.ends_with("--json"));
     }

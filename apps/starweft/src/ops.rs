@@ -128,7 +128,7 @@ pub fn run_publish_context(request: PublishContextRequest) -> Result<String> {
 
     let mut publish_signals = Vec::new();
     if let Some(task) = &task {
-        if task.status.as_str() == "failed" {
+        if task.status == starweft_protocol::TaskStatus::Failed {
             publish_signals.push("task_failed".to_owned());
         }
         if task.retry_attempt > 0 {
@@ -144,7 +144,7 @@ pub fn run_publish_context(request: PublishContextRequest) -> Result<String> {
         if project.retry.max_retry_attempt > 0 {
             publish_signals.push("retry_detected".to_owned());
         }
-        if project.status.as_str() == "stopped" {
+        if project.status == starweft_protocol::ProjectStatus::Stopped {
             publish_signals.push("project_stopped".to_owned());
         }
         if project.retry.latest_failure_action.is_some() {

@@ -174,6 +174,10 @@ mod tests {
                 reason_code: "user".to_owned(),
                 reason_text: "requested".to_owned(),
                 issued_at: OffsetDateTime::now_utc(),
+                authority_actor_id: ActorId::generate(),
+                authority_signature: starweft_crypto::StoredKeypair::generate()
+                    .sign_json(&serde_json::json!({"stop": "test"}))
+                    .expect("authority signature"),
             },
         };
         assert!(transition.accepted);

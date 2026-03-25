@@ -38,6 +38,7 @@ fn create_project(store: &Store, keypair: &StoredKeypair, owner: &ActorId) -> Pr
         title: "bench project".to_owned(),
         objective: "benchmark objective for performance testing".to_owned(),
         stop_authority_actor_id: owner.clone(),
+        execution_mode: starweft_protocol::ExecutionMode::Full,
         participant_policy: ParticipantPolicy {
             external_agents_allowed: true,
         },
@@ -73,6 +74,7 @@ fn delegate_tasks(
             description: format!("benchmark task number {i} for performance testing"),
             objective: format!("complete benchmark objective {i} successfully"),
             required_capability: "openclaw.execution.v1".to_owned(),
+            execution_mode: starweft_protocol::ExecutionMode::Full,
             input_payload: json!({"index": i}),
             expected_output_schema: json!({"type": "object"}),
         };

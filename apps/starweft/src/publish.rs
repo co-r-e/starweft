@@ -16,6 +16,7 @@ use crate::cli::{
     PublishScopeSelection,
 };
 use crate::config::{self, load_existing_config};
+use crate::helpers::{set_private_directory_permissions, set_private_file_permissions};
 use crate::ops::{
     ExportRequest, ExportScope, PublishContextRequest, RenderFormat, run_export,
     run_publish_context as ops_run_publish_context,
@@ -264,12 +265,37 @@ pub(crate) fn run_publish_github(args: PublishGitHubArgs) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let comment = post_github_comment(
+    let comment = match post_github_comment(
         &client,
         &github_api_base_url()?,
         &payload,
         &resolve_github_token()?,
-    )?;
+    ) {
+        Ok(comment) => comment,
+        Err(error) => {
+            let recorded = scope
+                .annotate(UnsignedEnvelope::new(
+                    identity.actor_id,
+                    None,
+                    PublishResultRecorded {
+                        scope_type,
+                        scope_id,
+                        target: target_label,
+                        status: "failed".to_owned(),
+                        location: None,
+                        detail: error.to_string(),
+                        result_payload: serde_json::json!({
+                            "request": payload,
+                            "error": error.to_string(),
+                        }),
+                        recorded_at: OffsetDateTime::now_utc(),
+                    },
+                ))
+                .sign(&actor_key)?;
+            runtime.record_local_publish_result_recorded(&recorded)?;
+            return Err(error);
+        }
+    };
     let publish_result = GitHubPublishResult {
         request: payload,
         comment_id: comment.id,
@@ -496,8 +522,10 @@ fn write_optional_output(path: Option<&PathBuf>, text: &str) -> Result<()> {
         let path = config::expand_home(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            set_private_directory_permissions(parent)?;
         }
-        fs::write(path, text)?;
+        fs::write(&path, text)?;
+        set_private_file_permissions(&path)?;
     }
     Ok(())
 }
@@ -537,6 +565,7 @@ mod tests {
                 description: "publish target".to_owned(),
                 objective: "publish target".to_owned(),
                 required_capability: "openclaw.execution.v1".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
             },

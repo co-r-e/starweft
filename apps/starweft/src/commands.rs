@@ -7,16 +7,20 @@ use starweft_id::{ActorId, NodeId, StopId};
 use starweft_p2p::libp2p_peer_id_from_private_key;
 use starweft_protocol::{StopOrder, StopScopeType, UnsignedEnvelope};
 use starweft_runtime::RuntimePipeline;
-use starweft_store::{LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, Store};
+use starweft_store::{
+    LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, PeerTrustState, Store,
+};
 use time::OffsetDateTime;
 
 use crate::cli::*;
 use crate::config::{self, Config, DataPaths, NodeRole, load_existing_config};
 use crate::helpers::{
     configured_actor_key_path, configured_stop_key_path, copy_dir_if_exists, copy_file_if_exists,
-    ensure_binary_exists, extract_peer_suffix, parse_multiaddr, read_keypair, remove_path,
+    ensure_binary_exists, ensure_peer_target_is_trusted, extract_peer_suffix, parse_multiaddr,
+    peer_dispatch_eligibility_reason, peer_trust_state_label, read_keypair, remove_path,
     require_local_identity, require_yes_confirmation, resolve_peer_public_key, resolve_stop_scope,
-    restore_dir_from_bundle, restore_file_from_bundle, sha256_hex, stop_key_exists,
+    restore_dir_from_bundle, restore_file_from_bundle, set_private_directory_permissions,
+    set_private_file_permissions, sha256_hex, stop_key_exists,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -106,6 +110,7 @@ pub(crate) fn create_backup_bundle(
     }
 
     fs::create_dir_all(&output)?;
+    set_private_directory_permissions(&output)?;
     copy_file_if_exists(&paths.config_toml, &output.join("config.toml"))?;
     copy_dir_if_exists(&paths.identity_dir, &output.join("identity"))?;
     if paths.ledger_db.exists() {
@@ -144,6 +149,7 @@ pub(crate) fn create_backup_bundle(
         output.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
+    set_private_file_permissions(&output.join("manifest.json"))?;
 
     Ok(output)
 }
@@ -178,44 +184,101 @@ pub(crate) fn restore_backup_bundle(
         }
     }
 
+    if !force {
+        for (source, destination, label) in [
+            (
+                input.join("config.toml"),
+                paths.config_toml.clone(),
+                "config.toml",
+            ),
+            (
+                input.join("identity"),
+                paths.identity_dir.clone(),
+                "identity",
+            ),
+            (
+                input.join("ledger").join("node.db"),
+                paths.ledger_db.clone(),
+                "ledger/node.db",
+            ),
+            (
+                input.join("ledger").join("node.db-wal"),
+                paths.ledger_db.with_extension("db-wal"),
+                "ledger/node.db-wal",
+            ),
+            (
+                input.join("ledger").join("node.db-shm"),
+                paths.ledger_db.with_extension("db-shm"),
+                "ledger/node.db-shm",
+            ),
+            (
+                input.join("artifacts"),
+                paths.artifacts_dir.clone(),
+                "artifacts",
+            ),
+            (input.join("logs"), paths.logs_dir.clone(), "logs"),
+            (input.join("cache"), paths.cache_dir.clone(), "cache"),
+        ] {
+            if source.exists() && destination.exists() {
+                bail!(
+                    "[E_RESTORE_CONFLICT] restore 先が既に存在します: {} ({label})",
+                    destination.display()
+                );
+            }
+        }
+    }
+
+    let stage_root = paths
+        .root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".starweft-restore-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+    if stage_root.exists() {
+        remove_path(&stage_root)?;
+    }
+    let stage_paths = DataPaths::from_root(&stage_root);
+    stage_paths.ensure_layout()?;
     restore_file_from_bundle(
         &input.join("config.toml"),
-        &paths.config_toml,
-        force,
+        &stage_paths.config_toml,
+        false,
         "config.toml",
     )?;
     restore_dir_from_bundle(
         &input.join("identity"),
-        &paths.identity_dir,
-        force,
+        &stage_paths.identity_dir,
+        true,
         "identity",
     )?;
     restore_file_from_bundle(
         &input.join("ledger").join("node.db"),
-        &paths.ledger_db,
-        force,
+        &stage_paths.ledger_db,
+        false,
         "ledger/node.db",
     )?;
     restore_file_from_bundle(
         &input.join("ledger").join("node.db-wal"),
-        &paths.ledger_db.with_extension("db-wal"),
-        force,
+        &stage_paths.ledger_db.with_extension("db-wal"),
+        false,
         "ledger/node.db-wal",
     )?;
     restore_file_from_bundle(
         &input.join("ledger").join("node.db-shm"),
-        &paths.ledger_db.with_extension("db-shm"),
-        force,
+        &stage_paths.ledger_db.with_extension("db-shm"),
+        false,
         "ledger/node.db-shm",
     )?;
     restore_dir_from_bundle(
         &input.join("artifacts"),
-        &paths.artifacts_dir,
-        force,
+        &stage_paths.artifacts_dir,
+        true,
         "artifacts",
     )?;
-    restore_dir_from_bundle(&input.join("logs"), &paths.logs_dir, force, "logs")?;
-    restore_dir_from_bundle(&input.join("cache"), &paths.cache_dir, force, "cache")?;
+    restore_dir_from_bundle(&input.join("logs"), &stage_paths.logs_dir, true, "logs")?;
+    restore_dir_from_bundle(&input.join("cache"), &stage_paths.cache_dir, true, "cache")?;
 
     if manifest
         .payload
@@ -223,10 +286,42 @@ pub(crate) fn restore_backup_bundle(
         .iter()
         .any(|entry| entry.path == "ledger/node.db")
     {
-        Store::open(&paths.ledger_db)?;
+        Store::open(&stage_paths.ledger_db)?;
+    }
+    set_private_directory_permissions(&stage_paths.root)?;
+    set_private_file_permissions(&stage_paths.config_toml)?;
+
+    let rollback_root = paths
+        .root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".starweft-rollback-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+    let had_existing_root = paths.root.exists();
+    if had_existing_root {
+        if rollback_root.exists() {
+            remove_path(&rollback_root)?;
+        }
+        fs::rename(&paths.root, &rollback_root)?;
+    }
+    match fs::rename(&stage_root, &paths.root) {
+        Ok(()) => {
+            if had_existing_root {
+                remove_path(&rollback_root)?;
+            }
+        }
+        Err(error) => {
+            if had_existing_root && rollback_root.exists() {
+                let _ = fs::rename(&rollback_root, &paths.root);
+            }
+            let _ = remove_path(&stage_root);
+            return Err(error.into());
+        }
     }
 
-    Ok((input, paths))
+    Ok((input, DataPaths::from_root(&paths.root)))
 }
 
 fn collect_backup_manifest_entries(root: &Path) -> Result<Vec<BackupManifestFileEntry>> {
@@ -458,6 +553,7 @@ pub(crate) fn run_audit_verify_log(args: CommonDataDirArgs) -> Result<()> {
             + report.parse_failures
             + report.signature_failures
             + report.raw_json_mismatches
+            + report.unverifiable_signatures
     );
     println!("signature_failures: {}", report.signature_failures);
     println!("raw_json_mismatches: {}", report.raw_json_mismatches);
@@ -465,9 +561,15 @@ pub(crate) fn run_audit_verify_log(args: CommonDataDirArgs) -> Result<()> {
         "unverifiable_signatures: {}",
         report.unverifiable_signatures
     );
-    if !report.errors.is_empty() {
+    if !report.errors.is_empty() || report.unverifiable_signatures > 0 {
         for error in report.errors {
             println!("error: {error}");
+        }
+        if report.unverifiable_signatures > 0 {
+            println!(
+                "error: unverifiable_signatures={}",
+                report.unverifiable_signatures
+            );
         }
         bail!("[E_AUDIT_FAILED] task_events に不整合があります");
     }
@@ -625,6 +727,7 @@ pub(crate) fn run_peer_add(args: PeerAddArgs) -> Result<()> {
             public_key,
             stop_public_key,
             capabilities,
+            trust_state: PeerTrustState::Trusted,
             updated_at: time::OffsetDateTime::now_utc(),
         })?;
     } else if !capabilities.is_empty() || stop_public_key.is_some() {
@@ -639,6 +742,7 @@ pub(crate) fn run_peer_add(args: PeerAddArgs) -> Result<()> {
         if stop_public_key.is_some() {
             existing.stop_public_key = stop_public_key;
         }
+        existing.trust_state = PeerTrustState::Trusted;
         existing.updated_at = time::OffsetDateTime::now_utc();
         store.upsert_peer_identity(&existing)?;
     }
@@ -677,21 +781,125 @@ pub(crate) fn run_peer_list(args: PeerListArgs) -> Result<()> {
     }
 
     for (index, peer) in peers.iter().enumerate() {
-        let capability_suffix = store
-            .peer_identity(&peer.actor_id)?
-            .filter(|identity| !identity.capabilities.is_empty())
-            .map(|identity| format!(" caps={}", identity.capabilities.join(",")))
-            .unwrap_or_default();
+        let identity = store.peer_identity(&peer.actor_id)?;
         println!(
-            "{}. {} {}{}",
-            index + 1,
-            peer.actor_id,
-            peer.multiaddr,
-            capability_suffix
+            "{}",
+            render_peer_list_entry(index + 1, peer, identity.as_ref())
         );
     }
 
     Ok(())
+}
+
+pub(crate) fn run_peer_promote(args: PeerPromoteArgs) -> Result<()> {
+    let (_, paths) = load_existing_config(args.data_dir.as_ref())?;
+    let store = Store::open(&paths.ledger_db)?;
+    let actor_id = ActorId::new(args.actor_id)?;
+    let mut identity = store
+        .peer_identity(&actor_id)?
+        .ok_or_else(|| anyhow!("[E_PEER_NOT_FOUND] peer identity が見つかりません: {actor_id}"))?;
+    identity.trust_state = match args.trust {
+        PeerTrustArg::Trusted => PeerTrustState::Trusted,
+        PeerTrustArg::Pinned => PeerTrustState::Pinned,
+    };
+    identity.updated_at = OffsetDateTime::now_utc();
+    store.upsert_peer_identity(&identity)?;
+    println!(
+        "promoted: {} trust={}",
+        identity.actor_id,
+        peer_trust_state_label(identity.trust_state)
+    );
+    Ok(())
+}
+
+pub(crate) fn run_peer_revoke(args: PeerRevokeArgs) -> Result<()> {
+    let (_, paths) = load_existing_config(args.data_dir.as_ref())?;
+    let store = Store::open(&paths.ledger_db)?;
+    let actor_id = ActorId::new(args.actor_id)?;
+    let mut identity = store
+        .peer_identity(&actor_id)?
+        .ok_or_else(|| anyhow!("[E_PEER_NOT_FOUND] peer identity が見つかりません: {actor_id}"))?;
+    identity.trust_state = PeerTrustState::Revoked;
+    identity.updated_at = OffsetDateTime::now_utc();
+    store.upsert_peer_identity(&identity)?;
+    println!(
+        "revoked: {} trust={}",
+        identity.actor_id,
+        peer_trust_state_label(identity.trust_state)
+    );
+    Ok(())
+}
+
+pub(crate) fn run_peer_rotate(args: PeerRotateArgs) -> Result<()> {
+    let (_, paths) = load_existing_config(args.data_dir.as_ref())?;
+    let store = Store::open(&paths.ledger_db)?;
+    let actor_id = ActorId::new(args.actor_id)?;
+    let mut identity = store
+        .peer_identity(&actor_id)?
+        .ok_or_else(|| anyhow!("[E_PEER_NOT_FOUND] peer identity が見つかりません: {actor_id}"))?;
+    let public_key = resolve_peer_public_key(args.public_key, args.public_key_file)?;
+    let stop_public_key = resolve_peer_public_key(args.stop_public_key, args.stop_public_key_file)?;
+    if public_key.is_none() && stop_public_key.is_none() {
+        bail!(
+            "[E_ARGUMENT] --public-key/--public-key-file または --stop-public-key/--stop-public-key-file のいずれかが必要です"
+        );
+    }
+    if let Some(public_key) = public_key {
+        identity.public_key = public_key;
+    }
+    if stop_public_key.is_some() {
+        identity.stop_public_key = stop_public_key;
+    }
+    identity.updated_at = OffsetDateTime::now_utc();
+    store.upsert_peer_identity(&identity)?;
+    println!(
+        "rotated: {} public_key_fp={} stop_key_fp={}",
+        identity.actor_id,
+        peer_key_fingerprint(&identity.public_key),
+        identity
+            .stop_public_key
+            .as_deref()
+            .map(peer_key_fingerprint)
+            .unwrap_or_else(|| "none".to_owned())
+    );
+    Ok(())
+}
+
+fn render_peer_list_entry(
+    index: usize,
+    peer: &PeerAddressRecord,
+    identity: Option<&PeerIdentityRecord>,
+) -> String {
+    let trust_state = identity
+        .map(|identity| peer_trust_state_label(identity.trust_state))
+        .unwrap_or("unknown");
+    let eligibility = identity
+        .map(|identity| peer_dispatch_eligibility_reason(identity.trust_state))
+        .unwrap_or("blocked:missing_identity");
+    let key_fp = identity
+        .map(|identity| peer_key_fingerprint(&identity.public_key))
+        .unwrap_or_else(|| "none".to_owned());
+    let stop_key_fp = identity
+        .and_then(|identity| identity.stop_public_key.as_deref())
+        .map(peer_key_fingerprint)
+        .unwrap_or_else(|| "none".to_owned());
+    let caps = identity
+        .filter(|identity| !identity.capabilities.is_empty())
+        .map(|identity| identity.capabilities.join(","))
+        .unwrap_or_else(|| "-".to_owned());
+    let seen = peer
+        .last_seen_at
+        .map(|ts| ts.to_string())
+        .unwrap_or_else(|| "manual".to_owned());
+    format!(
+        "{index}. {} {} trust={} dispatch={} pk_fp={} stop_fp={} last_seen={} caps={}",
+        peer.actor_id, peer.multiaddr, trust_state, eligibility, key_fp, stop_key_fp, seen, caps
+    )
+}
+
+fn peer_key_fingerprint(encoded_key: &str) -> String {
+    let digest = sha256_hex(encoded_key.as_bytes());
+    digest.chars().take(12).collect()
 }
 
 pub(crate) fn run_openclaw_attach(args: OpenClawAttachArgs) -> Result<()> {
@@ -821,6 +1029,59 @@ pub(crate) fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {
         }
     }
 
+    if config.discovery.registry_shared_secret.is_some() {
+        warnings.push(
+            "discovery.registry_shared_secret: inline secret は backup/process list 経由で露出しやすいため非推奨です"
+                .to_owned(),
+        );
+    }
+    if let Some(url) = config.discovery.registry_url.as_deref() {
+        match reqwest::Url::parse(url) {
+            Ok(parsed) => {
+                let host = parsed.host_str().unwrap_or_default();
+                let loopback = host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .map(|address| address.is_loopback())
+                        .unwrap_or(false);
+                if parsed.scheme() == "http" && !loopback {
+                    warnings.push(format!(
+                        "discovery.registry_url: public http registry は非推奨です: {url}"
+                    ));
+                }
+                if !loopback
+                    && config.discovery.registry_shared_secret.is_none()
+                    && config.discovery.registry_shared_secret_env.is_none()
+                {
+                    warnings.push(
+                        "discovery.registry_url: non-loopback registry ですが shared secret 未設定です"
+                            .to_owned(),
+                    );
+                }
+            }
+            Err(error) => warnings.push(format!("discovery.registry_url: {error}")),
+        }
+    }
+
+    for (path, expected, label, is_dir) in [
+        (&paths.root, 0o700, "node.data_dir", true),
+        (&paths.identity_dir, 0o700, "identity.dir", true),
+        (&paths.logs_dir, 0o700, "logs.dir", true),
+        (&paths.cache_dir, 0o700, "cache.dir", true),
+        (&paths.artifacts_dir, 0o700, "artifacts.dir", true),
+        (&paths.config_toml, 0o600, "config.toml", false),
+    ] {
+        if path.exists() {
+            if let Some(mode) = permission_mode(path, is_dir) {
+                if mode != expected {
+                    warnings.push(format!(
+                        "{label}: private permissions drift (expected {expected:o}, got {mode:o})"
+                    ));
+                }
+            }
+        }
+    }
+
     // observation planner が openclaw 系なのに bin 未設定
     if matches!(
         config.observation.planner,
@@ -870,6 +1131,19 @@ fn print_validation_result(json: bool, errors: &[String], warnings: &[String]) -
     }
 }
 
+#[cfg(unix)]
+fn permission_mode(path: &Path, _is_dir: bool) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn permission_mode(_path: &Path, _is_dir: bool) -> Option<u32> {
+    None
+}
+
 pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
     let (config, paths) = load_existing_config(args.data_dir.as_ref())?;
     if config.node.role != NodeRole::Principal {
@@ -888,6 +1162,7 @@ pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
 
     let store = Store::open(&paths.ledger_db)?;
     let identity = require_local_identity(&store, &paths)?;
+    let actor_key = read_keypair(&configured_actor_key_path(&config, &paths)?)?;
     let stop_key_path = configured_stop_key_path(&config, &paths)?;
     if !stop_key_path.exists() {
         bail!(
@@ -902,19 +1177,34 @@ pub(crate) fn run_stop(args: StopArgs) -> Result<()> {
         Some(actor_id) => actor_id,
         None => crate::runtime::unique_peer_actor_id(&store)?,
     };
+    ensure_peer_target_is_trusted(&store, &owner_actor_id, "stop")?;
 
     let stop_id = StopId::generate();
+    let reason_code = args.reason_code;
+    let reason_text = args.reason_text;
+    let issued_at = time::OffsetDateTime::now_utc();
     let order = StopOrder {
         stop_id: stop_id.clone(),
         scope_type: scope.scope_type.clone(),
         scope_id: scope.scope_id.clone(),
-        reason_code: args.reason_code,
-        reason_text: args.reason_text,
-        issued_at: time::OffsetDateTime::now_utc(),
+        reason_code: reason_code.clone(),
+        reason_text: reason_text.clone(),
+        issued_at,
+        authority_actor_id: identity.actor_id.clone(),
+        authority_signature: stop_key.sign_json(&starweft_protocol::StopAuthorityPayload {
+            stop_id: stop_id.clone(),
+            project_id: scope.project_id.clone(),
+            scope_type: scope.scope_type.clone(),
+            scope_id: scope.scope_id.clone(),
+            reason_code,
+            reason_text,
+            authority_actor_id: identity.actor_id.clone(),
+            issued_at,
+        })?,
     };
     let unsigned = UnsignedEnvelope::new(identity.actor_id, Some(owner_actor_id), order)
         .with_project_id(scope.project_id);
-    let envelope = unsigned.sign(&stop_key)?;
+    let envelope = unsigned.sign(&actor_key)?;
 
     let runtime = RuntimePipeline::new(&store);
     runtime.queue_outgoing(&envelope)?;
@@ -948,7 +1238,9 @@ mod tests {
     use super::*;
     use crate::config::{Config, DataPaths, NodeRole};
     use starweft_id::{ActorId, NodeId};
-    use starweft_store::{LocalIdentityRecord, Store};
+    use starweft_store::{
+        LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, PeerTrustState, Store,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -988,6 +1280,14 @@ mod tests {
         fs::write(paths.logs_dir.join("runtime.log"), "runtime-log").expect("write log");
         fs::write(paths.cache_dir.join("state.json"), "{\"cached\":true}").expect("write cache");
 
+        paths
+    }
+
+    fn write_peer_command_config(root: &Path) -> DataPaths {
+        let paths = DataPaths::from_root(root);
+        let config = Config::for_role(NodeRole::Owner, root, None);
+        config.save(&paths.config_toml).expect("save config");
+        paths.ensure_layout().expect("layout");
         paths
     }
 
@@ -1230,6 +1530,109 @@ mod tests {
         );
         assert_eq!(messages[0].delivery_attempts, 1);
         assert_eq!(messages[0].last_error.as_deref(), Some("network down"));
+    }
+
+    #[test]
+    fn run_peer_revoke_marks_peer_revoked() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = write_peer_command_config(temp.path());
+        let store = Store::open(&paths.ledger_db).expect("store");
+        let actor_id = ActorId::generate();
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: actor_id.clone(),
+                node_id: NodeId::generate(),
+                public_key: StoredKeypair::generate().public_key,
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: PeerTrustState::Trusted,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("peer identity");
+
+        run_peer_revoke(PeerRevokeArgs {
+            actor_id: actor_id.to_string(),
+            data_dir: Some(temp.path().to_path_buf()),
+        })
+        .expect("revoke");
+
+        let identity = store
+            .peer_identity(&actor_id)
+            .expect("lookup")
+            .expect("identity");
+        assert_eq!(identity.trust_state, PeerTrustState::Revoked);
+    }
+
+    #[test]
+    fn run_peer_rotate_updates_keys_and_preserves_trust() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = write_peer_command_config(temp.path());
+        let store = Store::open(&paths.ledger_db).expect("store");
+        let actor_id = ActorId::generate();
+        let original_key = StoredKeypair::generate();
+        let replacement_key = StoredKeypair::generate();
+        let replacement_stop_key = StoredKeypair::generate();
+        store
+            .upsert_peer_identity(&PeerIdentityRecord {
+                actor_id: actor_id.clone(),
+                node_id: NodeId::generate(),
+                public_key: original_key.public_key,
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: PeerTrustState::Pinned,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .expect("peer identity");
+
+        run_peer_rotate(PeerRotateArgs {
+            actor_id: actor_id.to_string(),
+            data_dir: Some(temp.path().to_path_buf()),
+            public_key: Some(replacement_key.public_key.clone()),
+            public_key_file: None,
+            stop_public_key: Some(replacement_stop_key.public_key.clone()),
+            stop_public_key_file: None,
+        })
+        .expect("rotate");
+
+        let identity = store
+            .peer_identity(&actor_id)
+            .expect("lookup")
+            .expect("identity");
+        assert_eq!(identity.public_key, replacement_key.public_key);
+        assert_eq!(
+            identity.stop_public_key.as_deref(),
+            Some(replacement_stop_key.public_key.as_str())
+        );
+        assert_eq!(identity.trust_state, PeerTrustState::Pinned);
+    }
+
+    #[test]
+    fn render_peer_list_entry_shows_fingerprint_and_eligibility() {
+        let peer = PeerAddressRecord {
+            actor_id: ActorId::new("actor_peer_01").expect("actor"),
+            node_id: NodeId::new("node_peer_01").expect("node"),
+            multiaddr: "/ip4/127.0.0.1/tcp/9000".to_owned(),
+            last_seen_at: None,
+        };
+        let key = StoredKeypair::generate();
+        let rendered = render_peer_list_entry(
+            1,
+            &peer,
+            Some(&PeerIdentityRecord {
+                actor_id: peer.actor_id.clone(),
+                node_id: peer.node_id.clone(),
+                public_key: key.public_key.clone(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                trust_state: PeerTrustState::Revoked,
+                updated_at: OffsetDateTime::now_utc(),
+            }),
+        );
+
+        assert!(rendered.contains("trust=revoked"));
+        assert!(rendered.contains("dispatch=blocked:revoked"));
+        assert!(rendered.contains("pk_fp="));
+        assert!(rendered.contains("caps=openclaw.execution.v1"));
     }
 
     #[test]

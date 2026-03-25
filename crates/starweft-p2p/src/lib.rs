@@ -251,6 +251,14 @@ impl RuntimeTransport {
             Self::Libp2p(driver) => driver.external_addresses(),
         }
     }
+
+    /// Returns the number of currently connected peers if the transport can report it.
+    pub fn connected_peer_count(&self) -> Option<u64> {
+        match self {
+            Self::LocalMailbox(_) => None,
+            Self::Libp2p(driver) => Some(driver.connected_peer_count()),
+        }
+    }
 }
 
 /// Derives the libp2p peer ID string from a 32-byte Ed25519 private key.
@@ -421,6 +429,9 @@ enum Libp2pCommand {
     QueryExternalAddresses {
         reply_tx: Sender<Vec<Multiaddr>>,
     },
+    QueryConnectedPeerCount {
+        reply_tx: Sender<u64>,
+    },
     Shutdown,
 }
 
@@ -570,6 +581,19 @@ impl Libp2pTransport {
             return Vec::new();
         }
         reply_rx.recv().unwrap_or_default()
+    }
+
+    /// Returns the number of currently connected peers.
+    pub fn connected_peer_count(&self) -> u64 {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .command_tx
+            .send(Libp2pCommand::QueryConnectedPeerCount { reply_tx })
+            .is_err()
+        {
+            return 0;
+        }
+        reply_rx.recv().unwrap_or(0)
     }
 }
 
@@ -923,6 +947,9 @@ async fn libp2p_event_loop(
                     Libp2pCommand::QueryExternalAddresses { reply_tx } => {
                         let addrs = swarm.external_addresses().cloned().collect();
                         let _ = reply_tx.send(addrs);
+                    }
+                    Libp2pCommand::QueryConnectedPeerCount { reply_tx } => {
+                        let _ = reply_tx.send(swarm.connected_peers().count() as u64);
                     }
                     Libp2pCommand::Shutdown => break,
                 }

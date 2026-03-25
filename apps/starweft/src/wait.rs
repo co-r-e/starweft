@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use serde_json::Value;
 use starweft_id::{ProjectId, StopId, TaskId, VisionId};
 use starweft_protocol::{ProjectStatus, TaskStatus};
@@ -77,62 +77,6 @@ pub(crate) struct WaitOutput {
     pub(crate) event_msg_type: Option<String>,
     pub(crate) snapshot: Option<Value>,
     pub(crate) event: Option<Value>,
-}
-
-pub(crate) fn build_local_project_approval_wait_output(
-    store: &Store,
-    project_id: &ProjectId,
-) -> Result<WaitOutput> {
-    let snapshot = store
-        .project_snapshot(project_id)?
-        .ok_or_else(|| anyhow!("[E_PROJECT_NOT_FOUND] project が見つかりません"))?;
-    Ok(WaitOutput {
-        scope_type: "project".to_owned(),
-        scope_id: project_id.to_string(),
-        matched_condition: "approval_applied".to_owned(),
-        elapsed_ms: 0,
-        matched_at: now_rfc3339()?,
-        project_id: Some(snapshot.project_id.to_string()),
-        vision_id: Some(snapshot.vision_id.to_string()),
-        status: Some(snapshot.status.to_string()),
-        stop_scope_type: None,
-        stop_scope_id: None,
-        event_msg_type: Some("ApprovalApplied".to_owned()),
-        snapshot: Some(serde_json::to_value(&snapshot)?),
-        event: Some(serde_json::json!({
-            "mode": "local",
-            "scope_type": "project",
-            "scope_id": project_id.to_string(),
-        })),
-    })
-}
-
-pub(crate) fn build_local_task_approval_wait_output(
-    store: &Store,
-    task_id: &TaskId,
-) -> Result<WaitOutput> {
-    let snapshot = store
-        .task_snapshot(task_id)?
-        .ok_or_else(|| anyhow!("[E_TASK_NOT_FOUND] task が見つかりません"))?;
-    Ok(WaitOutput {
-        scope_type: "task".to_owned(),
-        scope_id: task_id.to_string(),
-        matched_condition: "approval_applied".to_owned(),
-        elapsed_ms: 0,
-        matched_at: now_rfc3339()?,
-        project_id: Some(snapshot.project_id.to_string()),
-        vision_id: None,
-        status: Some(snapshot.status.to_string()),
-        stop_scope_type: None,
-        stop_scope_id: None,
-        event_msg_type: Some("ApprovalApplied".to_owned()),
-        snapshot: Some(serde_json::to_value(&snapshot)?),
-        event: Some(serde_json::json!({
-            "mode": "local",
-            "scope_type": "task",
-            "scope_id": task_id.to_string(),
-        })),
-    })
 }
 
 pub(crate) fn run_wait(args: WaitArgs) -> Result<()> {
@@ -677,6 +621,7 @@ mod tests {
                 title: "Project".to_owned(),
                 objective: "Objective".to_owned(),
                 stop_authority_actor_id: principal_actor_id,
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 participant_policy: starweft_protocol::ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -706,6 +651,7 @@ mod tests {
                 description: "desc".to_owned(),
                 objective: "obj".to_owned(),
                 required_capability: "openclaw.execution.v1".to_owned(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 input_payload: serde_json::json!({}),
                 expected_output_schema: serde_json::json!({}),
             },
@@ -788,6 +734,7 @@ mod tests {
                 title: "Wait Approval Project".to_owned(),
                 objective: "approval".to_owned(),
                 stop_authority_actor_id: principal_actor.clone(),
+                execution_mode: starweft_protocol::ExecutionMode::Full,
                 participant_policy: starweft_protocol::ParticipantPolicy {
                     external_agents_allowed: true,
                 },

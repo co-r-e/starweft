@@ -34,6 +34,12 @@ pub struct OpenClawAttachment {
     pub working_dir: Option<String>,
     /// Maximum execution time in seconds (defaults to 3600).
     pub timeout_sec: Option<u64>,
+    /// Whether to clear the child process environment before launching.
+    #[serde(default)]
+    pub clear_env: bool,
+    /// Environment variable names to pass through when `clear_env` is enabled.
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
 }
 
 /// A task request sent to the external process via stdin as JSON.
@@ -169,6 +175,14 @@ fn execute_task_inner(
 
     if let Some(working_dir) = &attachment.working_dir {
         command.current_dir(Path::new(working_dir));
+    }
+    if attachment.clear_env {
+        command.env_clear();
+        for key in &attachment.env_allowlist {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
     }
 
     let mut child = command.spawn()?;
@@ -489,6 +503,8 @@ printf '{"summary":"ok","output_payload":{"done":true}}'
                 bin: script_path.display().to_string(),
                 working_dir: None,
                 timeout_sec: Some(5),
+                clear_env: false,
+                env_allowlist: Vec::new(),
             },
             &sample_request(),
         )
@@ -516,6 +532,8 @@ printf '{"summary":"late","output_payload":{"done":true}}'
                 bin: script_path.display().to_string(),
                 working_dir: None,
                 timeout_sec: Some(1),
+                clear_env: false,
+                env_allowlist: Vec::new(),
             },
             &sample_request(),
         )
@@ -542,6 +560,8 @@ printf '{"summary":"done","output_payload":{"ok":true}}'
                 bin: script_path.display().to_string(),
                 working_dir: None,
                 timeout_sec: Some(5),
+                clear_env: false,
+                env_allowlist: Vec::new(),
             },
             &sample_request(),
         )
@@ -576,6 +596,8 @@ printf '{"summary":"late","output_payload":{"done":true}}'
                 bin: script_path.display().to_string(),
                 working_dir: None,
                 timeout_sec: Some(10),
+                clear_env: false,
+                env_allowlist: Vec::new(),
             },
             &sample_request(),
             Some(cancel_flag.as_ref()),

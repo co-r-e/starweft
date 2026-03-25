@@ -67,6 +67,16 @@ fn set_discovery_seeds(config_path: &Path, seeds: &[String]) {
     std::fs::write(config_path, updated).expect("write config");
 }
 
+fn promote_peer(data_dir: &Path, actor_id: &str) {
+    run(&[
+        "peer",
+        "promote",
+        actor_id,
+        "--data-dir",
+        data_dir.to_str().expect("path"),
+    ]);
+}
+
 #[cfg(unix)]
 fn write_mock_openclaw(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -247,6 +257,24 @@ fn libp2p_three_node_workflow_and_stop() {
             principal["libp2p_peer_id"]
         ),
         "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--actor-id",
+        &principal["actor_id"],
+        "--node-id",
+        &principal["node_id"],
+        "--public-key",
+        &principal["public_key"],
+        "--stop-public-key",
+        &principal["stop_public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{principal_port}/p2p/{}",
+            principal["libp2p_peer_id"]
+        ),
+        "--data-dir",
         owner_dir.to_str().expect("path"),
         "--actor-id",
         &principal["actor_id"],
@@ -266,6 +294,44 @@ fn libp2p_three_node_workflow_and_stop() {
         ),
         "--data-dir",
         owner_dir.to_str().expect("path"),
+        "--actor-id",
+        &worker["actor_id"],
+        "--node-id",
+        &worker["node_id"],
+        "--public-key",
+        &worker["public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
+            owner["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--actor-id",
+        &owner["actor_id"],
+        "--node-id",
+        &owner["node_id"],
+        "--public-key",
+        &owner["public_key"],
+    ]);
+    run(&[
+        "peer",
+        "add",
+        &format!(
+            "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
+            owner["libp2p_peer_id"]
+        ),
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
+        "--actor-id",
+        &owner["actor_id"],
+        "--node-id",
+        &owner["node_id"],
+        "--public-key",
+        &owner["public_key"],
     ]);
 
     let mut worker_fg = spawn_foreground(&[
@@ -552,6 +618,12 @@ fn libp2p_worker_plans_vision_via_openclaw() {
         ),
         "--data-dir",
         owner_dir.to_str().expect("path"),
+        "--actor-id",
+        &worker["actor_id"],
+        "--node-id",
+        &worker["node_id"],
+        "--public-key",
+        &worker["public_key"],
     ]);
 
     let mut owner_fg = spawn_foreground(&[
@@ -700,11 +772,23 @@ fn libp2p_bootstraps_via_discovery_seeds_without_peer_add() {
     replace_transport_with_libp2p(&worker_dir.join("config.toml"));
     enable_openclaw_bridge(&worker_dir.join("config.toml"), &mock_openclaw);
 
+    let principal = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        principal_dir.to_str().expect("path"),
+    ]));
     let owner = parse_keyed_output(&run(&[
         "identity",
         "show",
         "--data-dir",
         owner_dir.to_str().expect("path"),
+    ]));
+    let worker = parse_keyed_output(&run(&[
+        "identity",
+        "show",
+        "--data-dir",
+        worker_dir.to_str().expect("path"),
     ]));
     let owner_seed = format!(
         "/ip4/127.0.0.1/tcp/{owner_port}/p2p/{}",
@@ -752,6 +836,20 @@ fn libp2p_bootstraps_via_discovery_seeds_without_peer_add() {
         "openclaw.execution.v1",
         Duration::from_secs(30),
     );
+    wait_for_contains(
+        &owner_db,
+        "select public_key from peer_keys;",
+        &principal["public_key"],
+        Duration::from_secs(30),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select public_key from peer_keys;",
+        &worker["public_key"],
+        Duration::from_secs(30),
+    );
+    promote_peer(&owner_dir, &principal["actor_id"]);
+    promote_peer(&owner_dir, &worker["actor_id"]);
 
     run(&[
         "vision",
@@ -1133,6 +1231,30 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
     ]);
 
     wait_for_contains(
+        &owner_db,
+        "select msg_type from outbox_messages where msg_type = 'StopOrder';",
+        "StopOrder",
+        Duration::from_secs(30),
+    );
+    wait_for_contains(
+        &owner_db,
+        "select delivery_state || ':' || ifnull(last_error, '') from outbox_deliveries where msg_id in (select msg_id from outbox_messages where msg_type = 'StopOrder') order by rowid desc limit 1;",
+        "delivered",
+        Duration::from_secs(30),
+    );
+    wait_for_contains(
+        &worker_db,
+        "select count(*) from stop_orders;",
+        "1",
+        Duration::from_secs(30),
+    );
+    wait_for_contains(
+        &worker_db,
+        "select status from tasks;",
+        "stopped",
+        Duration::from_secs(120),
+    );
+    wait_for_contains(
         &principal_db,
         "select ack_state from stop_receipts;",
         "stopped",
@@ -1141,12 +1263,6 @@ fn libp2p_stop_cancels_running_worker_without_result_submission() {
     wait_for_contains(
         &owner_db,
         "select status from projects;",
-        "stopped",
-        Duration::from_secs(120),
-    );
-    wait_for_contains(
-        &worker_db,
-        "select status from tasks;",
         "stopped",
         Duration::from_secs(120),
     );

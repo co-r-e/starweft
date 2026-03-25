@@ -10,6 +10,7 @@ use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use reqwest::Method;
 use sha2::{Digest, Sha256};
+use starweft_crypto::{MessageSignature, StoredKeypair, verify_json, verifying_key_from_base64};
 use starweft_id::{ActorId, NodeId};
 use starweft_p2p::{RuntimeTopology, RuntimeTransport};
 use starweft_store::Store;
@@ -18,8 +19,8 @@ use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_kn
 use crate::cli::RegistryServeArgs;
 use crate::config::{Config, DataPaths};
 use crate::helpers::{
-    BootstrapPeerParams, local_advertised_capabilities, local_listen_addresses,
-    local_stop_public_key_helper, upsert_bootstrap_peer,
+    BootstrapPeerParams, configured_actor_key_path, local_advertised_capabilities,
+    local_listen_addresses, local_stop_public_key_helper, read_keypair, upsert_bootstrap_peer,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,31 @@ pub(crate) struct RegistryPeerRecord {
     pub(crate) listen_addresses: Vec<String>,
     pub(crate) role: String,
     pub(crate) published_at: OffsetDateTime,
+    pub(crate) record_signature: MessageSignature,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RegistryPeerRecordSignable<'a> {
+    actor_id: &'a str,
+    node_id: &'a str,
+    public_key: &'a str,
+    stop_public_key: &'a Option<String>,
+    capabilities: &'a [String],
+    listen_addresses: &'a [String],
+    role: &'a str,
+    published_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug)]
+struct RegistryPeerRecordInput {
+    actor_id: ActorId,
+    node_id: NodeId,
+    public_key: String,
+    stop_public_key: Option<String>,
+    capabilities: Vec<String>,
+    listen_addresses: Vec<String>,
+    role: String,
+    published_at: OffsetDateTime,
 }
 
 pub(crate) type RegistryHmacSha256 = Hmac<Sha256>;
@@ -256,6 +282,54 @@ pub(crate) fn sign_registry_request(
         .map_err(|error| anyhow!("[E_REGISTRY_AUTH] invalid shared secret: {error}"))?;
     mac.update(registry_signature_input(method, path, timestamp, nonce, content_sha256).as_bytes());
     Ok(BASE64_STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn registry_peer_record_signable(record: &RegistryPeerRecord) -> RegistryPeerRecordSignable<'_> {
+    RegistryPeerRecordSignable {
+        actor_id: &record.actor_id,
+        node_id: &record.node_id,
+        public_key: &record.public_key,
+        stop_public_key: &record.stop_public_key,
+        capabilities: &record.capabilities,
+        listen_addresses: &record.listen_addresses,
+        role: &record.role,
+        published_at: record.published_at,
+    }
+}
+
+fn sign_registry_peer_record(
+    actor_key: &StoredKeypair,
+    input: RegistryPeerRecordInput,
+) -> Result<RegistryPeerRecord> {
+    let mut record = RegistryPeerRecord {
+        actor_id: input.actor_id.to_string(),
+        node_id: input.node_id.to_string(),
+        public_key: input.public_key,
+        stop_public_key: input.stop_public_key,
+        capabilities: input.capabilities,
+        listen_addresses: input.listen_addresses,
+        role: input.role,
+        published_at: input.published_at,
+        record_signature: actor_key.sign_json(&serde_json::json!({}))?,
+    };
+    record.record_signature = actor_key.sign_json(&registry_peer_record_signable(&record))?;
+    Ok(record)
+}
+
+fn verify_registry_peer_record(record: &RegistryPeerRecord) -> Result<()> {
+    if record.record_signature.alg != "ed25519" {
+        bail!(
+            "[E_REGISTRY_RECORD_SIGNATURE] unsupported signature algorithm: {}",
+            record.record_signature.alg
+        );
+    }
+    let verifying_key = verifying_key_from_base64(&record.public_key)?;
+    verify_json(
+        &verifying_key,
+        &registry_peer_record_signable(record),
+        &record.record_signature,
+    )?;
+    Ok(())
 }
 
 pub(crate) fn parse_http_headers(headers: &str) -> HashMap<String, String> {
@@ -635,6 +709,11 @@ fn validate_registry_peer_record(
             "registry announce listen_addresses must not be empty",
         ));
     }
+    if let Err(error) = verify_registry_peer_record(record) {
+        return Err(RegistryHttpError::bad_request(format!(
+            "registry announce actor signature is invalid: {error}"
+        )));
+    }
     Ok(())
 }
 
@@ -824,16 +903,20 @@ pub(crate) fn sync_discovery_registry(
         .timeout(Duration::from_secs(5))
         .build()?;
     if let (Some(topology), Some(transport)) = (topology, transport) {
-        let announcement = RegistryPeerRecord {
-            actor_id: identity.actor_id.to_string(),
-            node_id: identity.node_id.to_string(),
-            public_key: identity.public_key.clone(),
-            stop_public_key: local_stop_public_key_helper(config, paths),
-            capabilities: local_advertised_capabilities(config),
-            listen_addresses: local_listen_addresses(topology, transport),
-            role: config.node.role.to_string(),
-            published_at: OffsetDateTime::now_utc(),
-        };
+        let actor_key = read_keypair(&configured_actor_key_path(config, paths)?)?;
+        let announcement = sign_registry_peer_record(
+            &actor_key,
+            RegistryPeerRecordInput {
+                actor_id: identity.actor_id.clone(),
+                node_id: identity.node_id.clone(),
+                public_key: identity.public_key.clone(),
+                stop_public_key: local_stop_public_key_helper(config, paths),
+                capabilities: local_advertised_capabilities(config),
+                listen_addresses: local_listen_addresses(topology, transport),
+                role: config.node.role.to_string(),
+                published_at: OffsetDateTime::now_utc(),
+            },
+        )?;
         let announce_url = registry_endpoint(registry_url, "announce");
         let announcement_body = serde_json::to_vec(&announcement)?;
         apply_registry_auth(
@@ -865,6 +948,7 @@ pub(crate) fn sync_discovery_registry(
         if record.actor_id == identity.actor_id.as_str() {
             continue;
         }
+        verify_registry_peer_record(&record)?;
         upsert_bootstrap_peer(BootstrapPeerParams {
             store,
             actor_id: &ActorId::new(record.actor_id.clone())?,
@@ -908,8 +992,10 @@ mod tests {
         let shared_secret = "registry-test-secret".to_owned();
         let discovered_actor = ActorId::generate().to_string();
         let discovered_node = NodeId::generate().to_string();
+        let discovered_keypair = starweft_crypto::StoredKeypair::generate();
         let discovered_actor_for_server = discovered_actor.clone();
         let discovered_node_for_server = discovered_node.clone();
+        let discovered_public_key_for_server = discovered_keypair.public_key.clone();
         let shared_secret_for_server = shared_secret.clone();
         let server = std::thread::spawn(move || {
             let (mut post_stream, _) = listener.accept().expect("accept announce");
@@ -945,6 +1031,11 @@ mod tests {
                 OffsetDateTime::now_utc(),
             )
             .expect("validate announce auth");
+            let announced = serde_json::from_slice::<RegistryPeerRecord>(
+                &request[header_end..header_end + content_length],
+            )
+            .expect("announce body");
+            verify_registry_peer_record(&announced).expect("announce actor signature");
             write!(
                 post_stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{{\"ok\":true}}"
@@ -975,16 +1066,23 @@ mod tests {
             )
             .expect("validate peers auth");
 
-            let response = vec![RegistryPeerRecord {
-                actor_id: discovered_actor_for_server.clone(),
-                node_id: discovered_node_for_server.clone(),
-                public_key: "registry-peer-pk".to_owned(),
-                stop_public_key: None,
-                capabilities: vec!["openclaw.execution.v1".to_owned()],
-                listen_addresses: vec!["/unix/registry-peer.sock".to_owned()],
-                role: "worker".to_owned(),
-                published_at: OffsetDateTime::now_utc(),
-            }];
+            let response = vec![
+                sign_registry_peer_record(
+                    &discovered_keypair,
+                    RegistryPeerRecordInput {
+                        actor_id: ActorId::new(discovered_actor_for_server.clone())
+                            .expect("actor id"),
+                        node_id: NodeId::new(discovered_node_for_server.clone()).expect("node id"),
+                        public_key: discovered_public_key_for_server.clone(),
+                        stop_public_key: None,
+                        capabilities: vec!["openclaw.execution.v1".to_owned()],
+                        listen_addresses: vec!["/unix/registry-peer.sock".to_owned()],
+                        role: "worker".to_owned(),
+                        published_at: OffsetDateTime::now_utc(),
+                    },
+                )
+                .expect("sign registry record"),
+            ];
             let body = serde_json::to_string(&response).expect("response json");
             write!(
                 get_stream,
@@ -1004,6 +1102,9 @@ mod tests {
         paths.ensure_layout().expect("layout");
         let store = Store::open(&paths.ledger_db).expect("store");
         let keypair = starweft_crypto::StoredKeypair::generate();
+        keypair
+            .write_to_path(&paths.actor_key)
+            .expect("write actor key");
         store
             .upsert_local_identity(&starweft_store::LocalIdentityRecord {
                 actor_id: ActorId::generate(),
@@ -1214,6 +1315,66 @@ mod tests {
             OffsetDateTime::now_utc(),
         )
         .expect("invalid announce payload should return response");
+        assert_eq!(response.0, "HTTP/1.1 400 Bad Request");
+    }
+
+    #[test]
+    fn process_registry_request_rejects_invalid_actor_signature() {
+        let args = RegistryServeArgs {
+            bind: "127.0.0.1:7777".to_owned(),
+            ttl_sec: 300,
+            rate_limit_window_sec: 60,
+            announce_rate_limit: 300,
+            peers_rate_limit: 900,
+            shared_secret: None,
+            shared_secret_env: None,
+            max_body_bytes: 65_536,
+            read_timeout_ms: 5_000,
+            write_timeout_ms: 5_000,
+            allow_insecure_no_auth: false,
+        };
+        let keypair = starweft_crypto::StoredKeypair::generate();
+        let mut record = sign_registry_peer_record(
+            &keypair,
+            RegistryPeerRecordInput {
+                actor_id: ActorId::generate(),
+                node_id: NodeId::generate(),
+                public_key: keypair.public_key.clone(),
+                stop_public_key: None,
+                capabilities: vec!["openclaw.execution.v1".to_owned()],
+                listen_addresses: vec!["/unix/worker.sock".to_owned()],
+                role: "worker".to_owned(),
+                published_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .expect("sign record");
+        record.role = "tampered".to_owned();
+        let request = ParsedRegistryRequest {
+            method: "POST".to_owned(),
+            path: "/announce".to_owned(),
+            header_map: HashMap::from([(
+                "content-length".to_owned(),
+                serde_json::to_vec(&record)
+                    .expect("record json")
+                    .len()
+                    .to_string(),
+            )]),
+            body: serde_json::to_vec(&record).expect("record json"),
+        };
+        let ctx = RegistryRequestContext {
+            entries: &Mutex::new(HashMap::new()),
+            replay_cache: &Mutex::new(HashMap::new()),
+            rate_limits: &Mutex::new(HashMap::new()),
+        };
+        let response = process_registry_request(
+            &args,
+            None,
+            &"127.0.0.1:7777".parse().expect("socket addr"),
+            &request,
+            &ctx,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("invalid signature should return response");
         assert_eq!(response.0, "HTTP/1.1 400 Bad Request");
     }
 

@@ -199,9 +199,9 @@ mod tests {
     use starweft_crypto::StoredKeypair;
     use starweft_id::{ActorId, ProjectId, TaskId, VisionId};
     use starweft_protocol::{
-        EvaluationPolicy, ParticipantPolicy, ProjectCharter, ProjectStatus, StopScopeType,
-        TaskDelegated, TaskExecutionStatus, TaskProgress, TaskResultSubmitted, TaskStatus,
-        UnsignedEnvelope,
+        EvaluationPolicy, ExecutionMode, ParticipantPolicy, ProjectCharter, ProjectStatus,
+        StopScopeType, TaskDelegated, TaskExecutionStatus, TaskProgress, TaskResultSubmitted,
+        TaskStatus, UnsignedEnvelope,
     };
     use time::OffsetDateTime;
 
@@ -230,6 +230,7 @@ mod tests {
                 title: "demo".to_owned(),
                 objective: "test projection".to_owned(),
                 stop_authority_actor_id: principal_actor.clone(),
+                execution_mode: ExecutionMode::Full,
                 participant_policy: ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -259,6 +260,7 @@ mod tests {
                 description: "collect data".to_owned(),
                 objective: "validate".to_owned(),
                 required_capability: "research.web.v1".to_owned(),
+                execution_mode: ExecutionMode::Full,
                 input_payload: serde_json::json!({ "target": "market" }),
                 expected_output_schema: serde_json::json!({ "type": "object" }),
             },
@@ -354,7 +356,7 @@ mod tests {
         assert_eq!(task_snapshot.result_summary.as_deref(), Some("done"));
 
         let stop_order = UnsignedEnvelope::new(
-            principal_actor,
+            principal_actor.clone(),
             None,
             starweft_protocol::StopOrder {
                 stop_id: starweft_id::StopId::generate(),
@@ -363,6 +365,10 @@ mod tests {
                 reason_code: "misalignment".to_owned(),
                 reason_text: "stop".to_owned(),
                 issued_at: OffsetDateTime::now_utc(),
+                authority_actor_id: principal_actor.clone(),
+                authority_signature: keypair
+                    .sign_json(&serde_json::json!({"stop": "test"}))
+                    .expect("authority signature"),
             },
         )
         .with_project_id(project_id.clone())
@@ -414,6 +420,7 @@ mod tests {
                 title: "demo".to_owned(),
                 objective: "test projection".to_owned(),
                 stop_authority_actor_id: worker_actor.clone(),
+                execution_mode: ExecutionMode::Full,
                 participant_policy: ParticipantPolicy {
                     external_agents_allowed: true,
                 },
@@ -443,6 +450,7 @@ mod tests {
                 description: "collect data".to_owned(),
                 objective: "validate".to_owned(),
                 required_capability: "research.web.v1".to_owned(),
+                execution_mode: ExecutionMode::Full,
                 input_payload: serde_json::json!({ "target": "market" }),
                 expected_output_schema: serde_json::json!({ "type": "object" }),
             },

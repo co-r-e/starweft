@@ -6,12 +6,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use multiaddr::Multiaddr;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use starweft_crypto::StoredKeypair;
+use starweft_crypto::{StoredKeypair, verifying_key_from_base64};
 use starweft_id::{ActorId, NodeId, ProjectId, TaskId};
 use starweft_observation::{SnapshotCachePolicy, snapshot_is_usable};
 use starweft_p2p::TransportDriver;
-use starweft_protocol::{ArtifactRef, StopScopeType, VisionConstraints};
-use starweft_store::{LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, Store};
+use starweft_protocol::{ArtifactRef, ExecutionMode, StopScopeType, VisionConstraints};
+use starweft_store::{
+    LocalIdentityRecord, PeerAddressRecord, PeerIdentityRecord, PeerTrustState, Store,
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::cli::StopScopeSelection;
@@ -131,6 +133,12 @@ pub(crate) fn parse_constraints(entries: &[String]) -> Result<VisionConstraints>
         })?;
         match key {
             "budget_mode" => constraints.budget_mode = Some(value.to_owned()),
+            "execution_mode" => {
+                constraints.execution_mode =
+                    Some(value.parse::<ExecutionMode>().with_context(|| {
+                        format!("execution_mode must be full|controlled, got {value}")
+                    })?)
+            }
             "allow_external_agents" => {
                 constraints.allow_external_agents =
                     Some(value.parse::<bool>().with_context(|| {
@@ -200,8 +208,10 @@ pub(crate) fn copy_file_if_exists(source: &Path, destination: &Path) -> Result<(
     }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
+        set_private_directory_permissions(parent)?;
     }
     fs::copy(source, destination)?;
+    set_private_file_permissions(destination)?;
     Ok(())
 }
 
@@ -210,6 +220,7 @@ pub(crate) fn copy_dir_if_exists(source: &Path, destination: &Path) -> Result<()
         return Ok(());
     }
     fs::create_dir_all(destination)?;
+    set_private_directory_permissions(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
@@ -263,6 +274,83 @@ pub(crate) fn restore_dir_from_bundle(
         remove_path(destination)?;
     }
     copy_dir_if_exists(source, destination)
+}
+
+#[cfg(unix)]
+pub(crate) fn set_private_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to set private file permissions on {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "failed to set private directory permissions on {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_private_file_permissions(path: &Path) -> Result<()> {
+    set_private_permissions_windows(path, false)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    set_private_permissions_windows(path, true)
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions_windows(path: &Path, is_dir: bool) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+                SetFileAttributesW,
+            };
+            let attrs = GetFileAttributesW(wide.as_ptr());
+            if attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_HIDDEN == 0) {
+                let _ = SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN);
+            }
+        }
+        if let Ok(username) = std::env::var("USERNAME") {
+            let grant = if is_dir {
+                format!("{username}:(OI)(CI)F")
+            } else {
+                format!("{username}:F")
+            };
+            let status = std::process::Command::new("icacls")
+                .args([
+                    path.to_string_lossy().as_ref(),
+                    "/inheritance:r",
+                    "/grant:r",
+                    &grant,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Ok(status) = status {
+                if !status.success() {
+                    tracing::warn!("icacls failed for {}", path.display());
+                }
+            }
+        }
+    }
+    let _ = (path, is_dir);
+    Ok(())
 }
 
 pub(crate) fn extract_peer_suffix(multiaddr: &str) -> String {
@@ -531,14 +619,16 @@ pub(crate) fn resolve_peer_public_key(
     inline: Option<String>,
     file: Option<PathBuf>,
 ) -> Result<Option<String>> {
+    let validate = |value: String| -> Result<String> {
+        verifying_key_from_base64(value.trim()).with_context(|| "invalid Ed25519 public key")?;
+        Ok(value.trim().to_owned())
+    };
     match (inline, file) {
-        (Some(value), None) => Ok(Some(value)),
-        (None, Some(path)) => Ok(Some(
+        (Some(value), None) => Ok(Some(validate(value)?)),
+        (None, Some(path)) => Ok(Some(validate(
             fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?
-                .trim()
-                .to_owned(),
-        )),
+                .with_context(|| format!("failed to read {}", path.display()))?,
+        )?)),
         (None, None) => Ok(None),
         (Some(_), Some(_)) => {
             bail!("[E_ARGUMENT] --public-key と --public-key-file は同時に指定できません")
@@ -570,11 +660,57 @@ pub(crate) fn submission_is_approved(constraints: &VisionConstraints) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn approval_state_is_approved(state: &str) -> bool {
+    state.starts_with("approved")
+}
+
 pub(crate) fn budget_mode_is_minimal(constraints: &VisionConstraints) -> bool {
     constraints
         .budget_mode
         .as_deref()
         .is_some_and(|value| value.eq_ignore_ascii_case("minimal"))
+}
+
+pub(crate) fn resolve_execution_mode(
+    constraints: &VisionConstraints,
+    default_mode: ExecutionMode,
+) -> ExecutionMode {
+    constraints.execution_mode.unwrap_or(default_mode)
+}
+
+pub(crate) fn peer_trust_state_label(trust_state: PeerTrustState) -> &'static str {
+    trust_state.as_str()
+}
+
+pub(crate) fn peer_is_locally_trusted(trust_state: PeerTrustState) -> bool {
+    matches!(
+        trust_state,
+        PeerTrustState::Trusted | PeerTrustState::Pinned
+    )
+}
+
+pub(crate) fn peer_dispatch_eligibility_reason(trust_state: PeerTrustState) -> &'static str {
+    match trust_state {
+        PeerTrustState::Trusted | PeerTrustState::Pinned => "eligible",
+        PeerTrustState::Discovered => "blocked:discovered",
+        PeerTrustState::Revoked => "blocked:revoked",
+    }
+}
+
+pub(crate) fn ensure_peer_target_is_trusted(
+    store: &Store,
+    actor_id: &ActorId,
+    context: &str,
+) -> Result<()> {
+    if let Some(identity) = store.peer_identity(actor_id)?
+        && !peer_is_locally_trusted(identity.trust_state)
+    {
+        bail!(
+            "[E_UNTRUSTED_PEER] trust_state={} の peer は {context} 対象にできません: actor_id={actor_id}",
+            peer_trust_state_label(identity.trust_state)
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn policy_blocking_reason(
@@ -664,14 +800,26 @@ pub(crate) struct BootstrapPeerParams<'a> {
 }
 
 pub(crate) fn upsert_bootstrap_peer(params: BootstrapPeerParams<'_>) -> Result<()> {
-    params.store.upsert_peer_identity(&PeerIdentityRecord {
-        actor_id: params.actor_id.clone(),
-        node_id: params.node_id.clone(),
-        public_key: params.public_key,
-        stop_public_key: params.stop_public_key,
-        capabilities: params.capabilities,
-        updated_at: params.seen_at,
-    })?;
+    verifying_key_from_base64(&params.public_key)
+        .with_context(|| "invalid bootstrap public key")?;
+    if let Some(stop_public_key) = params.stop_public_key.as_deref() {
+        verifying_key_from_base64(stop_public_key)
+            .with_context(|| "invalid bootstrap stop public key")?;
+    }
+    let accepted = params
+        .store
+        .upsert_discovered_peer_identity(&PeerIdentityRecord {
+            actor_id: params.actor_id.clone(),
+            node_id: params.node_id.clone(),
+            public_key: params.public_key,
+            stop_public_key: params.stop_public_key,
+            capabilities: params.capabilities,
+            trust_state: PeerTrustState::Discovered,
+            updated_at: params.seen_at,
+        })?;
+    if !accepted {
+        return Ok(());
+    }
     params.store.rebind_peer_addresses(
         params.actor_id,
         &params.node_id,

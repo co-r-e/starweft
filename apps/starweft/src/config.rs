@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use starweft_protocol::ExecutionMode;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +177,12 @@ pub struct OpenClawSection {
     pub working_dir: Option<String>,
     pub timeout_sec: u64,
     pub capability_version: String,
+    #[serde(default = "default_execution_mode")]
+    pub default_execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub controlled_env_allowlist: Vec<String>,
+    #[serde(default)]
+    pub controlled_stdio_passthrough: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -302,8 +309,15 @@ impl Default for OpenClawSection {
             working_dir: None,
             timeout_sec: 3600,
             capability_version: "openclaw.execution.v1".to_owned(),
+            default_execution_mode: default_execution_mode(),
+            controlled_env_allowlist: Vec::new(),
+            controlled_stdio_passthrough: false,
         }
     }
+}
+
+fn default_execution_mode() -> ExecutionMode {
+    ExecutionMode::Full
 }
 
 impl Default for CompatibilitySection {
